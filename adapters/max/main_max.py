@@ -1753,7 +1753,7 @@ async def run_max_bot() -> None:
                                                 except Exception:
                                                     pass
                                                 response = {
-                                                    "text": "✅ <b>Регистрация завершена!</b>",
+                                                    "text": "✅ Регистрация завершена!",
                                                     "parse_mode": "HTML",
                                                     "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
                                                 }
