@@ -57,12 +57,62 @@ def _admin_delete_list_page_response(all_users: list, page: int, total_pages: in
 
 HELP_TEXT = (
     "❓ <b>Помощь</b>\n\n"
-    "Этот бот позволяет создавать заявки в техническую поддержку:\n"
-    "• <b>Сайт</b> — проблемы с поиском на petrovich.ru\n"
-    "• <b>WMS</b> — заявки по настройке и работе складской системы\n"
-    "• <b>Смена пароля</b> — запрос смены пароля учётной записи\n\n"
-    "Заявки можно отслеживать в разделе «Мои заявки»."
+    "Этот бот позволяет создавать заявки в техническую поддержку.\n"
+    "Заявки можно отслеживать в разделе «Мои заявки».\n"
+    "Если не нашли форму, которая подходит к вашей проблеме то обратитесь на первую линию 1111/8-921-888-17-61"
 )
+
+
+def _tp_root_menu() -> dict:
+    return {
+        "text": "📋 <b>Создать заявку в ТП</b>\n\nВ каком разделе создаём заявку?",
+        "parse_mode": "HTML",
+        "buttons": [
+            {"id": "tp_group_programs", "label": "💻 Программы и сайт"},
+            {"id": "tp_group_equipment", "label": "🛠️ Оборудование"},
+            {"id": "tp_group_services", "label": "🧰 Услуги"},
+            {"id": "ticket_rubik_password_change", "label": "🔑 Смена пароля"},
+            {"id": "back_to_main", "label": "🔙 В главное меню"},
+        ],
+    }
+
+
+def _tp_programs_menu() -> dict:
+    return {
+        "text": "💻 <b>Программы и сайт</b>\n\nВыберите направление:",
+        "parse_mode": "HTML",
+        "buttons": [
+            {"id": "tp_section_site", "label": "🌐 Поиск/Сайт"},
+            {"id": "tp_section_wms", "label": "📦 WMS"},
+            {"id": "tp_section_email", "label": "📧 Электронная почта"},
+            {"id": "create_ticket_tp", "label": "⬅️ Назад"},
+        ],
+    }
+
+
+def _tp_equipment_menu() -> dict:
+    return {
+        "text": "🛠️ <b>Оборудование</b>\n\nВыберите тип заявки:",
+        "parse_mode": "HTML",
+        "buttons": [
+            {"id": "pc_issue_start", "label": "🖥️ Проблема в работе ПК"},
+            {"id": "orgtech_issue_start", "label": "🖨️ Оргтехника"},
+            {"id": "peripheral_issue_start", "label": "🧩 Периферийное оборудование"},
+            {"id": "network_issue_start", "label": "📶 Проблемы в работе сети"},
+            {"id": "create_ticket_tp", "label": "⬅️ Назад"},
+        ],
+    }
+
+
+def _tp_services_menu() -> dict:
+    return {
+        "text": "🧰 <b>Услуги</b>\n\nВыберите тип заявки:",
+        "parse_mode": "HTML",
+        "buttons": [
+            {"id": "electronic_queue_start", "label": "🎫 Электронная очередь"},
+            {"id": "create_ticket_tp", "label": "⬅️ Назад"},
+        ],
+    }
 
 
 def handle_start(user_id: int) -> dict:
@@ -112,13 +162,66 @@ def handle_callback(callback_id: str, user_id: int, my_tickets: Optional[list] =
     if callback_id == "start_registration":
         # Обрабатывается в main_max: задаётся состояние и первый шаг (email)
         return None
+    if callback_id in ("sa_stc_menu", "sa_stc_my_tasks"):
+        # Обрабатывается в main_max (асинхронные запросы к Jira/реестру).
+        return None
+    if callback_id and (
+        callback_id.startswith("stc_open_issue:")
+        or callback_id.startswith("stc_set_status:")
+        or callback_id.startswith("stc_apply_status:")
+        or callback_id.startswith("stc_ask_timespent:")
+        or callback_id.startswith("stc_apply_status_ts:")
+        or callback_id.startswith("stc_open_jira:")
+    ):
+        return None
+    if callback_id == "pc_issue_start":
+        # Обрабатывается в main_max: пошаговый сценарий заявки «Проблема в работе ПК»
+        return None
+    if callback_id == "orgtech_issue_start":
+        # Обрабатывается в main_max: пошаговый сценарий заявки «Оргтехника»
+        return None
+    if callback_id == "peripheral_issue_start":
+        # Обрабатывается в main_max: пошаговый сценарий заявки «Периферийное оборудование»
+        return None
+    if callback_id == "network_issue_start":
+        # Обрабатывается в main_max: пошаговый сценарий заявки «Проблемы в работе сети»
+        return None
+    if callback_id == "electronic_queue_start":
+        # Обрабатывается в main_max: пошаговый сценарий заявки «Электронная очередь»
+        return None
+    if callback_id == "tp_section_wms":
+        return None
+    if callback_id == "tp_section_site":
+        return None
+    if callback_id == "tp_section_email":
+        return {
+            "text": "📧 <b>Электронная почта</b>\n\nВыберите направление:",
+            "parse_mode": "HTML",
+            "buttons": [
+                {"id": "tp_email_owa_outlook", "label": "📨 Электронная почта (Owa\\Outlook)"},
+                {"id": "tp_email_groups", "label": "👥 Группы рассылки"},
+                {"id": "tp_email_forwarding", "label": "↪️ Настройка переадресации"},
+                {"id": "tp_group_programs", "label": "⬅️ Назад"},
+                {"id": "back_to_main", "label": "🔙 В главное меню"},
+            ],
+        }
+    if callback_id == "tp_email_owa_outlook":
+        return None
+    if callback_id == "tp_email_groups":
+        # Обрабатывается в main_max: пошаговый сценарий заявки «Группы рассылки»
+        return None
+    if callback_id == "tp_email_forwarding":
+        # Обрабатывается в main_max: пошаговый сценарий заявки «Настройка переадресации»
+        return None
     # Главное меню (для зарегистрированных)
     if callback_id == "create_ticket_tp":
-        result = support_api.get_ticket_types_menu(CHANNEL_ID, user_id)
-        if isinstance(result, Menu):
-            return menu_to_max(result)
-        if isinstance(result, Error):
-            return error_to_max(result)
+        return _tp_root_menu()
+    if callback_id == "tp_group_programs":
+        return _tp_programs_menu()
+    if callback_id == "tp_group_equipment":
+        return _tp_equipment_menu()
+    if callback_id == "tp_group_services":
+        return _tp_services_menu()
     if callback_id == "help":
         if not is_user_registered(user_id, CHANNEL_ID):
             return {"text": "Сначала пройдите регистрацию или привяжите аккаунт.", "parse_mode": "HTML", "buttons": back_btn}
@@ -251,11 +354,13 @@ def handle_callback(callback_id: str, user_id: int, my_tickets: Optional[list] =
         lines = []
         for t in tickets:
             issue_key = t.get("issue_key") or "—"
+            req_label = (t.get("request_type_label") or "").strip()
+            tail = f" {req_label}" if req_label else ""
             url = t.get("customer_request_url") or ""
             if url and issue_key != "—":
-                lines.append(f'• <a href="{url}">{issue_key}</a>')
+                lines.append(f'• <a href="{url}">{issue_key}</a>{tail}')
             else:
-                lines.append(f"• {issue_key}")
+                lines.append(f"• {issue_key}{tail}")
         text = "📋 <b>Мои заявки</b>\n\n" + "\n".join(lines) + "\n\nВыберите заявку (или откройте по ссылке):"
         buttons = [{"id": f"open_issue:{t.get('issue_key')}", "label": t.get("issue_key") or "—"} for t in tickets]
         buttons.append({"id": "back_to_main", "label": "🔙 В главное меню"})

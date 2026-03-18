@@ -6,6 +6,9 @@ from typing import List, Optional, Tuple
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 from config import is_admin
+from core.pc_problem import PC_PROBLEM_KINDS
+from core.orgtech import ORGTECH_KINDS
+from core.peripheral_equipment import PERIPHERAL_KINDS
 
 
 def get_start_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -25,6 +28,27 @@ def get_main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     ]
     if user_id and is_admin(user_id):
         buttons.append([InlineKeyboardButton(text="⚙️ Админ-панель", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_pc_problem_kind_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора типа проблемы ПК (customfield_11400)."""
+    buttons = [[InlineKeyboardButton(text=label, callback_data=f"pc_kind_{kind_id}")] for kind_id, label in PC_PROBLEM_KINDS]
+    buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_orgtech_kind_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора типа оргтехники (customfield_12613)."""
+    buttons = [[InlineKeyboardButton(text=label, callback_data=f"orgtech_kind_{kind_id}")] for kind_id, label in ORGTECH_KINDS]
+    buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_peripheral_kind_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора вида периферийного оборудования (customfield_11403)."""
+    buttons = [[InlineKeyboardButton(text=label, callback_data=f"peripheral_kind_{kind_id}")] for kind_id, label in PERIPHERAL_KINDS]
+    buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 

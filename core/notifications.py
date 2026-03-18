@@ -10,11 +10,12 @@ import asyncio
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.support import delivery as delivery_module
-from core.support.issue_binding_registry import get_all_issue_keys, get_user_ids_by_issue
+from core.support.issue_binding_registry import get_all_issue_keys, get_user_ids_by_issue, get_bindings_by_issue
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,14 @@ def _get_last_status(issue_key: str) -> Optional[str]:
     return data.get(key, {}).get("last_status")
 
 
+def _get_last_assignee(issue_key: str) -> Optional[str]:
+    key = (issue_key or "").strip().upper()
+    if not key:
+        return None
+    data = _load_state()
+    return data.get(key, {}).get("last_assignee")
+
+
 def _set_last_status(issue_key: str, status: str) -> None:
     key = (issue_key or "").strip().upper()
     if not key:
@@ -80,6 +89,25 @@ def _set_last_status(issue_key: str, status: str) -> None:
         data[key] = {}
     data[key]["last_status"] = (status or "").strip()
     _save_state(data)
+
+
+def _set_last_assignee(issue_key: str, assignee_username: str) -> None:
+    key = (issue_key or "").strip().upper()
+    if not key:
+        return
+    data = _load_state()
+    if key not in data:
+        data[key] = {}
+    data[key]["last_assignee"] = (assignee_username or "").strip().lower()
+    _save_state(data)
+
+
+def set_issue_last_assignee_baseline(issue_key: str, assignee_username: str) -> None:
+    """
+    Установить baseline assignee без отправки уведомлений.
+    Используется после технической переустановки исполнителя (например, при transition).
+    """
+    _set_last_assignee(issue_key, assignee_username)
 
 
 def _comment_body_plain(comment: Dict[str, Any], max_len: int = 500) -> str:
@@ -126,6 +154,20 @@ def _expand_recipients_to_linked_channels(recipients: List[tuple]) -> List[tuple
                 seen.add(key)
                 out.append(key)
     return out
+
+
+def _is_recent_issue_binding(issue_key: str, window_seconds: int = 900) -> bool:
+    """True, если заявка из реестра создана недавно (по created_at любой привязки)."""
+    now = time.time()
+    for b in get_bindings_by_issue(issue_key):
+        created = b.get("created_at")
+        try:
+            ts = float(created)
+        except Exception:
+            continue
+        if 0 <= now - ts <= max(1, int(window_seconds)):
+            return True
+    return False
 
 
 async def check_registry_statuses_and_notify() -> None:
@@ -216,6 +258,17 @@ async def check_registry_comments_and_notify() -> None:
             if last_count is None:
                 _set_last_comment_count(issue_key, current_count)
                 continue
+            # Если бот был выключен/перезапускался, а baseline по комментариям "пустой" (0),
+            # то при старте может полететь "волна" уведомлений по старым тикетам.
+            # Для несвежих заявок просто выставляем baseline без уведомления.
+            if last_count == 0 and current_count > 0 and not _is_recent_issue_binding(issue_key):
+                _set_last_comment_count(issue_key, current_count)
+                continue
+            # После включения фильтра internal-комментариев счётчик может уменьшиться.
+            # Сбрасываем baseline, чтобы цикл уведомлений не "залипал".
+            if current_count < last_count:
+                _set_last_comment_count(issue_key, current_count)
+                continue
             if current_count <= last_count:
                 continue
             new_count = current_count - last_count
@@ -265,12 +318,79 @@ async def check_registry_comments_and_notify() -> None:
         await asyncio.sleep(0.3)
 
 
+async def check_assignee_tasks_and_notify() -> None:
+    """
+    Уведомления для роли «СА СТЦ»: если у заявки из реестра сменился assignee на СА,
+    отправляем уведомление новому исполнителю.
+    """
+    from core.jira_aa import get_issue_admin_details
+    from core.stc_tasks import get_stc_recipients_by_jira_username
+    from core.support.api import get_jira_browse_url
+
+    issue_keys = get_all_issue_keys()
+    if not issue_keys:
+        return
+    for issue_key in issue_keys:
+        try:
+            info = await get_issue_admin_details(issue_key)
+            if not info:
+                continue
+            assignee_username = (info.get("assignee_username") or "").strip().lower()
+            if not assignee_username:
+                continue
+            recipients = get_stc_recipients_by_jira_username(assignee_username)
+            last_assignee = (_get_last_assignee(issue_key) or "").strip().lower()
+            if not last_assignee:
+                # Для новых заявок шлём уведомление сразу; для исторических — только baseline.
+                _set_last_assignee(issue_key, assignee_username)
+                if not recipients or not _is_recent_issue_binding(issue_key):
+                    continue
+            if last_assignee == assignee_username:
+                continue
+            if last_assignee:
+                _set_last_assignee(issue_key, assignee_username)
+            if not recipients:
+                continue
+            summary = (info.get("summary") or "—").strip()
+            status = (info.get("status") or "—").strip()
+            assignee_display = (info.get("assignee_display") or assignee_username).strip()
+            browse_url = get_jira_browse_url(issue_key)
+            text = (
+                f"🛠️ <b>Новая задача для СА СТЦ</b>\n\n"
+                f"Заявка: {issue_key}\n"
+                f"Тема: {summary}\n"
+                f"Статус: {status}\n"
+                f"Assignee: {assignee_display}\n"
+            )
+            if browse_url:
+                text += f'\n🔗 <a href="{browse_url}">Открыть в Jira</a>'
+            reply_markup = [
+                [{"text": "📋 Мои задачи", "callback_data": "sa_stc_my_tasks"}],
+                [{"text": "🔎 Открыть задачу", "callback_data": f"stc_open_issue:{issue_key}"}],
+            ]
+            for channel_id, user_id in recipients:
+                try:
+                    await delivery_module.deliver(channel_id, user_id, text, reply_markup=reply_markup)
+                except Exception as e:
+                    logger.warning(
+                        "Не удалось отправить уведомление assignee %s -> %s/%s: %s",
+                        issue_key,
+                        channel_id,
+                        user_id,
+                        e,
+                    )
+        except Exception as e:
+            logger.warning("Ошибка уведомления assignee %s: %s", issue_key, e)
+        await asyncio.sleep(0.3)
+
+
 async def run_registry_status_loop(interval_seconds: int = 90) -> None:
     """Цикл проверки статусов по реестру."""
     logger.info("Запущен проверщик статусов по реестру (интервал %s с)", interval_seconds)
     while True:
         try:
             await check_registry_statuses_and_notify()
+            await check_assignee_tasks_and_notify()
         except asyncio.CancelledError:
             break
         except Exception as e:

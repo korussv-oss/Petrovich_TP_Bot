@@ -117,6 +117,8 @@ def load_config() -> Dict[str, Any]:
             "ADMIN_IDS": admin_ids,
             # Админы Лупы: могут формировать Excel-отчёт по заявкам поиска (плюс ADMIN_IDS имеют доступ)
             "ADMIN_LUPA_IDS": _parse_int_list("ADMIN_LUPA_IDS"),
+            # Системные администраторы СТЦ: раздел «СА СТЦ» в главном меню.
+            "STC_SA_IDS": _parse_int_list("STC_SA_IDS"),
         },
         "JIRA": {
             "LOGIN_URL": (os.getenv("JIRA_LOGIN_URL") or "https://jira.petrovich.tech").strip().rstrip("/"),
@@ -130,6 +132,8 @@ def load_config() -> Dict[str, Any]:
             "ADMIN_IDS": _parse_int_list("ADMIN_MAX_IDS"),
             # Админы Лупы в MAX: могут формировать Excel-отчёт по заявкам поиска
             "ADMIN_LUPA_IDS": _parse_int_list("ADMIN_LUPA_MAX_IDS"),
+            # Системные администраторы СТЦ в MAX.
+            "STC_SA_IDS": _parse_int_list("STC_SA_MAX_IDS"),
         },
         "JIRA_AA": {
             "PROJECT_KEY": JIRA_AA_PROJECT_KEY,
@@ -185,6 +189,27 @@ def load_config() -> Dict[str, Any]:
                 ["Санкт-Петербург", "Москва", "Екатеринбург", "Великий Новгород", "Казань", "Нижний Новгород", "Краснодар", "Челябинск", "Самара", "Уфа"],
             ),
         },
+        "JIRA_PC": {
+            "PROJECT_KEY": (os.getenv("JIRA_PC_PROJECT_KEY") or "HD").strip(),
+            "ISSUE_TYPE": (os.getenv("JIRA_PC_ISSUE_TYPE") or "Incident").strip(),
+            "SERVICE_DESK_ID": (os.getenv("JIRA_PC_SERVICE_DESK_ID") or "1").strip(),
+            "REQUEST_TYPE_ID": (os.getenv("JIRA_PC_REQUEST_TYPE_ID") or "377").strip(),
+            "PORTAL_ID": (os.getenv("JIRA_PC_PORTAL_ID") or "1").strip(),
+            "FIELD_PC_PROBLEM_KIND": (os.getenv("JIRA_PC_FIELD_PROBLEM_KIND") or "customfield_11400").strip(),
+            "FIELD_DEPARTMENT": (os.getenv("JIRA_PC_FIELD_DEPARTMENT") or "customfield_11406").strip(),
+            "FIELD_EXISTING_PHONE": (os.getenv("JIRA_PC_FIELD_EXISTING_PHONE") or "customfield_13103").strip(),
+        },
+        "JIRA_EMAIL": {
+            "PROJECT_KEY": (os.getenv("JIRA_EMAIL_PROJECT_KEY") or "ISR").strip(),
+            "SERVICE_DESK_ID": (os.getenv("JIRA_EMAIL_SERVICE_DESK_ID") or "22").strip(),
+            "REQUEST_TYPE_ID_OWA": (os.getenv("JIRA_EMAIL_REQUEST_TYPE_ID_OWA") or "1257").strip(),
+            "PORTAL_ID": (os.getenv("JIRA_EMAIL_PORTAL_ID") or os.getenv("JIRA_EMAIL_SERVICE_DESK_ID") or "22").strip(),
+            "FIELD_PHONE": (os.getenv("JIRA_EMAIL_FIELD_PHONE") or "customfield_13103").strip(),
+            "FIELD_RMS_OR_IP": (os.getenv("JIRA_EMAIL_FIELD_RMS_OR_IP") or "customfield_14075").strip(),
+            "FIELD_DEPARTMENT": (os.getenv("JIRA_EMAIL_FIELD_DEPARTMENT") or "customfield_11406").strip(),
+            "FIELD_REQUEST_KIND": (os.getenv("JIRA_EMAIL_FIELD_REQUEST_KIND") or "customfield_19107").strip(),
+            "FIELD_WORKPLACE": (os.getenv("JIRA_EMAIL_FIELD_WORKPLACE") or "customfield_11402").strip(),
+        },
         # AD/LDAP: проверка сотрудника при регистрации (поиск по телефону). Все значения только из .env.
         "AD_LDAP": {
             "URL": (os.getenv("AD_LDAP_URL") or "").strip(),
@@ -231,3 +256,10 @@ def is_lupa_report_allowed(channel_id: str, user_id: int) -> bool:
     if (channel_id or "").strip().lower() == "max":
         return user_id in CONFIG.get("MAX", {}).get("ADMIN_LUPA_IDS", [])
     return user_id in CONFIG.get("TELEGRAM", {}).get("ADMIN_LUPA_IDS", [])
+
+
+def is_stc_sa(channel_id: str, user_id: int) -> bool:
+    """Проверка роли «Системный администратор СТЦ» для канала."""
+    if (channel_id or "").strip().lower() == "max":
+        return user_id in CONFIG.get("MAX", {}).get("STC_SA_IDS", [])
+    return user_id in CONFIG.get("TELEGRAM", {}).get("STC_SA_IDS", [])

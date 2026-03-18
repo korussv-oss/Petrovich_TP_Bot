@@ -60,11 +60,18 @@ async def request_comments_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-def _user_can_comment_issue(user_id: int, issue_key: str) -> bool:
+async def _user_can_comment_issue(user_id: int, issue_key: str) -> bool:
     """Доступ: заявка в pending или в реестре привязок."""
     if get_pending_issue_key_by_user(user_id) == issue_key:
         return True
-    return support_api.user_owns_issue(CHANNEL_ID, user_id, issue_key)
+    if support_api.user_owns_issue(CHANNEL_ID, user_id, issue_key):
+        return True
+    # Роль СА СТЦ: может комментировать задачи, где он текущий assignee.
+    try:
+        from core.stc_tasks import can_stc_user_access_issue
+        return await can_stc_user_access_issue(CHANNEL_ID, user_id, issue_key)
+    except Exception:
+        return False
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("add_comment:"))
@@ -73,7 +80,7 @@ async def add_comment_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
     issue_key = (callback.data or "").split(":", 1)[-1].strip()
-    if not issue_key or not _user_can_comment_issue(callback.from_user.id, issue_key):
+    if not issue_key or not await _user_can_comment_issue(callback.from_user.id, issue_key):
         await callback.answer("Заявка не найдена или доступ запрещён.", show_alert=True)
         return
     await state.set_state(CommentStates.WAITING_FOR_COMMENT)

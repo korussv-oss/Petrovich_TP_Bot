@@ -1,0 +1,560 @@
+# Каталог форм поддержки (UI + Jira маппинг).
+# Секреты и базовые параметры подключения остаются в .env (JIRA_LOGIN_URL, JIRA_TOKEN и т.д.).
+
+pc_problem:
+  label: "Проблема в работе ПК"
+  project_key: "HD"
+  portal_id: "1"
+  jira:
+    service_desk_id: "1"
+    request_type_id: "377"
+    reporter_profile_key: "jira_username"
+    fields:
+      customfield_11400:
+        source: "form.pc_problem_kind_id"
+        type: "option"
+        required: true
+      customfield_11406:
+        source: "profile.department"
+        type: "option"
+        required: true
+      customfield_13103:
+        source: "profile.phone"
+        type: "phone"
+        required: true
+      description:
+        source: "form.description"
+        type: "text"
+        required: false
+        default: "Описание не предоставлено"
+        max_len: 4000
+      attachment:
+        source: "attachments"
+        type: "attachment"
+        required: false
+  ui:
+    selects:
+      pc_problem_kind_id:
+        options:
+          - id: "11732"
+            label: "Зависание"
+          - id: "11733"
+            label: "Не включается"
+          - id: "11734"
+            label: "Самопроизвольно выключается"
+          - id: "11735"
+            label: "Медленно работает"
+          - id: "11736"
+            label: "Не печатает"
+          - id: "10803"
+            label: "Не нашёл подходящую категорию"
+          - id: "10800"
+            label: "Другая проблема с ПК"
+
+orgtech_problem:
+  label: "Оргтехника"
+  project_key: "HD"
+  portal_id: "1"
+  jira:
+    service_desk_id: "1"
+    request_type_id: "389"
+    reporter_profile_key: "jira_username"
+    fields:
+      customfield_11406:
+        source: "profile.department"
+        type: "option"
+        required: true
+      customfield_11221:
+        source: "profile.phone"
+        type: "phone"
+        required: true
+      customfield_12613:
+        source: "form.orgtech_kind"
+        type: "option"
+        required: true
+      customfield_11402:
+        source: "form.location"
+        type: "text"
+        required: true
+        max_len: 255
+      description:
+        source: "form.description"
+        type: "text"
+        required: false
+        default: "Описание не предоставлено"
+        max_len: 4000
+      attachment:
+        source: "attachments"
+        type: "attachment"
+        required: false
+  ui:
+    selects:
+      orgtech_kind:
+        options:
+          - id: "orgtech_printer"
+            label: "Принтер"
+          - id: "orgtech_mfu"
+            label: "МФУ"
+          - id: "orgtech_scanner"
+            label: "Сканер"
+          - id: "orgtech_bad_cartridge"
+            label: "Плохо заправлен картридж"
+          - id: "orgtech_other"
+            label: "Другое"
+
+peripheral_equipment:
+  label: "Периферийное оборудование"
+  project_key: "HD"
+  portal_id: "1"
+  jira:
+    service_desk_id: "1"
+    request_type_id: "738"
+    reporter_profile_key: "jira_username"
+    fields:
+      customfield_11406:
+        source: "profile.department"
+        type: "option"
+        required: true
+      customfield_11221:
+        source: "profile.phone"
+        type: "phone"
+        required: true
+      customfield_11403:
+        source: "form.peripheral_kind"
+        type: "option"
+        required: true
+      customfield_11401:
+        source: "form.ip_address"
+        type: "text"
+        required: true
+        max_len: 255
+      customfield_11402:
+        source: "form.workplace"
+        type: "text"
+        required: false
+        default: "нет"
+        max_len: 255
+      customfield_14075:
+        source: "form.rms_internet_id"
+        type: "text"
+        required: false
+        default: "нет"
+        max_len: 255
+      description:
+        source: "form.description"
+        type: "text"
+        required: false
+        default: "Описание не предоставлено"
+        max_len: 4000
+      attachment:
+        source: "attachments"
+        type: "attachment"
+        required: false
+  ui:
+    selects:
+      peripheral_kind:
+        options:
+          - id: "peripheral_keyboard"
+            label: "Клавиатура"
+          - id: "peripheral_mouse"
+            label: "Мышка"
+          - id: "peripheral_monitor"
+            label: "Монитор"
+          - id: "peripheral_phone"
+            label: "Телефонный аппарат"
+          - id: "peripheral_ups"
+            label: "ИБП"
+          - id: "peripheral_headset"
+            label: "Гарнитура/наушники"
+          - id: "peripheral_barcode_scanner"
+            label: "Сканер штрих-кода"
+          - id: "peripheral_tsd"
+            label: "ТСД"
+          - id: "peripheral_other"
+            label: "Другое"
+
+network_problem:
+  label: "Проблемы в работе сети"
+  project_key: "HD"
+  portal_id: "1"
+  jira:
+    service_desk_id: "1"
+    request_type_id: "407"
+    reporter_profile_key: "jira_username"
+    fields:
+      customfield_11406:
+        source: "profile.department"
+        type: "option"
+        required: true
+      customfield_11221:
+        source: "profile.phone"
+        type: "phone"
+        required: true
+      customfield_12800:
+        source: "form.network_type"
+        type: "option"
+        required: true
+      customfield_12905:
+        source: "form.pc_type"
+        type: "option"
+        required: false
+      customfield_15611:
+        source: "form.wifi_problem_owner"
+        type: "option"
+        required: false
+      customfield_18145:
+        source: "form.provider"
+        type: "option"
+        required: false
+      customfield_13804:
+        source: "form.provider_other"
+        type: "text"
+        required: false
+        max_len: 255
+      customfield_14075:
+        source: "form.rms_internet_id"
+        type: "text"
+        required: false
+        default: "нет"
+        max_len: 255
+      customfield_11401:
+        source: "form.ip_address"
+        type: "text"
+        required: false
+        default: "нет"
+        max_len: 255
+      customfield_18703:
+        source: "form.preferred_contact_time"
+        type: "text"
+        required: false
+        default: "нет"
+        max_len: 255
+      description:
+        source: "form.description"
+        type: "text"
+        required: false
+        default: "Описание не предоставлено"
+        max_len: 4000
+      attachment:
+        source: "attachments"
+        type: "attachment"
+        required: false
+  ui:
+    selects:
+      network_type:
+        options:
+          - id: "network_local"
+            label: "Локальная сеть (проводная)"
+          - id: "network_wifi"
+            label: "Wi-Fi (беспроводная)"
+          - id: "network_vpn"
+            label: "VPN"
+      provider:
+        options:
+          - id: "provider_petrovich"
+            label: "Сеть Петрович"
+          - id: "provider_other"
+            label: "Другой"
+      wifi_problem_owner:
+        options:
+          - id: "wifi_owner_employee"
+            label: "Сотрудник Петрович"
+          - id: "wifi_owner_client"
+            label: "Клиент"
+      pc_type:
+        options:
+          - id: "pc_type_personal"
+            label: "Личный ПК"
+          - id: "pc_type_corporate"
+            label: "Корпоративный (офисный) ПК"
+
+electronic_queue:
+  label: "Электронная очередь"
+  project_key: "HD"
+  portal_id: "1"
+  jira:
+    service_desk_id: "1"
+    request_type_id: "86"
+    reporter_profile_key: "jira_username"
+    fields:
+      summary:
+        source: "form.summary"
+        type: "text"
+        required: true
+        default: "Электронная очередь"
+        max_len: 255
+      customfield_11406:
+        source: "profile.department"
+        type: "option"
+        required: true
+      customfield_13103:
+        source: "profile.phone"
+        type: "phone"
+        required: true
+      customfield_15726:
+        source: "form.service_type"
+        type: "option"
+        required: true
+      description:
+        source: "form.description"
+        type: "text"
+        required: true
+        max_len: 4000
+  ui:
+    selects:
+      service_type:
+        options:
+          - id: "eq_problem"
+            label: "Проблема с услугой"
+          - id: "eq_settings_change"
+            label: "Изменение настроек"
+          - id: "eq_replace_equipment"
+            label: "Замена оборудования"
+
+email_forwarding:
+  label: "Настройка переадресации"
+  project_key: "ISR"
+  portal_id: "22"
+  jira:
+    service_desk_id: "22"
+    request_type_id: "394"
+    reporter_profile_key: "jira_username"
+    fields:
+      customfield_13688:
+        source: "form.on_off"
+        type: "option"
+        required: true
+      customfield_19007:
+        source: "form.email_from"
+        type: "text"
+        required: true
+        max_len: 255
+      customfield_19008:
+        source: "form.email_to"
+        type: "text"
+        required: true
+        max_len: 255
+      customfield_13692:
+        source: "form.redirection_date"
+        type: "text"
+        required: true
+        max_len: 20
+  ui:
+    selects:
+      on_off:
+        options:
+          - id: "email_fwd_on"
+            label: "Включить"
+          - id: "email_fwd_off"
+            label: "Выключить"
+
+email_groups:
+  label: "Группы рассылки"
+  project_key: "ISR"
+  portal_id: "22"
+  jira:
+    service_desk_id: "22"
+    request_type_id: "381"
+    reporter_profile_key: "jira_username"
+    fields:
+      customfield_13698:
+        source: "form.what_to_do"
+        type: "option"
+        required: true
+      customfield_13695:
+        source: "form.group_name"
+        type: "text"
+        required: false
+        max_len: 255
+      customfield_13696:
+        source: "form.group_owner"
+        type: "text"
+        required: false
+        max_len: 255
+      customfield_13697:
+        source: "form.group_membership"
+        type: "text"
+        required: false
+        max_len: 2000
+      customfield_11218:
+        source: "form.group_email"
+        type: "text"
+        required: false
+        max_len: 255
+      customfield_18716:
+        source: "form.ad_login"
+        type: "text"
+        required: false
+        max_len: 255
+      description:
+        source: "form.description"
+        type: "text"
+        required: false
+        max_len: 4000
+  ui:
+    selects:
+      what_to_do:
+        options:
+          - id: "13012"
+            label: "Создать группу рассылки"
+          - id: "13013"
+            label: "Удалить группу рассылки"
+          - id: "13014"
+            label: "Добавить сотрудника в группу рассылки"
+          - id: "13015"
+            label: "Удалить сотрудника из группы рассылки"
+
+email_owa_outlook:
+  label: "Электронная почта (Owa/Outlook)"
+  project_key: "ISR"
+  portal_id: "22"
+  jira:
+    service_desk_id: "22"
+    request_type_id: "1257"
+    reporter_profile_key: "jira_username"
+    fields:
+      customfield_13103:
+        source: "profile.phone"
+        type: "phone"
+        required: true
+      customfield_14075:
+        source: "form.rms_or_ip"
+        type: "text"
+        required: true
+        max_len: 255
+      customfield_11406:
+        source: "profile.department"
+        type: "option"
+        required: true
+      customfield_19107:
+        source: "form.request_kind"
+        type: "option"
+        required: true
+      customfield_11402:
+        source: "form.workplace"
+        type: "text"
+        required: false
+        max_len: 255
+      description:
+        source: "form.description"
+        type: "text"
+        required: true
+        max_len: 4000
+      attachment:
+        source: "attachments"
+        type: "attachment"
+        required: false
+  ui:
+    selects:
+      request_kind:
+        options:
+          - id: "email_owa_req_create"
+            label: "Создание почтового ящика"
+          - id: "email_owa_req_delete"
+            label: "Удаление почтового ящика"
+          - id: "email_owa_req_delivery_error"
+            label: "Ошибка при отправке/доставки"
+          - id: "email_owa_req_consult"
+            label: "Консультация"
+
+rubik_password_change:
+  label: "Смена пароля"
+  project_key: "AA"
+  portal_id: "23"
+  jira:
+    mode: "jsm"
+    service_desk_id: "23"
+    request_type_id: "964"
+    reporter_profile_key: "jira_username"
+    fields:
+      customfield_14320:
+        source: "profile.login"
+        type: "text"
+        required: true
+      customfield_13103:
+        source: "profile.phone"
+        type: "phone"
+        required: true
+      customfield_17506:
+        source: "form.password_new"
+        type: "text"
+        required: true
+      customfield_11406:
+        source: "profile.department"
+        type: "option"
+        required: false
+
+wms_issue:
+  label: "Проблема в работе WMS"
+  project_key: "PW"
+  portal_id: "31"
+  jira:
+    mode: "jsm"
+    service_desk_id: "31"
+    request_type_id: "569"
+    reporter_profile_key: "jira_username"
+    fields:
+      customfield_18215:
+        source: "form.department"
+        type: "option"
+        required: true
+      customfield_13803:
+        source: "form.process"
+        type: "option"
+        required: true
+      summary:
+        source: "form.summary"
+        type: "text"
+        required: false
+        default: "Заявка по настройке WMS"
+        max_len: 255
+      description:
+        source: "form.description"
+        type: "text"
+        required: false
+        default: "Описание не предоставлено"
+        max_len: 4000
+
+lupa_search:
+  label: "Поиск/Сайт"
+  project_key: "WHD"
+  portal_id: "5"
+  jira:
+    mode: "rest_issue"
+    issue_type: "Incident"
+    reporter_profile_key: "jira_username"
+    fields:
+      summary:
+        source: "form.summary"
+        type: "text"
+        required: false
+        default: "Ошибка в поиске на petrovich.ru"
+        max_len: 255
+      description:
+        source: "form.description"
+        type: "text"
+        required: true
+        max_len: 4000
+      customfield_12312:
+        source: "form.problematic_service"
+        type: "option"
+        required: true
+      customfield_15800:
+        source: "form.request_type"
+        type: "option"
+        required: true
+      customfield_11406:
+        source: "form.subdivision"
+        type: "option"
+        option_payload: "id_from_createmeta"
+        required: true
+      customfield_10500:
+        source: "form.service_name"
+        type: "text"
+        required: false
+        default: "Поиск"
+      customfield_12403:
+        source: "form.city"
+        type: "text"
+        required: false
+        max_len: 120

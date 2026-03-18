@@ -93,18 +93,11 @@ async def handle_wms_callback(user_id: int, callback_id: str) -> Optional[dict]:
         _flow.pop(user_id, None)
         from adapters.max.handlers import handle_main_menu
         return handle_main_menu(user_id)
-    # Назад из меню типа WMS → каталог типов заявок
+    # Назад из меню типа WMS → раздел «Программы и сайт»
     if callback_id == "wms_type_back" and state.get("step") == "subtype":
         _flow.pop(user_id, None)
-        from core.support.api import support_api
-        from core.support.models import Menu, Error
-        from adapters.max.render import menu_to_max, error_to_max
-        result = support_api.get_ticket_types_menu(CHANNEL_ID, user_id)
-        if isinstance(result, Menu):
-            return menu_to_max(result)
-        if isinstance(result, Error):
-            return error_to_max(result)
-        return None
+        from adapters.max.handlers import _tp_programs_menu
+        return _tp_programs_menu()
     # Вернуться к выбору типа заявки (из любого шага WMS)
     if callback_id == "wms_show_subtype":
         _flow[user_id] = {"step": "subtype", "data": {}}

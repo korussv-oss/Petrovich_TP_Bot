@@ -13,7 +13,21 @@ from user_storage import is_user_registered, get_user_profile, save_user_profile
 from core.support.api import support_api
 from core.support.models import Menu, Error
 from adapters.telegram.render import render_menu_to_kwargs
-from states import WmsTicketStates, WmsSettingsStates, PsiUserStates, LupaTicketStates, TpSectionStates
+from states import (
+    WmsTicketStates,
+    WmsSettingsStates,
+    PsiUserStates,
+    LupaTicketStates,
+    TpSectionStates,
+    PcIssueStates,
+    EmailOwaStates,
+    OrgtechIssueStates,
+    PeripheralEquipmentStates,
+    NetworkIssueStates,
+    ElectronicQueueStates,
+    EmailForwardingStates,
+    EmailGroupsStates,
+)
 from keyboards import (
     get_main_menu_keyboard,
     get_cancel_keyboard,
@@ -25,9 +39,32 @@ from keyboards import (
     get_lupa_request_type_keyboard,
     get_lupa_city_keyboard,
     get_lupa_skip_comment_keyboard,
+    get_pc_problem_kind_keyboard,
+    get_orgtech_kind_keyboard,
+    get_peripheral_kind_keyboard,
     LUPA_SERVICE_VALUES,
     LUPA_REQUEST_TYPE_VALUES,
 )
+from core.pc_problem import PC_PROBLEM_KIND_BY_ID
+from core.email_owa import EMAIL_OWA_REQUEST_KINDS, EMAIL_OWA_KIND_BY_ID
+from core.orgtech import ORGTECH_KIND_BY_ID
+from core.peripheral_equipment import PERIPHERAL_KIND_BY_ID
+from core.network_problem import (
+    NETWORK_TYPES,
+    NETWORK_TYPE_BY_ID,
+    NETWORK_PROVIDERS,
+    NETWORK_PROVIDER_BY_ID,
+    NETWORK_WIFI_OWNERS,
+    NETWORK_WIFI_OWNER_BY_ID,
+    NETWORK_PC_TYPES,
+    NETWORK_PC_TYPE_BY_ID,
+)
+from core.electronic_queue import (
+    ELECTRONIC_QUEUE_SERVICE_TYPES,
+    ELECTRONIC_QUEUE_SERVICE_TYPE_BY_ID,
+)
+from core.email_forwarding import EMAIL_FORWARDING_ON_OFF, EMAIL_FORWARDING_ON_OFF_BY_ID
+from core.email_groups import EMAIL_GROUPS_WHAT_TO_DO, EMAIL_GROUPS_WHAT_TO_DO_BY_ID
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -45,14 +82,752 @@ async def create_ticket_tp(callback: CallbackQuery, state: FSMContext):
         "📋 <b>Создать заявку в ТП</b>\n\nВ каком разделе создаём заявку?",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🌐 Сайт", callback_data="tp_section_site")],
-            [InlineKeyboardButton(text="📦 WMS", callback_data="tp_section_wms")],
+            [InlineKeyboardButton(text="💻 Программы и сайт", callback_data="tp_group_programs")],
+            [InlineKeyboardButton(text="🛠️ Оборудование", callback_data="tp_group_equipment")],
+            [InlineKeyboardButton(text="🧰 Услуги", callback_data="tp_group_services")],
             [InlineKeyboardButton(text="🔑 Смена пароля", callback_data="tp_section_password")],
             [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")],
         ]),
     )
     await callback.answer()
 
+
+@router.callback_query(lambda c: c.data == "tp_group_programs")
+async def tp_group_programs(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "💻 <b>Программы и сайт</b>\n\nВыберите направление:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌐 Поиск/Сайт", callback_data="tp_section_site")],
+            [InlineKeyboardButton(text="📦 WMS", callback_data="tp_section_wms")],
+            [InlineKeyboardButton(text="📧 Электронная почта", callback_data="tp_section_email")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="create_ticket_tp")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "tp_group_equipment")
+async def tp_group_equipment(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "🛠️ <b>Оборудование</b>\n\nВыберите тип заявки:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🖥️ Проблема в работе ПК", callback_data="pc_issue_start")],
+            [InlineKeyboardButton(text="🖨️ Оргтехника", callback_data="orgtech_issue_start")],
+            [InlineKeyboardButton(text="🧩 Периферийное оборудование", callback_data="peripheral_issue_start")],
+            [InlineKeyboardButton(text="📶 Проблемы в работе сети", callback_data="network_issue_start")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="create_ticket_tp")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "tp_group_services")
+async def tp_group_services(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "🧰 <b>Услуги</b>\n\nВыберите тип заявки:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎫 Электронная очередь", callback_data="electronic_queue_start")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="create_ticket_tp")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "tp_section_email")
+async def tp_section_email(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "📧 <b>Электронная почта</b>\n\nВыберите направление:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📨 Электронная почта (Owa\\Outlook)", callback_data="tp_email_owa_outlook")],
+            [InlineKeyboardButton(text="👥 Группы рассылки", callback_data="tp_email_groups")],
+            [InlineKeyboardButton(text="↪️ Настройка переадресации", callback_data="tp_email_forwarding")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_programs")],
+            [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({"tp_email_groups", "tp_email_forwarding"}))
+async def tp_section_email_stub(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    if callback.data == "tp_email_groups":
+        await _email_groups_start(callback, state)
+        await callback.answer()
+        return
+
+    # tp_email_forwarding — полноценный сценарий ниже
+    await _email_forwarding_start(callback, state)
+    await callback.answer()
+
+
+def _email_groups_what_to_do_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"email_groups_do:{oid}")] for oid, label in EMAIL_GROUPS_WHAT_TO_DO]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="email_groups_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _email_groups_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="email_groups_cancel")]])
+
+
+async def _email_groups_start(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(EmailGroupsStates.WAITING_FOR_WHAT_TO_DO)
+    await callback.message.edit_text(
+        "👥 <b>Группы рассылки</b>\n\nКакой тип работ вас интересует?",
+        parse_mode="HTML",
+        reply_markup=_email_groups_what_to_do_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "email_groups_cancel")
+async def email_groups_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await tp_section_email(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(EmailGroupsStates.WAITING_FOR_WHAT_TO_DO, F.data.startswith("email_groups_do:"))
+async def email_groups_select_what_to_do(callback: CallbackQuery, state: FSMContext):
+    oid = (callback.data.split(":", 1)[1] if callback.data else "").strip()
+    label = EMAIL_GROUPS_WHAT_TO_DO_BY_ID.get(oid)
+    if not label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(email_groups_what_to_do_id=oid, email_groups_what_to_do_label=label)
+    # Ветвление:
+    # 13012 create group -> name -> owner -> membership -> description
+    # 13013 delete group -> name -> description
+    # 13014 add member -> group email -> AD login
+    # 13015 remove member -> group email -> AD login
+    if oid in ("13012", "13013"):
+        await state.set_state(EmailGroupsStates.WAITING_FOR_GROUP_NAME)
+        await callback.message.edit_text(
+            f"👥 <b>Группы рассылки</b>\n\n✅ Тип работ: {label}\n\nВведите <b>Название группы рассылки</b>:",
+            parse_mode="HTML",
+            reply_markup=_email_groups_cancel_keyboard(),
+        )
+    else:
+        await state.set_state(EmailGroupsStates.WAITING_FOR_GROUP_EMAIL)
+        await callback.message.edit_text(
+            f"👥 <b>Группы рассылки</b>\n\n✅ Тип работ: {label}\n\nВведите <b>Адрес группы рассылки</b> (email):",
+            parse_mode="HTML",
+            reply_markup=_email_groups_cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(EmailGroupsStates.WAITING_FOR_GROUP_NAME, F.text)
+async def email_groups_group_name(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not text:
+        await message.answer("❌ Название не может быть пустым. Введите название группы.")
+        return
+    await state.update_data(email_groups_group_name=text)
+    data = await state.get_data()
+    what_id = (data.get("email_groups_what_to_do_id") or "").strip()
+    if what_id == "13012":
+        await state.set_state(EmailGroupsStates.WAITING_FOR_GROUP_OWNER)
+        await message.answer("Введите <b>Владельца группы рассылки</b> (email, например i.vanov@petrovich.ru):", parse_mode="HTML", reply_markup=_email_groups_cancel_keyboard())
+        return
+    # 13013
+    await state.set_state(EmailGroupsStates.WAITING_FOR_DESCRIPTION)
+    await message.answer("Введите <b>Причину изменения</b>:", parse_mode="HTML", reply_markup=_email_groups_cancel_keyboard())
+
+
+@router.message(EmailGroupsStates.WAITING_FOR_GROUP_OWNER, F.text)
+async def email_groups_group_owner(message: Message, state: FSMContext):
+    owner = (message.text or "").strip()
+    if owner.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not _looks_like_email(owner):
+        await message.answer("❌ Похоже, это не email. Введите адрес в формате name@domain.tld.")
+        return
+    await state.update_data(email_groups_group_owner=owner)
+    await state.set_state(EmailGroupsStates.WAITING_FOR_GROUP_MEMBERSHIP)
+    await message.answer(
+        "Введите <b>Кто будет входить в группу рассылки</b>.\n"
+        "Можно перечислить несколько email через запятую/перенос строки:",
+        parse_mode="HTML",
+        reply_markup=_email_groups_cancel_keyboard(),
+    )
+
+
+@router.message(EmailGroupsStates.WAITING_FOR_GROUP_MEMBERSHIP, F.text)
+async def email_groups_group_membership(message: Message, state: FSMContext):
+    members = (message.text or "").strip()
+    if members.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not members:
+        await message.answer("❌ Поле не может быть пустым. Укажите хотя бы одного участника (email).")
+        return
+    await state.update_data(email_groups_group_membership=members)
+    await state.set_state(EmailGroupsStates.WAITING_FOR_DESCRIPTION)
+    await message.answer("Введите <b>Причину изменения</b>:", parse_mode="HTML", reply_markup=_email_groups_cancel_keyboard())
+
+
+@router.message(EmailGroupsStates.WAITING_FOR_GROUP_EMAIL, F.text)
+async def email_groups_group_email(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    # В Jira часто поле принимает "Имя <email@...>", вытащим email если так.
+    email = raw
+    if "<" in raw and ">" in raw:
+        inner = raw.split("<", 1)[1].split(">", 1)[0].strip()
+        if inner:
+            email = inner
+    if not _looks_like_email(email):
+        await message.answer("❌ Похоже, это не email. Введите адрес группы рассылки (например, group@petrovich.ru).")
+        return
+    await state.update_data(email_groups_group_email=email)
+    await state.set_state(EmailGroupsStates.WAITING_FOR_AD_LOGIN)
+    await message.answer("Введите <b>Имя учетной записи сотрудника</b> (AD Login) в формате <b>i.vanov</b>:", parse_mode="HTML", reply_markup=_email_groups_cancel_keyboard())
+
+
+def _looks_like_ad_login(value: str) -> bool:
+    v = (value or "").strip()
+    if not v or " " in v or "@" in v:
+        return False
+    if "." not in v:
+        return False
+    left, _, right = v.partition(".")
+    if not left or not right:
+        return False
+    allowed = "abcdefghijklmnopqrstuvwxyz0123456789._-"
+    vv = v.lower()
+    return all(c in allowed for c in vv)
+
+
+@router.message(EmailGroupsStates.WAITING_FOR_AD_LOGIN, F.text)
+async def email_groups_ad_login(message: Message, state: FSMContext):
+    login = (message.text or "").strip()
+    if login.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not _looks_like_ad_login(login):
+        await message.answer("❌ Нужен AD Login строго в формате <b>i.vanov</b> (без @ и домена).", parse_mode="HTML")
+        return
+    await state.update_data(email_groups_ad_login=login)
+    await _email_groups_finish(message, state)
+
+
+@router.message(EmailGroupsStates.WAITING_FOR_DESCRIPTION, F.text)
+async def email_groups_description(message: Message, state: FSMContext):
+    desc = (message.text or "").strip()
+    if desc.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not desc:
+        await message.answer("❌ Причина изменения не может быть пустой.")
+        return
+    await state.update_data(email_groups_description=desc)
+    await _email_groups_finish(message, state)
+
+
+async def _email_groups_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+    what_id = (data.get("email_groups_what_to_do_id") or "").strip()
+    what_label = (data.get("email_groups_what_to_do_label") or "").strip()
+
+    form_data = {"what_to_do": what_id}
+    # ветка 1
+    if what_id == "13012":
+        form_data.update({
+            "group_name": (data.get("email_groups_group_name") or "").strip(),
+            "group_owner": (data.get("email_groups_group_owner") or "").strip(),
+            "group_membership": (data.get("email_groups_group_membership") or "").strip(),
+            "description": (data.get("email_groups_description") or "").strip(),
+        })
+        missing = [k for k in ("group_name", "group_owner", "group_membership", "description") if not (form_data.get(k) or "").strip()]
+        if missing:
+            await message.answer("❌ Не все поля заполнены. Начните заново.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+            await state.clear()
+            return
+    # ветка 2
+    elif what_id == "13013":
+        form_data.update({
+            "group_name": (data.get("email_groups_group_name") or "").strip(),
+            "description": (data.get("email_groups_description") or "").strip(),
+        })
+        missing = [k for k in ("group_name", "description") if not (form_data.get(k) or "").strip()]
+        if missing:
+            await message.answer("❌ Не все поля заполнены. Начните заново.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+            await state.clear()
+            return
+    # ветки 3/4
+    elif what_id in ("13014", "13015"):
+        form_data.update({
+            "group_email": (data.get("email_groups_group_email") or "").strip(),
+            "ad_login": (data.get("email_groups_ad_login") or "").strip(),
+        })
+        missing = [k for k in ("group_email", "ad_login") if not (form_data.get(k) or "").strip()]
+        if missing:
+            await message.answer("❌ Не все поля заполнены. Начните заново.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+            await state.clear()
+            return
+    else:
+        await message.answer("❌ Неизвестный тип работ. Начните заново.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        await state.clear()
+        return
+
+    success, issue_key, msg = await support_api.create_ticket(CHANNEL_ID, message.from_user.id, "email_groups", form_data)
+    await state.clear()
+    if not success:
+        await message.answer(f"❌ Ошибка Jira: {issue_key}")
+        return
+    # пользователю полезно видеть выбранный тип работ
+    await message.answer(f"✅ {what_label}\n\n{msg}", disable_web_page_preview=True)
+
+
+def _email_forwarding_on_off_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"email_fwd_onoff:{oid}")] for oid, label in EMAIL_FORWARDING_ON_OFF]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="email_fwd_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _email_forwarding_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="email_fwd_cancel")]])
+
+
+async def _email_forwarding_start(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(EmailForwardingStates.WAITING_FOR_ON_OFF)
+    await callback.message.edit_text(
+        "↪️ <b>Настройка переадресации</b>\n\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=_email_forwarding_on_off_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "email_fwd_cancel")
+async def email_forwarding_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await tp_section_email(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(EmailForwardingStates.WAITING_FOR_ON_OFF, F.data.startswith("email_fwd_onoff:"))
+async def email_forwarding_select_on_off(callback: CallbackQuery, state: FSMContext):
+    oid = (callback.data.split(":", 1)[1] if callback.data else "").strip()
+    if oid not in EMAIL_FORWARDING_ON_OFF_BY_ID:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(email_fwd_on_off=oid)
+    await state.set_state(EmailForwardingStates.WAITING_FOR_EMAIL_FROM)
+    await callback.message.edit_text(
+        "Введите email, <b>с которого</b> нужно установить переадресацию (например, name@petrovich.ru):",
+        parse_mode="HTML",
+        reply_markup=_email_forwarding_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+def _looks_like_email(value: str) -> bool:
+    v = (value or "").strip()
+    if len(v) < 5 or "@" not in v or " " in v:
+        return False
+    local, _, domain = v.partition("@")
+    if not local or not domain or "." not in domain:
+        return False
+    return True
+
+
+@router.message(EmailForwardingStates.WAITING_FOR_EMAIL_FROM, F.text)
+async def email_forwarding_email_from(message: Message, state: FSMContext):
+    email_from = (message.text or "").strip()
+    if email_from.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not _looks_like_email(email_from):
+        await message.answer("❌ Похоже, это не email. Введите адрес в формате name@domain.tld.")
+        return
+    await state.update_data(email_fwd_email_from=email_from)
+    await state.set_state(EmailForwardingStates.WAITING_FOR_EMAIL_TO)
+    await message.answer("Введите email, <b>на который</b> нужно установить переадресацию:", parse_mode="HTML", reply_markup=_email_forwarding_cancel_keyboard())
+
+
+@router.message(EmailForwardingStates.WAITING_FOR_EMAIL_TO, F.text)
+async def email_forwarding_email_to(message: Message, state: FSMContext):
+    email_to = (message.text or "").strip()
+    if email_to.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not _looks_like_email(email_to):
+        await message.answer("❌ Похоже, это не email. Введите адрес в формате name@domain.tld.")
+        return
+    await state.update_data(email_fwd_email_to=email_to)
+    await state.set_state(EmailForwardingStates.WAITING_FOR_DATE)
+    await message.answer(
+        "Введите дату включения/выключения переадресации.\n\nФормат: <b>YYYY-MM-DD</b> (например, 2026-03-16) или <b>DD.MM.YYYY</b>.",
+        parse_mode="HTML",
+        reply_markup=_email_forwarding_cancel_keyboard(),
+    )
+
+
+def _parse_date_to_yyyy_mm_dd(value: str) -> str | None:
+    import datetime as _dt
+
+    v = (value or "").strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return _dt.datetime.strptime(v, fmt).date().isoformat()
+        except Exception:
+            pass
+    return None
+
+
+@router.message(EmailForwardingStates.WAITING_FOR_DATE, F.text)
+async def email_forwarding_date(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    d = _parse_date_to_yyyy_mm_dd(raw)
+    if not d:
+        await message.answer("❌ Не понял дату. Введите YYYY-MM-DD или DD.MM.YYYY.")
+        return
+    data = await state.get_data()
+    on_off = (data.get("email_fwd_on_off") or "").strip()
+    email_from = (data.get("email_fwd_email_from") or "").strip()
+    email_to = (data.get("email_fwd_email_to") or "").strip()
+
+    # Jira validValues для customfield_13688:
+    # 13006 = Включить, 13007 = Выключить
+    on_off_value = "13006" if on_off == "email_fwd_on" else "13007"
+
+    form_data = {
+        "on_off": on_off_value,
+        "email_from": email_from,
+        "email_to": email_to,
+        "redirection_date": d,
+    }
+    success, issue_key, msg = await support_api.create_ticket(CHANNEL_ID, message.from_user.id, "email_forwarding", form_data)
+    await state.clear()
+    if not success:
+        await message.answer(f"❌ Ошибка Jira: {issue_key}")
+        return
+    await message.answer(msg, disable_web_page_preview=True)
+
+
+def _email_owa_request_kind_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=key)] for key, label in EMAIL_OWA_REQUEST_KINDS]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _email_owa_workplace_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data="email_owa_skip_workplace")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+def _email_owa_attachments_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Создать заявку", callback_data="email_owa_finish_ticket")],
+        [InlineKeyboardButton(text="⏭ Пропустить вложения", callback_data="email_owa_skip_attachments")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+@router.callback_query(lambda c: c.data == "tp_email_owa_outlook")
+async def tp_email_owa_outlook_start(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(EmailOwaStates.WAITING_FOR_REQUEST_KIND)
+    await callback.message.edit_text(
+        "📨 <b>Электронная почта (Owa\\Outlook)</b>\n\nВыберите ваш запрос:",
+        parse_mode="HTML",
+        reply_markup=_email_owa_request_kind_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(EmailOwaStates.WAITING_FOR_REQUEST_KIND, F.data.in_(set(EMAIL_OWA_KIND_BY_ID.keys())))
+async def tp_email_owa_select_kind(callback: CallbackQuery, state: FSMContext):
+    kind_key = (callback.data or "").strip()
+    kind_label = EMAIL_OWA_KIND_BY_ID.get(kind_key)
+    if not kind_label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(request_kind=kind_label)
+    await state.set_state(EmailOwaStates.WAITING_FOR_RMS_OR_IP)
+    await callback.message.edit_text(
+        "📨 <b>Электронная почта (Owa\\Outlook)</b>\n\n"
+        f"✅ Запрос: {kind_label}\n\n"
+        "Укажите RMS или IP:",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(EmailOwaStates.WAITING_FOR_REQUEST_KIND, F.text)
+async def tp_email_owa_kind_text(message: Message):
+    await message.reply("Выберите тип запроса кнопкой ниже.", reply_markup=_email_owa_request_kind_keyboard())
+
+
+@router.message(EmailOwaStates.WAITING_FOR_RMS_OR_IP, F.text)
+async def tp_email_owa_rms(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not text:
+        await message.reply("Укажите RMS или IP.", reply_markup=get_cancel_keyboard())
+        return
+    await state.update_data(rms_or_ip=text)
+    await state.set_state(EmailOwaStates.WAITING_FOR_WORKPLACE)
+    await message.reply(
+        "Укажите номер или местоположение рабочего места (опционально) или нажмите «Пропустить».",
+        reply_markup=_email_owa_workplace_keyboard(),
+    )
+
+
+@router.callback_query(EmailOwaStates.WAITING_FOR_WORKPLACE, F.data == "email_owa_skip_workplace")
+async def tp_email_owa_skip_workplace(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(workplace="")
+    await state.set_state(EmailOwaStates.WAITING_FOR_DESCRIPTION)
+    await callback.message.edit_text(
+        "Введите подробное описание проблемы:",
+        reply_markup=get_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(EmailOwaStates.WAITING_FOR_WORKPLACE, F.text)
+async def tp_email_owa_workplace(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    await state.update_data(workplace=text)
+    await state.set_state(EmailOwaStates.WAITING_FOR_DESCRIPTION)
+    await message.reply("Введите подробное описание проблемы:", reply_markup=get_cancel_keyboard())
+
+
+@router.message(EmailOwaStates.WAITING_FOR_DESCRIPTION, F.text)
+async def tp_email_owa_description(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not text:
+        await message.reply("Описание не может быть пустым.", reply_markup=get_cancel_keyboard())
+        return
+    await state.update_data(description=text, email_owa_attachment_file_ids=[])
+    await state.set_state(EmailOwaStates.WAITING_FOR_ATTACHMENTS)
+    await message.reply(
+        "📎 Приложите фото/видео/документы (опционально) или нажмите «Создать заявку».",
+        reply_markup=_email_owa_attachments_keyboard(),
+    )
+
+
+@router.message(EmailOwaStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+async def tp_email_owa_attachment_add(message: Message, state: FSMContext):
+    data = await state.get_data()
+    file_ids = list(data.get("email_owa_attachment_file_ids") or [])
+    if len(file_ids) >= 10:
+        await message.reply("Достигнут лимит 10 файлов.", reply_markup=_email_owa_attachments_keyboard())
+        return
+    file_id = None
+    if message.photo:
+        photo = message.photo[-1]
+        if getattr(photo, "file_size", 0) and photo.file_size > 10 * 1024 * 1024:
+            await message.reply("Фото не должно превышать 10 МБ.", reply_markup=_email_owa_attachments_keyboard())
+            return
+        file_id = photo.file_id
+    elif message.document:
+        if message.document.file_size and message.document.file_size > 10 * 1024 * 1024:
+            await message.reply("Файл не должен превышать 10 МБ.", reply_markup=_email_owa_attachments_keyboard())
+            return
+        file_id = message.document.file_id
+    elif message.video:
+        if message.video.file_size and message.video.file_size > 10 * 1024 * 1024:
+            await message.reply("Видео не должно превышать 10 МБ.", reply_markup=_email_owa_attachments_keyboard())
+            return
+        file_id = message.video.file_id
+    if file_id:
+        file_ids.append(file_id)
+        await state.update_data(email_owa_attachment_file_ids=file_ids)
+        await message.reply(f"📎 Добавлено {len(file_ids)} из 10.", reply_markup=_email_owa_attachments_keyboard())
+
+
+async def _finish_email_owa_common(callback: CallbackQuery, state: FSMContext, file_ids: list):
+    data = await state.get_data()
+    profile = get_user_profile(callback.from_user.id) or {}
+    department = (profile.get("department") or "").strip()
+    phone = (profile.get("phone") or "").strip()
+    jira_username = (profile.get("jira_username") or "").strip()
+    if not department:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указано подразделение. Сначала выберите его в заявке Lupa.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    if not phone:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указан телефон. Перепройдите регистрацию или привяжите аккаунт.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    if not jira_username:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указан Jira-пользователь (Reporter). Перепройдите регистрацию.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+
+    form_data = {
+        "request_kind": (data.get("request_kind") or "").strip(),
+        "rms_or_ip": (data.get("rms_or_ip") or "").strip(),
+        "workplace": (data.get("workplace") or "").strip(),
+        "description": (data.get("description") or "").strip(),
+    }
+
+    attachment_paths = []
+    if file_ids:
+        import os
+        import tempfile
+        bot = callback.bot
+        for fid in file_ids[:10]:
+            try:
+                f = await bot.get_file(fid)
+                safe_name = f.file_path.replace("/", "_").replace("\\", "_") if f.file_path else str(fid)
+                path = os.path.join(tempfile.gettempdir(), f"email_owa_attach_{safe_name}")
+                await bot.download_file(f.file_path, path)
+                if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
+                    attachment_paths.append(path)
+            except Exception as e:
+                logger.warning("Скачивание вложения TG email_owa %s: %s", fid[:20] if isinstance(fid, str) else fid, e)
+    try:
+        success, issue_key, msg = await support_api.create_ticket(
+            CHANNEL_ID,
+            callback.from_user.id,
+            "email_owa_outlook",
+            form_data,
+            attachment_paths=attachment_paths,
+        )
+        display_text = msg or issue_key
+        await state.clear()
+        await callback.message.edit_text(
+            f"✅ {display_text}" if success else f"❌ {display_text}",
+            parse_mode="HTML",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+    finally:
+        import os
+        for p in attachment_paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
+@router.callback_query(EmailOwaStates.WAITING_FOR_ATTACHMENTS, F.data == "email_owa_skip_attachments")
+async def tp_email_owa_skip_attachments(callback: CallbackQuery, state: FSMContext):
+    await _finish_email_owa_common(callback, state, [])
+
+
+@router.callback_query(EmailOwaStates.WAITING_FOR_ATTACHMENTS, F.data == "email_owa_finish_ticket")
+async def tp_email_owa_finish(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_ids = data.get("email_owa_attachment_file_ids") or []
+    await _finish_email_owa_common(callback, state, file_ids)
+
+
+@router.callback_query(lambda c: c.data == "pc_issue_start")
+async def pc_issue_start(callback: CallbackQuery, state: FSMContext):
+    """Старт сценария «Проблема в работе ПК»."""
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(PcIssueStates.WAITING_FOR_KIND)
+    await callback.message.edit_text(
+        "🖥️ <b>Проблема в работе ПК</b>\n\nС чем наблюдаются проблемы?",
+        parse_mode="HTML",
+        reply_markup=get_pc_problem_kind_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(PcIssueStates.WAITING_FOR_KIND, F.data.startswith("pc_kind_"))
+async def pc_issue_select_kind(callback: CallbackQuery, state: FSMContext):
+    kind_id = callback.data.replace("pc_kind_", "", 1).strip()
+    kind_label = PC_PROBLEM_KIND_BY_ID.get(kind_id)
+    if not kind_label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(pc_problem_kind_id=kind_id, pc_problem_kind_label=kind_label)
+    await state.set_state(PcIssueStates.WAITING_FOR_DESCRIPTION)
+    await callback.message.edit_text(
+        "🖥️ <b>Проблема в работе ПК</b>\n\n"
+        f"✅ Категория: {kind_label}\n\n"
+        "Опишите проблему (поле Description) или нажмите «Пропустить».",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="pc_skip_description")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.message(PcIssueStates.WAITING_FOR_KIND, F.text)
+async def pc_issue_kind_text(message: Message):
+    await message.reply("Выберите категорию кнопкой ниже.", reply_markup=get_pc_problem_kind_keyboard())
 
 @router.callback_query(lambda c: c.data == "tp_section_password")
 async def tp_section_password(callback: CallbackQuery, state: FSMContext):
@@ -470,7 +1245,7 @@ async def wms_type_back(callback: CallbackQuery, state: FSMContext):
             "📋 <b>Создать заявку в ТП</b>\n\nВ каком разделе создаём заявку?",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🌐 Сайт", callback_data="tp_section_site")],
+                [InlineKeyboardButton(text="🌐 Поиск/Сайт", callback_data="tp_section_site")],
                 [InlineKeyboardButton(text="📦 WMS", callback_data="tp_section_wms")],
                 [InlineKeyboardButton(text="🔑 Смена пароля", callback_data="tp_section_password")],
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main")],
@@ -1054,6 +1829,1049 @@ def _psi_user_attachments_keyboard():
         [InlineKeyboardButton(text="⏭ Пропустить вложения", callback_data="skip_psi_attachment")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
     ])
+
+
+def _pc_issue_attachments_keyboard():
+    """Вложения для заявки ПК: завершить или пропустить."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Создать заявку", callback_data="pc_finish_ticket")],
+        [InlineKeyboardButton(text="⏭ Пропустить вложения", callback_data="pc_skip_attachments")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+async def _pc_issue_enter_attachments(callback_or_message, state: FSMContext, is_callback: bool):
+    await state.set_state(PcIssueStates.WAITING_FOR_ATTACHMENTS)
+    await state.update_data(pc_attachment_file_ids=[])
+    text = (
+        "🖥️ <b>Проблема в работе ПК</b>\n\n"
+        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
+        "или нажмите «Создать заявку» / «Пропустить вложения»."
+    )
+    if is_callback:
+        await callback_or_message.message.edit_text(text, parse_mode="HTML", reply_markup=_pc_issue_attachments_keyboard())
+        await callback_or_message.answer()
+    else:
+        await callback_or_message.reply(text, parse_mode="HTML", reply_markup=_pc_issue_attachments_keyboard())
+
+
+@router.callback_query(PcIssueStates.WAITING_FOR_DESCRIPTION, F.data == "pc_skip_description")
+async def pc_skip_description(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(description="")
+    await _pc_issue_enter_attachments(callback, state, is_callback=True)
+
+
+@router.message(PcIssueStates.WAITING_FOR_DESCRIPTION, F.text)
+async def pc_description(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    await state.update_data(description=(message.text or "").strip())
+    await _pc_issue_enter_attachments(message, state, is_callback=False)
+
+
+@router.message(PcIssueStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+async def pc_attachment_add(message: Message, state: FSMContext):
+    data = await state.get_data()
+    file_ids = list(data.get("pc_attachment_file_ids") or [])
+    if len(file_ids) >= 10:
+        await message.reply("Достигнут лимит 10 файлов.", reply_markup=_pc_issue_attachments_keyboard())
+        return
+    file_id = None
+    if message.photo:
+        photo = message.photo[-1]
+        if getattr(photo, "file_size", 0) and photo.file_size > 10 * 1024 * 1024:
+            await message.reply("Фото не должно превышать 10 МБ.", reply_markup=_pc_issue_attachments_keyboard())
+            return
+        file_id = photo.file_id
+    elif message.document:
+        if message.document.file_size and message.document.file_size > 10 * 1024 * 1024:
+            await message.reply("Файл не должен превышать 10 МБ.", reply_markup=_pc_issue_attachments_keyboard())
+            return
+        file_id = message.document.file_id
+    elif message.video:
+        if message.video.file_size and message.video.file_size > 10 * 1024 * 1024:
+            await message.reply("Видео не должно превышать 10 МБ.", reply_markup=_pc_issue_attachments_keyboard())
+            return
+        file_id = message.video.file_id
+    if file_id:
+        file_ids.append(file_id)
+        await state.update_data(pc_attachment_file_ids=file_ids)
+        await message.reply(
+            f"📎 Добавлено {len(file_ids)} из 10. Можно добавить ещё или завершить создание заявки.",
+            reply_markup=_pc_issue_attachments_keyboard(),
+        )
+
+
+async def _finish_pc_issue_common(callback: CallbackQuery, state: FSMContext, file_ids: list):
+    data = await state.get_data()
+    profile = get_user_profile(callback.from_user.id) or {}
+    department = (profile.get("department") or "").strip()
+    phone = (profile.get("phone") or "").strip()
+    jira_username = (profile.get("jira_username") or "").strip()
+    if not department:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указано подразделение. Сначала выберите его в заявке Lupa.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    if not phone:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указан телефон. Перепройдите регистрацию или привяжите аккаунт.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    if not jira_username:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указан Jira-пользователь (Reporter). Перепройдите регистрацию.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+
+    form_data = {
+        "pc_problem_kind_id": (data.get("pc_problem_kind_id") or "").strip(),
+        "description": (data.get("description") or "").strip(),
+    }
+
+    attachment_paths = []
+    if file_ids:
+        import os
+        import tempfile
+
+        bot = callback.bot
+        for fid in file_ids[:10]:
+            try:
+                f = await bot.get_file(fid)
+                safe_name = f.file_path.replace("/", "_").replace("\\", "_") if f.file_path else str(fid)
+                path = os.path.join(tempfile.gettempdir(), f"pc_attach_{safe_name}")
+                await bot.download_file(f.file_path, path)
+                if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
+                    attachment_paths.append(path)
+            except Exception as e:
+                logger.warning("Скачивание вложения TG pc_problem %s: %s", fid[:20] if isinstance(fid, str) else fid, e)
+
+    try:
+        success, issue_key, msg = await support_api.create_ticket(
+            CHANNEL_ID, callback.from_user.id, "pc_problem", form_data, attachment_paths=attachment_paths
+        )
+        display_text = msg or issue_key
+        await state.clear()
+        await callback.message.edit_text(
+            f"✅ {display_text}" if success else f"❌ {display_text}",
+            parse_mode="HTML",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+    finally:
+        import os
+        for p in attachment_paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
+@router.callback_query(PcIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "pc_skip_attachments")
+async def pc_skip_attachments(callback: CallbackQuery, state: FSMContext):
+    await _finish_pc_issue_common(callback, state, [])
+
+
+@router.callback_query(PcIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "pc_finish_ticket")
+async def pc_finish_ticket(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_ids = data.get("pc_attachment_file_ids") or []
+    await _finish_pc_issue_common(callback, state, file_ids)
+
+
+def _orgtech_desc_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data="orgtech_skip_description")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+def _orgtech_attachments_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Создать заявку", callback_data="orgtech_finish_ticket")],
+        [InlineKeyboardButton(text="⏭ Пропустить вложения", callback_data="orgtech_skip_attachments")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+@router.callback_query(lambda c: c.data == "orgtech_issue_start")
+async def orgtech_issue_start(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(OrgtechIssueStates.WAITING_FOR_KIND)
+    await callback.message.edit_text(
+        "🖨️ <b>Оргтехника</b>\n\nУкажите тип оргтехники:",
+        parse_mode="HTML",
+        reply_markup=get_orgtech_kind_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(OrgtechIssueStates.WAITING_FOR_KIND, F.data.startswith("orgtech_kind_"))
+async def orgtech_select_kind(callback: CallbackQuery, state: FSMContext):
+    kind_id = callback.data.replace("orgtech_kind_", "", 1).strip()
+    kind_label = ORGTECH_KIND_BY_ID.get(kind_id)
+    if not kind_label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(orgtech_kind=kind_label)
+    await state.set_state(OrgtechIssueStates.WAITING_FOR_LOCATION)
+    await callback.message.edit_text(
+        "🖨️ <b>Оргтехника</b>\n\n"
+        f"✅ Тип: {kind_label}\n\n"
+        "Укажите местоположение (обязательно):",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(OrgtechIssueStates.WAITING_FOR_KIND, F.text)
+async def orgtech_kind_text(message: Message):
+    await message.reply("Выберите тип оргтехники кнопкой ниже.", reply_markup=get_orgtech_kind_keyboard())
+
+
+@router.message(OrgtechIssueStates.WAITING_FOR_LOCATION, F.text)
+async def orgtech_location(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not text:
+        await message.reply("Укажите местоположение.", reply_markup=get_cancel_keyboard())
+        return
+    await state.update_data(location=text)
+    await state.set_state(OrgtechIssueStates.WAITING_FOR_DESCRIPTION)
+    await message.reply(
+        "Опишите проблему (поле Description) или нажмите «Пропустить».",
+        reply_markup=_orgtech_desc_keyboard(),
+    )
+
+
+@router.callback_query(OrgtechIssueStates.WAITING_FOR_DESCRIPTION, F.data == "orgtech_skip_description")
+async def orgtech_skip_description(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(description="", orgtech_attachment_file_ids=[])
+    await state.set_state(OrgtechIssueStates.WAITING_FOR_ATTACHMENTS)
+    await callback.message.edit_text(
+        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
+        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        reply_markup=_orgtech_attachments_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(OrgtechIssueStates.WAITING_FOR_DESCRIPTION, F.text)
+async def orgtech_description(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    await state.update_data(description=text, orgtech_attachment_file_ids=[])
+    await state.set_state(OrgtechIssueStates.WAITING_FOR_ATTACHMENTS)
+    await message.reply(
+        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
+        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        reply_markup=_orgtech_attachments_keyboard(),
+    )
+
+
+@router.message(OrgtechIssueStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+async def orgtech_attachment_add(message: Message, state: FSMContext):
+    data = await state.get_data()
+    file_ids = list(data.get("orgtech_attachment_file_ids") or [])
+    if len(file_ids) >= 10:
+        await message.reply("Достигнут лимит 10 файлов.", reply_markup=_orgtech_attachments_keyboard())
+        return
+    file_id = None
+    if message.photo:
+        photo = message.photo[-1]
+        if getattr(photo, "file_size", 0) and photo.file_size > 10 * 1024 * 1024:
+            await message.reply("Фото не должно превышать 10 МБ.", reply_markup=_orgtech_attachments_keyboard())
+            return
+        file_id = photo.file_id
+    elif message.document:
+        if message.document.file_size and message.document.file_size > 10 * 1024 * 1024:
+            await message.reply("Файл не должен превышать 10 МБ.", reply_markup=_orgtech_attachments_keyboard())
+            return
+        file_id = message.document.file_id
+    elif message.video:
+        if message.video.file_size and message.video.file_size > 10 * 1024 * 1024:
+            await message.reply("Видео не должно превышать 10 МБ.", reply_markup=_orgtech_attachments_keyboard())
+            return
+        file_id = message.video.file_id
+    if file_id:
+        file_ids.append(file_id)
+        await state.update_data(orgtech_attachment_file_ids=file_ids)
+        await message.reply(f"📎 Добавлено {len(file_ids)} из 10.", reply_markup=_orgtech_attachments_keyboard())
+
+
+async def _finish_orgtech_common(callback: CallbackQuery, state: FSMContext, file_ids: list):
+    data = await state.get_data()
+    profile = get_user_profile(callback.from_user.id) or {}
+    department = (profile.get("department") or "").strip()
+    phone = (profile.get("phone") or "").strip()
+    jira_username = (profile.get("jira_username") or "").strip()
+    if not department:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указано подразделение. Сначала выберите его в заявке Lupa.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    if not phone:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указан телефон. Перепройдите регистрацию или привяжите аккаунт.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    if not jira_username:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указан Jira-пользователь (Reporter). Перепройдите регистрацию.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+
+    form_data = {
+        "orgtech_kind": (data.get("orgtech_kind") or "").strip(),
+        "location": (data.get("location") or "").strip(),
+        "description": (data.get("description") or "").strip(),
+    }
+    attachment_paths = []
+    if file_ids:
+        import os
+        import tempfile
+        bot = callback.bot
+        for fid in file_ids[:10]:
+            try:
+                f = await bot.get_file(fid)
+                safe_name = f.file_path.replace("/", "_").replace("\\", "_") if f.file_path else str(fid)
+                path = os.path.join(tempfile.gettempdir(), f"orgtech_attach_{safe_name}")
+                await bot.download_file(f.file_path, path)
+                if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
+                    attachment_paths.append(path)
+            except Exception as e:
+                logger.warning("Скачивание вложения TG orgtech %s: %s", fid[:20] if isinstance(fid, str) else fid, e)
+
+    try:
+        success, issue_key, msg = await support_api.create_ticket(
+            CHANNEL_ID, callback.from_user.id, "orgtech_problem", form_data, attachment_paths=attachment_paths
+        )
+        display_text = msg or issue_key
+        await state.clear()
+        await callback.message.edit_text(
+            f"✅ {display_text}" if success else f"❌ {display_text}",
+            parse_mode="HTML",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+    finally:
+        import os
+        for p in attachment_paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
+@router.callback_query(OrgtechIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "orgtech_skip_attachments")
+async def orgtech_skip_attachments(callback: CallbackQuery, state: FSMContext):
+    await _finish_orgtech_common(callback, state, [])
+
+
+@router.callback_query(OrgtechIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "orgtech_finish_ticket")
+async def orgtech_finish_ticket(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_ids = data.get("orgtech_attachment_file_ids") or []
+    await _finish_orgtech_common(callback, state, file_ids)
+
+
+def _peripheral_desc_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data="peripheral_skip_description")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+def _peripheral_attachments_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Создать заявку", callback_data="peripheral_finish_ticket")],
+        [InlineKeyboardButton(text="⏭ Пропустить вложения", callback_data="peripheral_skip_attachments")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+@router.callback_query(lambda c: c.data == "peripheral_issue_start")
+async def peripheral_issue_start(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(PeripheralEquipmentStates.WAITING_FOR_KIND)
+    await callback.message.edit_text(
+        "🧩 <b>Периферийное оборудование</b>\n\nВыберите вид оборудования:",
+        parse_mode="HTML",
+        reply_markup=get_peripheral_kind_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(PeripheralEquipmentStates.WAITING_FOR_KIND, F.data.startswith("peripheral_kind_"))
+async def peripheral_select_kind(callback: CallbackQuery, state: FSMContext):
+    kind_id = callback.data.replace("peripheral_kind_", "", 1).strip()
+    kind_label = PERIPHERAL_KIND_BY_ID.get(kind_id)
+    if not kind_label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(peripheral_kind=kind_label)
+    await state.set_state(PeripheralEquipmentStates.WAITING_FOR_IP)
+    await callback.message.edit_text(
+        "🧩 <b>Периферийное оборудование</b>\n\n"
+        f"✅ Вид оборудования: {kind_label}\n\n"
+        "Укажите IP адрес (если нет, напишите «нет»):",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(PeripheralEquipmentStates.WAITING_FOR_KIND, F.text)
+async def peripheral_kind_text(message: Message):
+    await message.reply("Выберите вид оборудования кнопкой ниже.", reply_markup=get_peripheral_kind_keyboard())
+
+
+@router.message(PeripheralEquipmentStates.WAITING_FOR_IP, F.text)
+async def peripheral_ip(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not text:
+        await message.reply("Укажите IP адрес или «нет».", reply_markup=get_cancel_keyboard())
+        return
+    await state.update_data(ip_address=text)
+    await state.set_state(PeripheralEquipmentStates.WAITING_FOR_DESCRIPTION)
+    await message.reply("Опишите проблему (Description) или нажмите «Пропустить».", reply_markup=_peripheral_desc_keyboard())
+
+
+@router.callback_query(PeripheralEquipmentStates.WAITING_FOR_DESCRIPTION, F.data == "peripheral_skip_description")
+async def peripheral_skip_description(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(description="", peripheral_attachment_file_ids=[])
+    await state.set_state(PeripheralEquipmentStates.WAITING_FOR_ATTACHMENTS)
+    await callback.message.edit_text(
+        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
+        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        reply_markup=_peripheral_attachments_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(PeripheralEquipmentStates.WAITING_FOR_DESCRIPTION, F.text)
+async def peripheral_description(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    await state.update_data(description=text, peripheral_attachment_file_ids=[])
+    await state.set_state(PeripheralEquipmentStates.WAITING_FOR_ATTACHMENTS)
+    await message.reply(
+        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
+        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        reply_markup=_peripheral_attachments_keyboard(),
+    )
+
+
+@router.message(PeripheralEquipmentStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+async def peripheral_attachment_add(message: Message, state: FSMContext):
+    data = await state.get_data()
+    file_ids = list(data.get("peripheral_attachment_file_ids") or [])
+    if len(file_ids) >= 10:
+        await message.reply("Достигнут лимит 10 файлов.", reply_markup=_peripheral_attachments_keyboard())
+        return
+    file_id = None
+    if message.photo:
+        photo = message.photo[-1]
+        if getattr(photo, "file_size", 0) and photo.file_size > 10 * 1024 * 1024:
+            await message.reply("Фото не должно превышать 10 МБ.", reply_markup=_peripheral_attachments_keyboard())
+            return
+        file_id = photo.file_id
+    elif message.document:
+        if message.document.file_size and message.document.file_size > 10 * 1024 * 1024:
+            await message.reply("Файл не должен превышать 10 МБ.", reply_markup=_peripheral_attachments_keyboard())
+            return
+        file_id = message.document.file_id
+    elif message.video:
+        if message.video.file_size and message.video.file_size > 10 * 1024 * 1024:
+            await message.reply("Видео не должно превышать 10 МБ.", reply_markup=_peripheral_attachments_keyboard())
+            return
+        file_id = message.video.file_id
+    if file_id:
+        file_ids.append(file_id)
+        await state.update_data(peripheral_attachment_file_ids=file_ids)
+        await message.reply(f"📎 Добавлено {len(file_ids)} из 10.", reply_markup=_peripheral_attachments_keyboard())
+
+
+async def _finish_peripheral_common(callback: CallbackQuery, state: FSMContext, file_ids: list):
+    data = await state.get_data()
+    profile = get_user_profile(callback.from_user.id) or {}
+    department = (profile.get("department") or "").strip()
+    phone = (profile.get("phone") or "").strip()
+    jira_username = (profile.get("jira_username") or "").strip()
+    if not department:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указано подразделение. Сначала выберите его в заявке Lupa.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    if not phone:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указан телефон. Перепройдите регистрацию или привяжите аккаунт.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    if not jira_username:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указан Jira-пользователь (Reporter). Перепройдите регистрацию.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+
+    form_data = {
+        "peripheral_kind": (data.get("peripheral_kind") or "").strip(),
+        "ip_address": (data.get("ip_address") or "").strip(),
+        "description": (data.get("description") or "").strip(),
+    }
+    attachment_paths = []
+    if file_ids:
+        import os
+        import tempfile
+        bot = callback.bot
+        for fid in file_ids[:10]:
+            try:
+                f = await bot.get_file(fid)
+                safe_name = f.file_path.replace("/", "_").replace("\\", "_") if f.file_path else str(fid)
+                path = os.path.join(tempfile.gettempdir(), f"peripheral_attach_{safe_name}")
+                await bot.download_file(f.file_path, path)
+                if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
+                    attachment_paths.append(path)
+            except Exception as e:
+                logger.warning("Скачивание вложения TG peripheral %s: %s", fid[:20] if isinstance(fid, str) else fid, e)
+
+    try:
+        success, issue_key, msg = await support_api.create_ticket(
+            CHANNEL_ID, callback.from_user.id, "peripheral_equipment", form_data, attachment_paths=attachment_paths
+        )
+        display_text = msg or issue_key
+        await state.clear()
+        await callback.message.edit_text(
+            f"✅ {display_text}" if success else f"❌ {display_text}",
+            parse_mode="HTML",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+    finally:
+        import os
+        for p in attachment_paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
+@router.callback_query(PeripheralEquipmentStates.WAITING_FOR_ATTACHMENTS, F.data == "peripheral_skip_attachments")
+async def peripheral_skip_attachments(callback: CallbackQuery, state: FSMContext):
+    await _finish_peripheral_common(callback, state, [])
+
+
+@router.callback_query(PeripheralEquipmentStates.WAITING_FOR_ATTACHMENTS, F.data == "peripheral_finish_ticket")
+async def peripheral_finish_ticket(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_ids = data.get("peripheral_attachment_file_ids") or []
+    await _finish_peripheral_common(callback, state, file_ids)
+
+
+def _network_select_keyboard(options: list[tuple[str, str]], prefix: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"{prefix}{oid}")] for oid, label in options]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _network_description_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data="network_skip_description")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+def _network_rms_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data="network_skip_rms")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+def _network_attachments_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Создать заявку", callback_data="network_finish_ticket")],
+        [InlineKeyboardButton(text="⏭ Пропустить вложения", callback_data="network_skip_attachments")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
+    ])
+
+
+@router.callback_query(lambda c: c.data == "network_issue_start")
+async def network_issue_start(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(NetworkIssueStates.WAITING_FOR_NETWORK_TYPE)
+    await callback.message.edit_text(
+        "🌐 <b>Проблемы в работе сети</b>\n\nВыберите тип проблемной сети:",
+        parse_mode="HTML",
+        reply_markup=_network_select_keyboard(NETWORK_TYPES, "network_type_"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(NetworkIssueStates.WAITING_FOR_NETWORK_TYPE, F.data.startswith("network_type_"))
+async def network_select_type(callback: CallbackQuery, state: FSMContext):
+    type_id = callback.data.replace("network_type_", "", 1).strip()
+    type_label = NETWORK_TYPE_BY_ID.get(type_id)
+    if not type_label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(network_type=type_label, provider="", provider_other="", wifi_problem_owner="", pc_type="")
+    if type_label == "Wi-Fi (беспроводная)":
+        await state.set_state(NetworkIssueStates.WAITING_FOR_WIFI_OWNER)
+        await callback.message.edit_text(
+            "🌐 <b>Проблемы в работе сети</b>\n\n"
+            f"✅ Тип сети: {type_label}\n\n"
+            "Укажите, у кого проблемы:",
+            parse_mode="HTML",
+            reply_markup=_network_select_keyboard(NETWORK_WIFI_OWNERS, "network_wifi_owner_"),
+        )
+    elif type_label == "VPN":
+        await state.set_state(NetworkIssueStates.WAITING_FOR_PC_TYPE)
+        await callback.message.edit_text(
+            "🌐 <b>Проблемы в работе сети</b>\n\n"
+            f"✅ Тип сети: {type_label}\n\n"
+            "Выберите тип ПК:",
+            parse_mode="HTML",
+            reply_markup=_network_select_keyboard(NETWORK_PC_TYPES, "network_pc_type_"),
+        )
+    else:
+        await state.set_state(NetworkIssueStates.WAITING_FOR_PROVIDER)
+        await callback.message.edit_text(
+            "🌐 <b>Проблемы в работе сети</b>\n\n"
+            f"✅ Тип сети: {type_label}\n\n"
+            "Выберите провайдера:",
+            parse_mode="HTML",
+            reply_markup=_network_select_keyboard(NETWORK_PROVIDERS, "network_provider_"),
+        )
+    await callback.answer()
+
+
+@router.message(NetworkIssueStates.WAITING_FOR_NETWORK_TYPE, F.text)
+async def network_type_text(message: Message):
+    await message.reply("Выберите тип сети кнопкой ниже.", reply_markup=_network_select_keyboard(NETWORK_TYPES, "network_type_"))
+
+
+@router.callback_query(NetworkIssueStates.WAITING_FOR_WIFI_OWNER, F.data.startswith("network_wifi_owner_"))
+async def network_select_wifi_owner(callback: CallbackQuery, state: FSMContext):
+    owner_id = callback.data.replace("network_wifi_owner_", "", 1).strip()
+    owner_label = NETWORK_WIFI_OWNER_BY_ID.get(owner_id)
+    if not owner_label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(wifi_problem_owner=owner_label)
+    await state.set_state(NetworkIssueStates.WAITING_FOR_RMS)
+    await callback.message.edit_text(
+        "Укажите RMS Internet ID (опционально) или нажмите «Пропустить».",
+        reply_markup=_network_rms_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(NetworkIssueStates.WAITING_FOR_WIFI_OWNER, F.text)
+async def network_wifi_owner_text(message: Message):
+    await message.reply(
+        "Выберите вариант кнопкой ниже.",
+        reply_markup=_network_select_keyboard(NETWORK_WIFI_OWNERS, "network_wifi_owner_"),
+    )
+
+
+@router.callback_query(NetworkIssueStates.WAITING_FOR_PC_TYPE, F.data.startswith("network_pc_type_"))
+async def network_select_pc_type(callback: CallbackQuery, state: FSMContext):
+    pc_id = callback.data.replace("network_pc_type_", "", 1).strip()
+    pc_label = NETWORK_PC_TYPE_BY_ID.get(pc_id)
+    if not pc_label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(pc_type=pc_label)
+    await state.set_state(NetworkIssueStates.WAITING_FOR_PROVIDER)
+    await callback.message.edit_text(
+        "Выберите провайдера:",
+        reply_markup=_network_select_keyboard(NETWORK_PROVIDERS, "network_provider_"),
+    )
+    await callback.answer()
+
+
+@router.message(NetworkIssueStates.WAITING_FOR_PC_TYPE, F.text)
+async def network_pc_type_text(message: Message):
+    await message.reply(
+        "Выберите тип ПК кнопкой ниже.",
+        reply_markup=_network_select_keyboard(NETWORK_PC_TYPES, "network_pc_type_"),
+    )
+
+
+@router.callback_query(NetworkIssueStates.WAITING_FOR_PROVIDER, F.data.startswith("network_provider_"))
+async def network_select_provider(callback: CallbackQuery, state: FSMContext):
+    provider_id = callback.data.replace("network_provider_", "", 1).strip()
+    provider_label = NETWORK_PROVIDER_BY_ID.get(provider_id)
+    if not provider_label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(provider=provider_label)
+    if provider_label == "Другой":
+        await state.set_state(NetworkIssueStates.WAITING_FOR_PROVIDER_OTHER)
+        await callback.message.edit_text(
+            "Укажите название поставщика услуг (поле Other):",
+            reply_markup=get_cancel_keyboard(),
+        )
+    else:
+        await state.update_data(provider_other="")
+        await state.set_state(NetworkIssueStates.WAITING_FOR_RMS)
+        await callback.message.edit_text(
+            "Укажите RMS Internet ID (опционально) или нажмите «Пропустить».",
+            reply_markup=_network_rms_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(NetworkIssueStates.WAITING_FOR_PROVIDER, F.text)
+async def network_provider_text(message: Message):
+    await message.reply(
+        "Выберите провайдера кнопкой ниже.",
+        reply_markup=_network_select_keyboard(NETWORK_PROVIDERS, "network_provider_"),
+    )
+
+
+@router.message(NetworkIssueStates.WAITING_FOR_PROVIDER_OTHER, F.text)
+async def network_provider_other(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not text:
+        await message.reply("Укажите поставщика услуг.", reply_markup=get_cancel_keyboard())
+        return
+    await state.update_data(provider_other=text)
+    await state.set_state(NetworkIssueStates.WAITING_FOR_RMS)
+    await message.reply("Укажите RMS Internet ID (опционально) или нажмите «Пропустить».", reply_markup=_network_rms_keyboard())
+
+
+@router.callback_query(NetworkIssueStates.WAITING_FOR_RMS, F.data == "network_skip_rms")
+async def network_skip_rms(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(rms_internet_id="нет")
+    await state.set_state(NetworkIssueStates.WAITING_FOR_DESCRIPTION)
+    await callback.message.edit_text(
+        "Опишите проблему (Description) или нажмите «Пропустить».",
+        reply_markup=_network_description_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(NetworkIssueStates.WAITING_FOR_RMS, F.text)
+async def network_rms(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    await state.update_data(rms_internet_id=text or "нет")
+    await state.set_state(NetworkIssueStates.WAITING_FOR_DESCRIPTION)
+    await message.reply("Опишите проблему (Description) или нажмите «Пропустить».", reply_markup=_network_description_keyboard())
+
+
+@router.callback_query(NetworkIssueStates.WAITING_FOR_DESCRIPTION, F.data == "network_skip_description")
+async def network_skip_description(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(description="", network_attachment_file_ids=[])
+    await state.set_state(NetworkIssueStates.WAITING_FOR_ATTACHMENTS)
+    await callback.message.edit_text(
+        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
+        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        reply_markup=_network_attachments_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(NetworkIssueStates.WAITING_FOR_DESCRIPTION, F.text)
+async def network_description(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    await state.update_data(description=text, network_attachment_file_ids=[])
+    await state.set_state(NetworkIssueStates.WAITING_FOR_ATTACHMENTS)
+    await message.reply(
+        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
+        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        reply_markup=_network_attachments_keyboard(),
+    )
+
+
+@router.message(NetworkIssueStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+async def network_attachment_add(message: Message, state: FSMContext):
+    data = await state.get_data()
+    file_ids = list(data.get("network_attachment_file_ids") or [])
+    if len(file_ids) >= 10:
+        await message.reply("Достигнут лимит 10 файлов.", reply_markup=_network_attachments_keyboard())
+        return
+    file_id = None
+    if message.photo:
+        photo = message.photo[-1]
+        if getattr(photo, "file_size", 0) and photo.file_size > 10 * 1024 * 1024:
+            await message.reply("Фото не должно превышать 10 МБ.", reply_markup=_network_attachments_keyboard())
+            return
+        file_id = photo.file_id
+    elif message.document:
+        if message.document.file_size and message.document.file_size > 10 * 1024 * 1024:
+            await message.reply("Файл не должен превышать 10 МБ.", reply_markup=_network_attachments_keyboard())
+            return
+        file_id = message.document.file_id
+    elif message.video:
+        if message.video.file_size and message.video.file_size > 10 * 1024 * 1024:
+            await message.reply("Видео не должно превышать 10 МБ.", reply_markup=_network_attachments_keyboard())
+            return
+        file_id = message.video.file_id
+    if file_id:
+        file_ids.append(file_id)
+        await state.update_data(network_attachment_file_ids=file_ids)
+        await message.reply(f"📎 Добавлено {len(file_ids)} из 10.", reply_markup=_network_attachments_keyboard())
+
+
+async def _finish_network_common(callback: CallbackQuery, state: FSMContext, file_ids: list):
+    data = await state.get_data()
+    profile = get_user_profile(callback.from_user.id) or {}
+    department = (profile.get("department") or "").strip()
+    phone = (profile.get("phone") or "").strip()
+    jira_username = (profile.get("jira_username") or "").strip()
+    if not department:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указано подразделение. Сначала выберите его в заявке Lupa.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    if not phone:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указан телефон. Перепройдите регистрацию или привяжите аккаунт.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    if not jira_username:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ В профиле не указан Jira-пользователь (Reporter). Перепройдите регистрацию.",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    network_type = (data.get("network_type") or "").strip()
+    provider = (data.get("provider") or "").strip()
+    provider_other = (data.get("provider_other") or "").strip()
+    wifi_owner = (data.get("wifi_problem_owner") or "").strip()
+    pc_type = (data.get("pc_type") or "").strip()
+    if network_type == "Локальная сеть (проводная)" and not provider:
+        await callback.answer("Укажите провайдера.", show_alert=True)
+        return
+    if network_type == "Wi-Fi (беспроводная)" and not wifi_owner:
+        await callback.answer("Укажите, у кого проблемы.", show_alert=True)
+        return
+    if network_type == "VPN" and (not pc_type or not provider):
+        await callback.answer("Для VPN нужно указать тип ПК и провайдера.", show_alert=True)
+        return
+    if provider == "Другой" and not provider_other:
+        await callback.answer("Укажите поставщика услуг (Other).", show_alert=True)
+        return
+
+    form_data = {
+        "network_type": network_type,
+        "provider": provider,
+        "provider_other": provider_other,
+        "wifi_problem_owner": wifi_owner,
+        "pc_type": pc_type,
+        "description": (data.get("description") or "").strip(),
+        "rms_internet_id": (data.get("rms_internet_id") or "").strip() or "нет",
+        "ip_address": "нет",
+        "preferred_contact_time": "нет",
+    }
+    attachment_paths = []
+    if file_ids:
+        import os
+        import tempfile
+        bot = callback.bot
+        for fid in file_ids[:10]:
+            try:
+                f = await bot.get_file(fid)
+                safe_name = f.file_path.replace("/", "_").replace("\\", "_") if f.file_path else str(fid)
+                path = os.path.join(tempfile.gettempdir(), f"network_attach_{safe_name}")
+                await bot.download_file(f.file_path, path)
+                if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
+                    attachment_paths.append(path)
+            except Exception as e:
+                logger.warning("Скачивание вложения TG network %s: %s", fid[:20] if isinstance(fid, str) else fid, e)
+
+    try:
+        success, issue_key, msg = await support_api.create_ticket(
+            CHANNEL_ID, callback.from_user.id, "network_problem", form_data, attachment_paths=attachment_paths
+        )
+        display_text = msg or issue_key
+        await state.clear()
+        await callback.message.edit_text(
+            f"✅ {display_text}" if success else f"❌ {display_text}",
+            parse_mode="HTML",
+            reply_markup=get_main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+    finally:
+        import os
+        for p in attachment_paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
+@router.callback_query(NetworkIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "network_skip_attachments")
+async def network_skip_attachments(callback: CallbackQuery, state: FSMContext):
+    await _finish_network_common(callback, state, [])
+
+
+@router.callback_query(NetworkIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "network_finish_ticket")
+async def network_finish_ticket(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    file_ids = data.get("network_attachment_file_ids") or []
+    await _finish_network_common(callback, state, file_ids)
+
+
+def _electronic_queue_type_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"eq_type_{sid}")] for sid, label in ELECTRONIC_QUEUE_SERVICE_TYPES]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(lambda c: c.data == "electronic_queue_start")
+async def electronic_queue_start(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(ElectronicQueueStates.WAITING_FOR_SERVICE_TYPE)
+    await callback.message.edit_text(
+        "🎫 <b>Электронная очередь</b>\n\nВыберите тип услуги:",
+        parse_mode="HTML",
+        reply_markup=_electronic_queue_type_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(ElectronicQueueStates.WAITING_FOR_SERVICE_TYPE, F.data.startswith("eq_type_"))
+async def electronic_queue_select_type(callback: CallbackQuery, state: FSMContext):
+    type_id = callback.data.replace("eq_type_", "", 1).strip()
+    type_label = ELECTRONIC_QUEUE_SERVICE_TYPE_BY_ID.get(type_id)
+    if not type_label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(service_type=type_label)
+    await state.set_state(ElectronicQueueStates.WAITING_FOR_DESCRIPTION)
+    await callback.message.edit_text(
+        "🎫 <b>Электронная очередь</b>\n\n"
+        f"✅ Тип услуги: {type_label}\n\n"
+        "Введите подробное описание:",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(ElectronicQueueStates.WAITING_FOR_SERVICE_TYPE, F.text)
+async def electronic_queue_type_text(message: Message):
+    await message.reply("Выберите тип услуги кнопкой ниже.", reply_markup=_electronic_queue_type_keyboard())
+
+
+@router.message(ElectronicQueueStates.WAITING_FOR_DESCRIPTION, F.text)
+async def electronic_queue_description(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not text:
+        await message.reply("Описание не может быть пустым.", reply_markup=get_cancel_keyboard())
+        return
+    data = await state.get_data()
+    profile = get_user_profile(message.from_user.id) or {}
+    department = (profile.get("department") or "").strip()
+    phone = (profile.get("phone") or "").strip()
+    jira_username = (profile.get("jira_username") or "").strip()
+    if not department:
+        await state.clear()
+        await message.reply("❌ В профиле не указано подразделение.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not phone:
+        await state.clear()
+        await message.reply("❌ В профиле не указан телефон.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not jira_username:
+        await state.clear()
+        await message.reply("❌ В профиле не указан Jira-пользователь (Reporter).", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    form_data = {
+        "summary": "Электронная очередь",
+        "service_type": (data.get("service_type") or "").strip(),
+        "description": text,
+    }
+    success, issue_key, msg = await support_api.create_ticket(CHANNEL_ID, message.from_user.id, "electronic_queue", form_data)
+    await state.clear()
+    display_text = msg or issue_key
+    await message.reply(
+        f"✅ {display_text}" if success else f"❌ {display_text}",
+        parse_mode="HTML",
+        reply_markup=get_main_menu_keyboard(message.from_user.id),
+    )
 
 
 @router.message(WmsTicketStates.WAITING_FOR_DESCRIPTION, F.text)

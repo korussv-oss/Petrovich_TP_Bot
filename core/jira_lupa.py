@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 import aiohttp
 
 from config import CONFIG
+from validators import sanitize_jira_text
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,7 @@ async def create_lupa_issue(
     f_service = (lupa.get("FIELD_SERVICE") or "customfield_10500").strip()
     f_city = (lupa.get("FIELD_ADDRESS_CITY") or "customfield_12403").strip()
 
-    description = (description or "").strip() or "Описание не предоставлено"
+    description = sanitize_jira_text((description or "").strip() or "Описание не предоставлено", max_len=4000)
     problematic_service = (problematic_service or "Сайт (petrovich.ru)").strip()
     request_type = (request_type or "проблемы с поиском").strip()
     subdivision = (subdivision or "").strip()
@@ -145,7 +146,7 @@ async def create_lupa_issue(
             f_service: "Поиск",
         }
     }
-    if city and (city := (city or "").strip()):
+    if city and (city := sanitize_jira_text((city or "").strip(), max_len=120)):
         payload["fields"][f_city] = city
 
     url = urljoin(base_url + "/", "rest/api/2/issue")

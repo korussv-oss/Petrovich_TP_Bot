@@ -12,11 +12,21 @@ from urllib.parse import urljoin
 import aiohttp
 
 from config import CONFIG
+from validators import validate_issue_key, sanitize_jira_text
 
 logger = logging.getLogger(__name__)
 
 JIRA_AA = CONFIG.get("JIRA_AA", {})
 FIELDS = JIRA_AA.get("FIELDS", {})
+
+
+def _safe_issue_key(issue_key: str) -> Optional[str]:
+    key = (issue_key or "").strip()
+    ok, _ = validate_issue_key(key)
+    if not ok:
+        logger.warning("Некорректный issue_key: %r", issue_key)
+        return None
+    return key
 
 
 async def _get_jsm_request_type_allowed_fields(
@@ -135,12 +145,15 @@ async def _get_jira_current_user(base_url: str, token: str) -> Optional[str]:
         return None
 
 
-async def _set_assignee(base_url: str, token: str, issue_key: str, username: str) -> None:
+async def _set_assignee(base_url: str, token: str, issue_key: str, username: str) -> bool:
     """
     Устанавливает исполнителя по REST API.
     Используем отдельный эндпоинт PUT .../issue/{key}/assignee, а не редактирование issue:
     иначе Jira может вернуть 400 «assignee not on the appropriate screen» (как при создании).
     """
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
+        return False
     url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/assignee")
     headers = {"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"}
     body = {"name": username}
@@ -149,6 +162,7 @@ async def _set_assignee(base_url: str, token: str, issue_key: str, username: str
             async with session.put(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 204:
                     logger.debug("Assignee %s установлен для %s", username, issue_key)
+                    return True
                 elif resp.status == 403:
                     body_403 = await resp.text()
                     jira_user = await _get_jira_current_user(base_url, token)
@@ -170,6 +184,7 @@ async def _set_assignee(base_url: str, token: str, issue_key: str, username: str
                     logger.warning("Assignee для %s: %s %s", issue_key, resp.status, (text or "")[:300])
     except Exception as e:
         logger.warning("Не удалось установить assignee: %s", e)
+    return False
 
 
 async def _set_reporter(base_url: str, token: str, issue_key: str, username: str) -> None:
@@ -178,6 +193,9 @@ async def _set_reporter(base_url: str, token: str, issue_key: str, username: str
     Требует права Modify Reporter и наличие поля Reporter на экране редактирования.
     """
     if not username:
+        return
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
         return
     url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}")
     headers = {
@@ -217,6 +235,9 @@ async def issue_exists(issue_key: str) -> Optional[bool]:
     token = (jira.get("TOKEN") or "").strip()
     if not base_url or not token:
         return None
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
+        return None
     url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}?fields=summary")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     try:
@@ -250,6 +271,9 @@ async def get_issue_info(issue_key: str) -> Optional[Dict[str, Any]]:
     token = (jira.get("TOKEN") or "").strip()
     if not base_url or not token:
         return None
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
+        return None
     url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}?fields=summary,status,description")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     try:
@@ -271,14 +295,64 @@ async def get_issue_info(issue_key: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def get_issue_comments(issue_key: str) -> list:
-    """Возвращает список комментариев задачи. Каждый элемент: dict с author.displayName, body, created."""
+async def get_issue_admin_details(issue_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Расширенная информация о задаче для карточки СА:
+    summary, status, description, assignee, reporter, issuetype, project.
+    """
+    jira = CONFIG.get("JIRA", {})
+    base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
+    token = (jira.get("TOKEN") or "").strip()
+    if not base_url or not token:
+        return None
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
+        return None
+    fields = "summary,status,description,assignee,reporter,issuetype,project"
+    url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}?fields={fields}")
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                f = data.get("fields") or {}
+                status_obj = f.get("status") or {}
+                assignee_obj = f.get("assignee") or {}
+                reporter_obj = f.get("reporter") or {}
+                issuetype_obj = f.get("issuetype") or {}
+                project_obj = f.get("project") or {}
+                desc = (f.get("description") or "").strip()
+                if desc and len(desc) > 800:
+                    desc = desc[:800] + "..."
+                return {
+                    "summary": (f.get("summary") or "").strip(),
+                    "status": (status_obj.get("name") or "").strip(),
+                    "description": desc,
+                    "assignee_display": (assignee_obj.get("displayName") or "").strip(),
+                    "assignee_username": (assignee_obj.get("name") or assignee_obj.get("key") or "").strip(),
+                    "reporter_display": (reporter_obj.get("displayName") or "").strip(),
+                    "reporter_username": (reporter_obj.get("name") or reporter_obj.get("key") or "").strip(),
+                    "issue_type": (issuetype_obj.get("name") or "").strip(),
+                    "project_key": (project_obj.get("key") or "").strip().upper(),
+                }
+    except Exception as e:
+        logger.debug("get_issue_admin_details %s: %s", issue_key, e)
+        return None
+
+
+async def get_issue_transitions(issue_key: str) -> list:
+    """Доступные workflow-переходы задачи."""
     jira = CONFIG.get("JIRA", {})
     base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
     token = (jira.get("TOKEN") or "").strip()
     if not base_url or not token:
         return []
-    url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/comment")
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
+        return []
+    url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/transitions")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     try:
         async with aiohttp.ClientSession() as session:
@@ -286,7 +360,208 @@ async def get_issue_comments(issue_key: str) -> list:
                 if resp.status != 200:
                     return []
                 data = await resp.json()
-                return list(data.get("comments") or [])
+                out = []
+                for t in data.get("transitions") or []:
+                    if not isinstance(t, dict):
+                        continue
+                    tid = (t.get("id") or "").strip()
+                    name = (t.get("name") or "").strip()
+                    to_name = ((t.get("to") or {}).get("name") or "").strip() if isinstance(t.get("to"), dict) else ""
+                    if tid and name:
+                        out.append({"id": tid, "name": name, "to_name": to_name})
+                return out
+    except Exception as e:
+        logger.debug("get_issue_transitions %s: %s", issue_key, e)
+        return []
+
+
+async def _get_transition_with_fields(issue_key: str, transition_id: str) -> Optional[Dict[str, Any]]:
+    """Вернуть transition с описанием полей (expand=transitions.fields)."""
+    jira = CONFIG.get("JIRA", {})
+    base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
+    token = (jira.get("TOKEN") or "").strip()
+    if not base_url or not token:
+        return None
+    issue_key = _safe_issue_key(issue_key)
+    transition_id = (transition_id or "").strip()
+    if not issue_key or not transition_id:
+        return None
+    url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/transitions?expand=transitions.fields")
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                for t in data.get("transitions") or []:
+                    if not isinstance(t, dict):
+                        continue
+                    if (t.get("id") or "").strip() == transition_id:
+                        return t
+    except Exception as e:
+        logger.debug("get transition fields %s/%s: %s", issue_key, transition_id, e)
+    return None
+
+
+def _pick_done_resolution_payload(transition_obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Подобрать payload поля resolution по transition metadata.
+    Предпочтение: Done, иначе первое допустимое значение.
+    """
+    if not isinstance(transition_obj, dict):
+        return {"name": "Done"}
+    fields = transition_obj.get("fields") or {}
+    if not isinstance(fields, dict):
+        return {"name": "Done"}
+    rmeta = fields.get("resolution") or {}
+    if not isinstance(rmeta, dict):
+        return {"name": "Done"}
+    allowed = rmeta.get("allowedValues") or []
+    if not isinstance(allowed, list) or not allowed:
+        return {"name": "Done"}
+    # 1) Пытаемся найти Done.
+    for v in allowed:
+        if not isinstance(v, dict):
+            continue
+        name = (v.get("name") or v.get("value") or "").strip()
+        if name.lower() == "done":
+            vid = (v.get("id") or "").strip()
+            return {"id": vid} if vid else {"name": name}
+    # 2) Иначе берём первое допустимое.
+    first = allowed[0]
+    if isinstance(first, dict):
+        fid = (first.get("id") or "").strip()
+        fname = (first.get("name") or first.get("value") or "").strip()
+        if fid:
+            return {"id": fid}
+        if fname:
+            return {"name": fname}
+    return {"name": "Done"}
+
+
+async def transition_issue(
+    issue_key: str,
+    transition_id: str,
+    preserve_assignee_username: Optional[str] = None,
+    default_time_spent: str = "5m",
+) -> tuple[bool, str]:
+    """Выполнить workflow-переход задачи по transition_id."""
+    jira = CONFIG.get("JIRA", {})
+    base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
+    token = (jira.get("TOKEN") or "").strip()
+    if not base_url or not token:
+        return False, "Не настроено подключение к Jira."
+    issue_key = _safe_issue_key(issue_key)
+    transition_id = (transition_id or "").strip()
+    if not issue_key or not transition_id:
+        return False, "Некорректный ключ заявки или переход."
+    url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/transitions")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    payload = {"transition": {"id": transition_id}}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 204:
+                    if preserve_assignee_username:
+                        restored = await _set_assignee(base_url, token, issue_key, preserve_assignee_username)
+                        if restored:
+                            try:
+                                from core.notifications import set_issue_last_assignee_baseline
+                                set_issue_last_assignee_baseline(issue_key, preserve_assignee_username)
+                            except Exception:
+                                pass
+                            return True, "Статус обновлён, исполнитель восстановлен."
+                        return True, "Статус обновлён (исполнителя восстановить не удалось)."
+                    return True, "Статус обновлён."
+                text = await resp.text()
+                # Некоторые переходы (например Resolve) требуют worklog + resolution.
+                if resp.status == 400:
+                    err_lower = (text or "").lower()
+                    needs_worklog = ("затр" in err_lower) or ("time spent" in err_lower) or ("worklog" in err_lower)
+                    needs_resolution = "resolution" in err_lower
+                    if needs_worklog or needs_resolution:
+                        t_obj = await _get_transition_with_fields(issue_key, transition_id)
+                        fields_payload: Dict[str, Any] = {}
+                        update_payload: Dict[str, Any] = {}
+                        if needs_resolution:
+                            fields_payload["resolution"] = _pick_done_resolution_payload(t_obj)
+                        if needs_worklog:
+                            update_payload["worklog"] = [{"add": {"timeSpent": default_time_spent}}]
+                        retry_payload: Dict[str, Any] = {"transition": {"id": transition_id}}
+                        if fields_payload:
+                            retry_payload["fields"] = fields_payload
+                        if update_payload:
+                            retry_payload["update"] = update_payload
+                        async with aiohttp.ClientSession() as s2:
+                            async with s2.post(
+                                url, json=retry_payload, headers=headers, timeout=aiohttp.ClientTimeout(total=20)
+                            ) as r2:
+                                if r2.status == 204:
+                                    if preserve_assignee_username:
+                                        restored = await _set_assignee(base_url, token, issue_key, preserve_assignee_username)
+                                        if restored:
+                                            try:
+                                                from core.notifications import set_issue_last_assignee_baseline
+                                                set_issue_last_assignee_baseline(issue_key, preserve_assignee_username)
+                                            except Exception:
+                                                pass
+                                            return True, "Статус обновлён, исполнитель восстановлен."
+                                        return True, "Статус обновлён (исполнителя восстановить не удалось)."
+                                    return True, "Статус обновлён."
+                                t2 = await r2.text()
+                                return False, f"Ошибка Jira: {r2.status}. {(t2 or '')[:200]}"
+                return False, f"Ошибка Jira: {resp.status}. {(text or '')[:200]}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _is_internal_comment(comment: Dict[str, Any]) -> bool:
+    """
+    True для внутренних комментариев Jira Service Management.
+    Признак: property sd.public.comment.value.internal == true.
+    """
+    props = comment.get("properties") or []
+    if not isinstance(props, list):
+        return False
+    for p in props:
+        if not isinstance(p, dict):
+            continue
+        if (p.get("key") or "").strip() != "sd.public.comment":
+            continue
+        val = p.get("value")
+        if isinstance(val, dict) and bool(val.get("internal")):
+            return True
+    return False
+
+
+async def get_issue_comments(issue_key: str, include_internal: bool = False) -> list:
+    """Возвращает список комментариев задачи. Внутренние (internal) по умолчанию исключаются."""
+    jira = CONFIG.get("JIRA", {})
+    base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
+    token = (jira.get("TOKEN") or "").strip()
+    if not base_url or not token:
+        return []
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
+        return []
+    # expand=properties нужен, чтобы отличать public/internal комментарии в JSM.
+    url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/comment?expand=properties")
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                comments = list(data.get("comments") or [])
+                if include_internal:
+                    return comments
+                return [c for c in comments if not _is_internal_comment(c)]
     except Exception as e:
         logger.warning("get_issue_comments %s: %s", issue_key, e)
         return []
@@ -297,7 +572,9 @@ async def add_comment(issue_key: str, body: str) -> bool:
     jira = CONFIG.get("JIRA", {})
     base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
     token = (jira.get("TOKEN") or "").strip()
-    if not base_url or not token or not (body or "").strip():
+    issue_key = _safe_issue_key(issue_key)
+    body_clean = sanitize_jira_text(body or "", max_len=5000)
+    if not issue_key or not base_url or not token or not body_clean:
         return False
     url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/comment")
     headers = {
@@ -305,7 +582,7 @@ async def add_comment(issue_key: str, body: str) -> bool:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
     }
-    payload = {"body": (body or "").strip()}
+    payload = {"body": body_clean}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -330,6 +607,9 @@ async def get_issue_request_type_value(issue_key: str, field_id: Optional[str] =
     token = (jira.get("TOKEN") or "").strip()
     if not base_url or not token:
         return None
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
+        return None
     fid = (field_id or JIRA_AA.get("FIELD_CUSTOMER_REQUEST_TYPE", "") or "customfield_10500").strip()
     url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}?fields={fid}")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
@@ -351,6 +631,9 @@ async def get_issue_editmeta(issue_key: str) -> Dict[str, Any]:
     base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
     token = (jira.get("TOKEN") or "").strip()
     if not base_url or not token:
+        return {}
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
         return {}
     url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/editmeta")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
@@ -383,6 +666,9 @@ async def update_issue_request_type(
         logger.error("JIRA LOGIN_URL или TOKEN не заданы")
         return False
 
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
+        return False
     field_id = (field_id or JIRA_AA.get("FIELD_CUSTOMER_REQUEST_TYPE", "") or "customfield_10500").strip()
     if not field_id:
         logger.error("Не задано поле типа запроса")
@@ -390,7 +676,8 @@ async def update_issue_request_type(
 
     # Копируем значение из другой задачи (рекомендуемый способ)
     if source_issue_key:
-        copied = await get_issue_request_type_value(source_issue_key, field_id)
+        src_key = _safe_issue_key(source_issue_key)
+        copied = await get_issue_request_type_value(src_key, field_id) if src_key else None
         if copied is not None:
             logger.info("Скопировано значение типа запроса из %s", source_issue_key)
             # Jira GET возвращает полный объект; при записи часто нужен только id
@@ -464,6 +751,9 @@ async def _try_set_request_type_via_transition(
     На экране перехода поле Request type может быть доступно, даже если его нет в editmeta.
     Внимание: может изменить статус задачи (переход по workflow).
     """
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
+        return False
     url_list = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/transitions")
     headers = {
         "Accept": "application/json",
@@ -516,13 +806,13 @@ async def create_password_change_issue(
         logger.error("JIRA LOGIN_URL или TOKEN не заданы")
         return None
 
-    summary = f"Смена пароля: {ad_account}"
-    description = (
+    summary = sanitize_jira_text(f"Смена пароля: {ad_account}", max_len=255)
+    description = sanitize_jira_text(
         f"Запрос на смену пароля через бота.\n"
         f"AD account: {ad_account}\n"
         f"Existing phone: {existing_phone}\n"
         f"Password_new: (заполнено в кастомном поле)"
-    )
+    , max_len=4000)
     field_ad = FIELDS.get("AD_ACCOUNT") or ""
     field_phone = FIELDS.get("EXISTING_PHONE") or ""
     field_pass = FIELDS.get("PASSWORD_NEW") or ""

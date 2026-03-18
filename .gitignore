@@ -22,11 +22,14 @@ env/
 ### Local configuration and secrets
 .env
 .env.*
-!env.example
+!.env.example
 
 ### Application data (contains персональные данные и служебную информацию)
+data/
+!data/.gitkeep
 data/*.json
 data/*.log
+data/*.lock
 data/lupa_tickets_log.xlsx
 
 ### Logs
@@ -39,4 +42,10 @@ Thumbs.db
 ### Personal local notes / внутренняя документация (ИБ)
 DEV_NOTES_LOCAL.md
 README.md
+
+### Local helper scripts
+scripts/
+
+### Local catalog override
+config/ticket_catalog.yaml
 
