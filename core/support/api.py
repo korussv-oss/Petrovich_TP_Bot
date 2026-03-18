@@ -7,6 +7,7 @@ from typing import List, Optional
 
 from config import CONFIG
 from core.support.models import Text, Menu, MenuButton, Form, FormField, Error
+from validators import sanitize_jira_text
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,11 @@ def get_start_response(channel_id: str, user_id: int) -> Text | Menu:
 
 def get_main_menu_response(channel_id: str, user_id: int) -> Menu:
     """
-    Главное меню: Создать заявку в ТП, Личный кабинет, Помощь (+ Админ-панель для ADMIN_IDS).
+    Главное меню: Создать заявку в ТП, Мои заявки, Помощь (+ Админ-панель для ADMIN_IDS).
     Единый источник кнопок для Telegram и MAX. Для MAX проверка по привязке max_user_id.
     """
     from user_storage import is_user_registered
-    from config import is_channel_admin
+    from config import is_channel_admin, is_stc_sa
 
     if not is_user_registered(user_id, channel_id or "telegram"):
         return get_start_response(channel_id, user_id)
@@ -57,9 +58,10 @@ def get_main_menu_response(channel_id: str, user_id: int) -> Menu:
     buttons: List[MenuButton] = [
         MenuButton(id="create_ticket_tp", label="📋 Создать заявку в ТП"),
         MenuButton(id="my_tickets", label="📋 Мои заявки"),
-        MenuButton(id="personal_cabinet", label="👤 Личный кабинет"),
         MenuButton(id="help", label="❓ Помощь"),
     ]
+    if is_stc_sa(channel_id or "telegram", user_id):
+        buttons.append(MenuButton(id="sa_stc_menu", label="🛠️ СА СТЦ"))
     from config import is_lupa_report_allowed
     if is_channel_admin(channel_id or "telegram", user_id) or is_lupa_report_allowed(channel_id or "telegram", user_id):
         buttons.append(MenuButton(id="admin_panel", label="⚙️ Админ-панель"))
@@ -111,6 +113,10 @@ def get_ticket_types_menu(channel_id: str, user_id: int) -> Menu | Error:
         label = meta.get("label") or tid
         buttons.append(MenuButton(id=f"ticket_{tid}", label=label))
 
+    # Отдельный сценарий заявки «Проблема в работе ПК» (общий для TG/MAX),
+    # показываем в меню «Создать заявку в ТП».
+    buttons.append(MenuButton(id="pc_issue_start", label="🖥️ Проблема в работе ПК"))
+
     if not buttons:
         return Menu(text="Нет доступных типов заявок.", buttons=[])
 
@@ -148,6 +154,7 @@ async def create_ticket(
 
     if ticket_type_id == "wms_issue":
         from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
         from core.jira_wms import create_wms_issue
         from core.support.issue_binding_registry import add_binding
         profile = get_user_profile(user_id, channel_id) or {}
@@ -162,15 +169,33 @@ async def create_ticket(
             return False, "Укажите подразделение (или заполните его в учётных данных).", None
         if not process:
             return False, "Укажите процесс.", None
-        ok, result = await create_wms_issue(
-            summary=summary,
-            description=description,
-            department=department,
-            process=process,
-            full_name=(profile.get("full_name") or "").strip(),
-            phone=(profile.get("phone") or "").strip(),
-            jira_username=(profile.get("jira_username") or "").strip() or None,
+        # Новый путь: forms_catalog + form_engine
+        engine_form_data = {
+            "summary": summary,
+            "description": sanitize_jira_text(
+                f"Контактное лицо: {(profile.get('full_name') or '').strip() or '—'}, {(profile.get('phone') or '').strip() or '—'}\n\n{description or 'Описание не предоставлено'}",
+                max_len=4000,
+            ),
+            "department": department,
+            "process": process,
+        }
+        ok, result, _ = await create_issue_from_form(
+            "wms_issue",
+            form_data=engine_form_data,
+            profile=profile,
+            attachment_paths=[],
         )
+        if not ok:
+            # Фолбэк на legacy-реализацию WMS
+            ok, result = await create_wms_issue(
+                summary=summary,
+                description=description,
+                department=department,
+                process=process,
+                full_name=(profile.get("full_name") or "").strip(),
+                phone=(profile.get("phone") or "").strip(),
+                jira_username=(profile.get("jira_username") or "").strip() or None,
+            )
         if not ok:
             return False, result, None
         add_binding(channel_id, user_id, result, "PW", "wms_issue")
@@ -184,6 +209,7 @@ async def create_ticket(
 
     if ticket_type_id == "lupa_search":
         from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
         from core.jira_lupa import create_lupa_issue
         from core.support.issue_binding_registry import add_binding
         profile = get_user_profile(user_id, channel_id) or {}
@@ -200,15 +226,32 @@ async def create_ticket(
             or (profile.get("department_wms") or "").strip()
         )
         if not subdivision:
-            return False, "Укажите подразделение в профиле: Личный кабинет → Подразделение (то, что указывали при регистрации).", None
-        ok, result = await create_lupa_issue(
-            description=description,
-            problematic_service=(form_data.get("problematic_service") or "Сайт (petrovich.ru)").strip(),
-            request_type=(form_data.get("request_type") or "проблемы с поиском").strip(),
-            subdivision=subdivision,
-            city=(form_data.get("city") or "").strip(),
-            jira_username=(profile.get("jira_username") or "").strip() or None,
+            return False, "Укажите подразделение при создании заявки (выберите из списка).", None
+        engine_form_data = {
+            "summary": "Ошибка в поиске на petrovich.ru",
+            "description": description,
+            "problematic_service": (form_data.get("problematic_service") or "Сайт (petrovich.ru)").strip(),
+            "request_type": (form_data.get("request_type") or "проблемы с поиском").strip(),
+            "subdivision": subdivision,
+            "city": (form_data.get("city") or "").strip(),
+            "service_name": "Поиск",
+        }
+        ok, result, _ = await create_issue_from_form(
+            "lupa_search",
+            form_data=engine_form_data,
+            profile=profile,
+            attachment_paths=[],
         )
+        if not ok:
+            # Фолбэк на legacy-реализацию Лупы
+            ok, result = await create_lupa_issue(
+                description=description,
+                problematic_service=(form_data.get("problematic_service") or "Сайт (petrovich.ru)").strip(),
+                request_type=(form_data.get("request_type") or "проблемы с поиском").strip(),
+                subdivision=subdivision,
+                city=(form_data.get("city") or "").strip(),
+                jira_username=(profile.get("jira_username") or "").strip() or None,
+            )
         if not ok:
             return False, result, None
         add_binding(channel_id, user_id, result, "WHD", "lupa_search")
@@ -228,6 +271,206 @@ async def create_ticket(
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         portal_id = (CONFIG.get("JIRA_LUPA", {}).get("PORTAL_ID") or "5").strip()
         if jira_url:
+            link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "pc_problem":
+        from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
+        from core.support.issue_binding_registry import add_binding
+        profile = get_user_profile(user_id, channel_id) or {}
+        ok, result, project_key = await create_issue_from_form(
+            "pc_problem",
+            form_data=form_data,
+            profile=profile,
+            attachment_paths=list(attachment_paths or []),
+        )
+        if not ok:
+            return False, result, None
+        proj = (project_key or "HD").strip().upper()
+        add_binding(channel_id, user_id, result, proj, "pc_problem")
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("pc_problem") or {}).get("portal_id") or "1")
+            link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "orgtech_problem":
+        from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
+        from core.support.issue_binding_registry import add_binding
+        profile = get_user_profile(user_id, channel_id) or {}
+        ok, result, project_key = await create_issue_from_form(
+            "orgtech_problem",
+            form_data=form_data,
+            profile=profile,
+            attachment_paths=list(attachment_paths or []),
+        )
+        if not ok:
+            return False, result, None
+        proj = (project_key or "HD").strip().upper()
+        add_binding(channel_id, user_id, result, proj, "orgtech_problem")
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("orgtech_problem") or {}).get("portal_id") or "1")
+            link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "peripheral_equipment":
+        from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
+        from core.support.issue_binding_registry import add_binding
+        profile = get_user_profile(user_id, channel_id) or {}
+        ok, result, project_key = await create_issue_from_form(
+            "peripheral_equipment",
+            form_data=form_data,
+            profile=profile,
+            attachment_paths=list(attachment_paths or []),
+        )
+        if not ok:
+            return False, result, None
+        proj = (project_key or "HD").strip().upper()
+        add_binding(channel_id, user_id, result, proj, "peripheral_equipment")
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("peripheral_equipment") or {}).get("portal_id") or "1")
+            link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "network_problem":
+        from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
+        from core.support.issue_binding_registry import add_binding
+        profile = get_user_profile(user_id, channel_id) or {}
+        ok, result, project_key = await create_issue_from_form(
+            "network_problem",
+            form_data=form_data,
+            profile=profile,
+            attachment_paths=list(attachment_paths or []),
+        )
+        if not ok:
+            return False, result, None
+        proj = (project_key or "HD").strip().upper()
+        add_binding(channel_id, user_id, result, proj, "network_problem")
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("network_problem") or {}).get("portal_id") or "1")
+            link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "electronic_queue":
+        from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
+        from core.support.issue_binding_registry import add_binding
+        profile = get_user_profile(user_id, channel_id) or {}
+        ok, result, project_key = await create_issue_from_form(
+            "electronic_queue",
+            form_data=form_data,
+            profile=profile,
+            attachment_paths=list(attachment_paths or []),
+        )
+        if not ok:
+            return False, result, None
+        proj = (project_key or "HD").strip().upper()
+        add_binding(channel_id, user_id, result, proj, "electronic_queue")
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("electronic_queue") or {}).get("portal_id") or "1")
+            link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "email_owa_outlook":
+        from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
+        from core.support.issue_binding_registry import add_binding
+        profile = get_user_profile(user_id, channel_id) or {}
+        ok, result, project_key = await create_issue_from_form(
+            "email_owa_outlook",
+            form_data=form_data,
+            profile=profile,
+            attachment_paths=list(attachment_paths or []),
+        )
+        if not ok:
+            return False, result, None
+        proj = (project_key or "ISR").strip().upper()
+        add_binding(channel_id, user_id, result, proj, "email_owa_outlook")
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("email_owa_outlook") or {}).get("portal_id") or "22")
+            link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "email_forwarding":
+        from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
+        from core.support.issue_binding_registry import add_binding
+        profile = get_user_profile(user_id, channel_id) or {}
+        ok, result, project_key = await create_issue_from_form(
+            "email_forwarding",
+            form_data=form_data,
+            profile=profile,
+            attachment_paths=list(attachment_paths or []),
+        )
+        if not ok:
+            return False, result, None
+        proj = (project_key or "ISR").strip().upper()
+        add_binding(channel_id, user_id, result, proj, "email_forwarding")
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("email_forwarding") or {}).get("portal_id") or "22")
+            link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "email_groups":
+        from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
+        from core.support.issue_binding_registry import add_binding
+        profile = get_user_profile(user_id, channel_id) or {}
+        ok, result, project_key = await create_issue_from_form(
+            "email_groups",
+            form_data=form_data,
+            profile=profile,
+            attachment_paths=list(attachment_paths or []),
+        )
+        if not ok:
+            return False, result, None
+        proj = (project_key or "ISR").strip().upper()
+        add_binding(channel_id, user_id, result, proj, "email_groups")
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("email_groups") or {}).get("portal_id") or "22")
             link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
             msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
         else:
@@ -321,9 +564,65 @@ MY_TICKETS_EXCLUDED_STATUSES = frozenset({
 })
 
 
+def get_ticket_type_label(ticket_type_id: Optional[str], project_key: Optional[str] = None) -> str:
+    """Человекочитаемое имя типа заявки для списка «Мои заявки»."""
+    tid = (ticket_type_id or "").strip()
+    if not tid:
+        return ""
+    # Сначала проверяем каталог типов заявок.
+    try:
+        from core.support.ticket_catalog import get_ticket_type
+        meta = get_ticket_type(tid)
+        if isinstance(meta, dict):
+            label = (meta.get("label") or "").strip()
+            if label:
+                return label
+    except Exception:
+        pass
+    # Затем каталог форм (новый движок).
+    try:
+        from core.forms_catalog import get_form_definition
+        fmeta = get_form_definition(tid)
+        if isinstance(fmeta, dict):
+            label = (fmeta.get("label") or "").strip()
+            if label:
+                return label
+    except Exception:
+        pass
+    # Встроенные типы, добавленные напрямую в код.
+    mapping = {
+        "lupa_search": "Поиск/Сайт",
+        "wms_issue": "Проблема в работе WMS",
+        "wms_settings": "Изменение настроек системы WMS",
+        "wms_psi_user": "Пользователь PSIwms",
+        "pc_problem": "Проблема в работе ПК",
+        "orgtech_problem": "Оргтехника",
+        "peripheral_equipment": "Периферийное оборудование",
+        "network_problem": "Проблемы в работе сети",
+        "electronic_queue": "Электронная очередь",
+        "email_owa_outlook": "Электронная почта (Owa/Outlook)",
+        "email_forwarding": "Настройка переадресации",
+        "email_groups": "Группы рассылки",
+    }
+    if tid in mapping:
+        return mapping[tid]
+    # Фолбэк по проекту, если ticket_type_id неизвестен.
+    proj = (project_key or "").strip().upper()
+    if proj == "HD":
+        return "Проблема в работе ПК"
+    if proj == "ISR":
+        return "Электронная почта"
+    if proj == "WHD":
+        return "Поиск/Сайт"
+    if proj == "PW":
+        return "WMS"
+    return tid
+
+
 def get_jira_customer_request_url(issue_key: str, project_key: Optional[str] = None) -> str:
     """
-    Ссылка на заявку в Jira. PW (WMS): /browse/PW-xxx; WHD (Lupa): портал portal/5.
+    Ссылка на заявку в Jira.
+    PW (WMS): /browse/PW-xxx; WHD (Lupa): portal/5; HD (PC): portal/1; ISR (Email): portal/1.
     """
     key = (issue_key or "").strip()
     if not key:
@@ -340,7 +639,38 @@ def get_jira_customer_request_url(issue_key: str, project_key: Optional[str] = N
     if proj == "WHD":
         portal_id = (CONFIG.get("JIRA_LUPA", {}).get("PORTAL_ID") or "5").strip()
         return f"{base}/plugins/servlet/desk/portal/{portal_id}/{key}"
+    # PC (HD): портал Service Desk для конечных пользователей
+    if proj == "HD":
+        try:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("pc_problem") or {}).get("portal_id") or "").strip()
+        except Exception:
+            portal_id = ""
+        if not portal_id:
+            portal_id = (CONFIG.get("JIRA_PC", {}).get("PORTAL_ID") or "1").strip()
+        return f"{base}/plugins/servlet/desk/portal/{portal_id}/{key}"
+    if proj == "ISR":
+        try:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("email_owa_outlook") or {}).get("portal_id") or "").strip()
+        except Exception:
+            portal_id = ""
+        if not portal_id:
+            portal_id = (CONFIG.get("JIRA_EMAIL", {}).get("PORTAL_ID") or "22").strip()
+        return f"{base}/plugins/servlet/desk/portal/{portal_id}/{key}"
     # остальные проекты — browse
+    return f"{base}/browse/{key}"
+
+
+def get_jira_browse_url(issue_key: str) -> str:
+    """Ссылка формата /browse/KEY (для исполнителей/администраторов)."""
+    key = (issue_key or "").strip()
+    if not key:
+        return ""
+    jira = CONFIG.get("JIRA", {})
+    base = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
+    if not base:
+        return ""
     return f"{base}/browse/{key}"
 
 
@@ -364,6 +694,7 @@ def get_my_tickets(channel_id: str, user_id: int) -> List[dict]:
                 "issue_key": b.get("issue_key"),
                 "project_key": b.get("project_key"),
                 "ticket_type_id": b.get("ticket_type_id"),
+                "request_type_label": get_ticket_type_label(b.get("ticket_type_id"), b.get("project_key")),
                 "customer_request_url": get_jira_customer_request_url(b.get("issue_key"), b.get("project_key")),
             })
     return result
@@ -480,6 +811,9 @@ class SupportAPI:
 
     def get_jira_customer_request_url(self, issue_key: str) -> str:
         return get_jira_customer_request_url(issue_key)
+
+    def get_jira_browse_url(self, issue_key: str) -> str:
+        return get_jira_browse_url(issue_key)
 
 
 support_api = SupportAPI()

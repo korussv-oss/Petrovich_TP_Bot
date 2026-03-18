@@ -94,3 +94,72 @@ class LupaTicketStates(StatesGroup):
     ENTER_CITY = State()
     ENTER_CITY_MANUAL = State()  # ввод города текстом после «Ввести вручную»
     WAITING_FOR_DESCRIPTION = State()  # комментарий (можно пропустить)
+
+
+class PcIssueStates(StatesGroup):
+    """Заявка «Проблема в работе ПК»: категория проблемы → описание (можно пропустить) → вложения (можно пропустить)."""
+    WAITING_FOR_KIND = State()
+    WAITING_FOR_DESCRIPTION = State()
+    WAITING_FOR_ATTACHMENTS = State()
+
+
+class EmailOwaStates(StatesGroup):
+    """Заявка «Электронная почта (Owa\\Outlook)»: запрос → RMS/IP → рабочее место (опц.) → описание → вложения (опц.)."""
+    WAITING_FOR_REQUEST_KIND = State()
+    WAITING_FOR_RMS_OR_IP = State()
+    WAITING_FOR_WORKPLACE = State()
+    WAITING_FOR_DESCRIPTION = State()
+    WAITING_FOR_ATTACHMENTS = State()
+
+
+class OrgtechIssueStates(StatesGroup):
+    """Заявка «Оргтехника»: тип → местоположение → описание (опц.) → вложения (опц.)."""
+    WAITING_FOR_KIND = State()
+    WAITING_FOR_LOCATION = State()
+    WAITING_FOR_DESCRIPTION = State()
+    WAITING_FOR_ATTACHMENTS = State()
+
+
+class PeripheralEquipmentStates(StatesGroup):
+    """Заявка «Периферийное оборудование»: вид → IP (обяз.) → описание (опц.) → вложения (опц.)."""
+    WAITING_FOR_KIND = State()
+    WAITING_FOR_IP = State()
+    WAITING_FOR_DESCRIPTION = State()
+    WAITING_FOR_ATTACHMENTS = State()
+
+
+class NetworkIssueStates(StatesGroup):
+    """Заявка «Проблемы в работе сети» с ветвлением по типу сети."""
+    WAITING_FOR_NETWORK_TYPE = State()
+    WAITING_FOR_PROVIDER = State()
+    WAITING_FOR_PROVIDER_OTHER = State()
+    WAITING_FOR_WIFI_OWNER = State()
+    WAITING_FOR_PC_TYPE = State()
+    WAITING_FOR_RMS = State()
+    WAITING_FOR_DESCRIPTION = State()
+    WAITING_FOR_ATTACHMENTS = State()
+
+
+class ElectronicQueueStates(StatesGroup):
+    """Заявка «Электронная очередь»: тип услуги -> описание."""
+    WAITING_FOR_SERVICE_TYPE = State()
+    WAITING_FOR_DESCRIPTION = State()
+
+
+class EmailForwardingStates(StatesGroup):
+    """Переадресация: on/off -> from -> to -> date."""
+    WAITING_FOR_ON_OFF = State()
+    WAITING_FOR_EMAIL_FROM = State()
+    WAITING_FOR_EMAIL_TO = State()
+    WAITING_FOR_DATE = State()
+
+
+class EmailGroupsStates(StatesGroup):
+    """Группы рассылки: what_to_do -> ветвление по сценарию."""
+    WAITING_FOR_WHAT_TO_DO = State()
+    WAITING_FOR_GROUP_NAME = State()
+    WAITING_FOR_GROUP_OWNER = State()
+    WAITING_FOR_GROUP_MEMBERSHIP = State()
+    WAITING_FOR_GROUP_EMAIL = State()
+    WAITING_FOR_AD_LOGIN = State()
+    WAITING_FOR_DESCRIPTION = State()

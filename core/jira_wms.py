@@ -14,6 +14,7 @@ import aiohttp
 
 from config import CONFIG
 from core.wms_constants import WMS_PROCESSES
+from validators import sanitize_jira_text, validate_issue_key
 
 logger = logging.getLogger(__name__)
 
@@ -200,12 +201,15 @@ async def create_wms_issue(
     process_field = (wms.get("FIELD_PROCESS") or "customfield_13803").strip()
     service_field = (wms.get("FIELD_SERVICE_TYPE") or "customfield_10500").strip()
 
-    summary = (summary or "").strip() or "Заявка по настройке WMS"
-    description = (description or "").strip() or "Описание не предоставлено"
+    summary = sanitize_jira_text((summary or "").strip() or "Заявка по настройке WMS", max_len=255)
+    description = sanitize_jira_text((description or "").strip() or "Описание не предоставлено", max_len=4000)
     department = (department or "").strip()
     process = (process or "").strip()
     if full_name or phone:
-        description = f"Контактное лицо: {full_name or '—'}, {phone or '—'}\n\n" + description
+        description = sanitize_jira_text(
+            f"Контактное лицо: {full_name or '—'}, {phone or '—'}\n\n" + description,
+            max_len=4000,
+        )
 
     if not department:
         logger.error("WMS: пустое подразделение")
@@ -376,9 +380,12 @@ async def create_wms_settings(
     if not temp_ids:
         return False, "Не удалось загрузить файлы. Проверьте размер (до 10 МБ) и повторите."
 
-    description = (description or "").strip() or "Описание не предоставлено"
+    description = sanitize_jira_text((description or "").strip() or "Описание не предоставлено", max_len=4000)
     if full_name or phone:
-        description = f"Контактное лицо: {full_name or '—'}, {phone or '—'}\n\n" + description
+        description = sanitize_jira_text(
+            f"Контактное лицо: {full_name or '—'}, {phone or '—'}\n\n" + description,
+            max_len=4000,
+        )
     department = (department or "").strip()
     if not department:
         return False, "Укажите подразделение."
@@ -434,10 +441,13 @@ async def create_wms_psi_user(
     dept_field = (wms.get("FIELD_DEPARTMENT") or "customfield_18215").strip()
     psi_field = (wms.get("FIELD_PSI_USER_FULL_NAME") or "customfield_12406").strip()
 
-    summary = (summary or "").strip()[:255] or "Заявка на пользователя PSIwms"
-    description = (description or "").strip() or "Описание не предоставлено"
+    summary = sanitize_jira_text((summary or "").strip() or "Заявка на пользователя PSIwms", max_len=255)
+    description = sanitize_jira_text((description or "").strip() or "Описание не предоставлено", max_len=4000)
     if full_name_contact or phone:
-        description = f"Контактное лицо: {full_name_contact or '—'}, {phone or '—'}\n\n" + description
+        description = sanitize_jira_text(
+            f"Контактное лицо: {full_name_contact or '—'}, {phone or '—'}\n\n" + description,
+            max_len=4000,
+        )
     department = (department or "").strip()
     full_name = (full_name or "").strip()
     if not department:
@@ -472,6 +482,10 @@ async def add_attachments_to_issue(issue_key: str, file_paths: List[str]) -> Tup
     """
     if not issue_key or not file_paths:
         return 0, 0
+    ok, _ = validate_issue_key(issue_key)
+    if not ok:
+        logger.warning("Некорректный issue_key для вложений: %r", issue_key)
+        return 0, min(len(file_paths), MAX_ATTACHMENTS_PER_ISSUE)
     jira = CONFIG.get("JIRA", {})
     base_url = (jira.get("LOGIN_URL") or "").rstrip("/")
     token = (jira.get("TOKEN") or "").strip()

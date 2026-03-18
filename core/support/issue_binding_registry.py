@@ -70,6 +70,15 @@ def get_bindings_by_user(channel_id: str, channel_user_id: int) -> List[Dict[str
     return [r for r in records if r.get("channel_id") == channel_id and r.get("channel_user_id") == channel_user_id]
 
 
+def get_bindings_by_issue(issue_key: str) -> List[Dict[str, Any]]:
+    """Все привязки по issue_key."""
+    key = (issue_key or "").strip().upper()
+    if not key:
+        return []
+    records = _load()
+    return [r for r in records if (r.get("issue_key") or "").strip().upper() == key]
+
+
 def get_user_ids_by_issue(issue_key: str) -> List[tuple]:
     """По issue_key вернуть список (channel_id, channel_user_id) для доставки уведомлений."""
     key = (issue_key or "").strip().upper()
@@ -88,6 +97,11 @@ def get_all_issue_keys() -> List[str]:
         if k:
             keys.add(k)
     return sorted(keys)
+
+
+def get_all_bindings() -> List[Dict[str, Any]]:
+    """Все записи реестра привязок."""
+    return _load()
 
 
 def remove_binding(issue_key: str, channel_id: str, channel_user_id: int) -> bool:

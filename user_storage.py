@@ -356,6 +356,40 @@ def get_all_users_sorted() -> list:
     return items
 
 
+def find_users_by_jira_username(jira_username: str) -> list:
+    """
+    Возвращает список telegram_id, у которых в профиле jira_username совпадает.
+    Сопоставление без учёта регистра.
+    """
+    target = (jira_username or "").strip().lower()
+    if not target:
+        return []
+    db = load_user_db()
+    out = []
+    for uid, profile in db.items():
+        ju = (profile.get("jira_username") or "").strip().lower()
+        if ju and ju == target:
+            try:
+                out.append(int(uid))
+            except Exception:
+                continue
+    return out
+
+
+def get_linked_max_user_ids(telegram_id: int) -> list:
+    """Список max_user_id, привязанных к telegram_id."""
+    tg = str(int(telegram_id))
+    idx = _load_json(INDEX_MAX_USER, {})
+    out = []
+    for max_uid, mapped_tg in idx.items():
+        if str(mapped_tg) == tg:
+            try:
+                out.append(int(max_uid))
+            except Exception:
+                continue
+    return out
+
+
 def search_users_by_fio(partial: str, limit: int = 50) -> list:
     """Поиск по части ФИО (без учёта регистра). Возвращает список (user_id, profile)."""
     if not (partial or "").strip():

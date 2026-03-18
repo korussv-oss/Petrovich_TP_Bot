@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import re
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -434,12 +435,15 @@ async def _send_message_max(
     return None
 
 
-async def _get_updates_raw(bot, timeout: int = 25, limit: int = 10) -> list:
+async def _get_updates_raw(bot, timeout: int = 25, limit: int = 10, offset: int | None = None) -> list:
     """
     Получить сырой список апдейтов (dict), без парсинга через Update.from_dict.
     API MAX может возвращать структуру без update_id — библиотека тогда падает с KeyError.
     """
     params = {"timeout": timeout, "limit": limit}
+    # В MAX Bot API (как в Telegram) offset позволяет не получать уже обработанные апдейты повторно.
+    if offset is not None:
+        params["offset"] = int(offset)
     data = await bot._make_request("GET", "/updates", params=params)
     return data.get("updates") or []
 
@@ -725,6 +729,215 @@ async def _handle_open_issue_max(user_id: int, callback_id: str) -> dict | None:
     return {"text": text, "parse_mode": "HTML", "buttons": buttons}
 
 
+async def _handle_stc_open_issue_max(user_id: int, issue_key: str) -> dict:
+    from core.stc_tasks import can_stc_user_access_issue, get_stc_assignee_tasks
+    from core.jira_aa import get_issue_admin_details, get_issue_comments
+    from core.support.api import support_api
+    from config import is_stc_sa
+
+    back_btn = [{"id": "back_to_main", "label": "🔙 В главное меню"}]
+    if not is_stc_sa("max", user_id):
+        return {"text": "Нет доступа.", "parse_mode": "HTML", "buttons": back_btn}
+    if not await can_stc_user_access_issue("max", user_id, issue_key):
+        return {
+            "text": "❌ Заявка недоступна (возможно, вы больше не исполнитель).",
+            "parse_mode": "HTML",
+            "buttons": [
+                {"id": "sa_stc_my_tasks", "label": "🔙 К моим задачам"},
+                {"id": "back_to_main", "label": "🔙 В главное меню"},
+            ],
+        }
+    info = await get_issue_admin_details(issue_key) or {}
+    comments = await get_issue_comments(issue_key)
+    creator = "—"
+    req_label = "—"
+    for t in await get_stc_assignee_tasks("max", user_id):
+        if (t.get("issue_key") or "").upper() == issue_key.upper():
+            creator = t.get("creator") or "—"
+            req_label = t.get("request_type_label") or "—"
+            break
+    summary = info.get("summary") or "—"
+    status = info.get("status") or "—"
+    desc = info.get("description") or "—"
+    reporter = info.get("reporter_display") or "—"
+    assignee = info.get("assignee_display") or "—"
+    lines = []
+    for c in reversed((comments or [])[-5:]):
+        author = (c.get("author") or {}).get("displayName", "—")
+        body = (c.get("body") or "").strip()
+        if len(body) > 180:
+            body = body[:180] + "..."
+        lines.append(f"👤 {author}: {body}")
+    jira_url = support_api.get_jira_browse_url(issue_key)
+    jira_line = f'\n🔗 <a href="{jira_url}">Открыть в JIRA</a>' if jira_url else ""
+    text = (
+        f"🛠️ <b>Задача {issue_key}</b>\n\n"
+        f"Тип: {req_label}\n"
+        f"Автор: {creator}\n"
+        f"Reporter: {reporter}\n"
+        f"Assignee: {assignee}\n"
+        f"Статус: {status}\n"
+        f"Тема: {summary}{jira_line}\n\n"
+        f"Описание:\n{desc}\n\n"
+        + ("Последние комментарии:\n" + "\n\n".join(lines) if lines else "Комментариев пока нет.")
+    )
+    buttons = [
+        {"id": f"stc_open_jira:{issue_key}", "label": "🔗 Открыть в JIRA"},
+        {"id": f"stc_set_status:{issue_key}", "label": "🔄 Установить статус"},
+        {"id": f"add_comment:{issue_key}", "label": "✏️ Добавить комментарий"},
+        {"id": "sa_stc_my_tasks", "label": "🔙 К моим задачам"},
+        {"id": "back_to_main", "label": "🔙 В главное меню"},
+    ]
+    return {"text": text, "parse_mode": "HTML", "buttons": buttons}
+
+
+async def _handle_stc_callback_max(user_id: int, callback_id: str) -> dict:
+    from config import is_stc_sa
+    from core.stc_tasks import get_stc_assignee_tasks, can_stc_user_access_issue
+    from core.jira_aa import get_issue_transitions, transition_issue
+    from core.support.api import support_api
+
+    back_btn = [{"id": "back_to_main", "label": "🔙 В главное меню"}]
+    if not is_stc_sa("max", user_id):
+        return {"text": "Нет доступа.", "parse_mode": "HTML", "buttons": back_btn}
+    if callback_id == "sa_stc_menu":
+        return {
+            "text": "🛠️ <b>СА СТЦ</b>\n\nВыберите действие:",
+            "parse_mode": "HTML",
+            "buttons": [
+                {"id": "sa_stc_my_tasks", "label": "📋 Мои задачи"},
+                {"id": "back_to_main", "label": "🔙 В главное меню"},
+            ],
+        }
+    if callback_id == "sa_stc_my_tasks":
+        tasks = await get_stc_assignee_tasks("max", user_id)
+        if not tasks:
+            return {
+                "text": "📋 <b>Мои задачи (СА СТЦ)</b>\n\nУ вас нет заявок, где вы текущий исполнитель.",
+                "parse_mode": "HTML",
+                "buttons": [
+                    {"id": "sa_stc_menu", "label": "⬅️ Назад"},
+                    {"id": "back_to_main", "label": "🔙 В главное меню"},
+                ],
+            }
+        lines = [f"• {t['issue_key']} — {(t.get('request_type_label') or '—')}" for t in tasks]
+        buttons = [{"id": f"stc_open_issue:{t['issue_key']}", "label": t["issue_key"]} for t in tasks]
+        buttons += [
+            {"id": "sa_stc_menu", "label": "⬅️ Назад"},
+            {"id": "back_to_main", "label": "🔙 В главное меню"},
+        ]
+        return {"text": "📋 <b>Мои задачи (СА СТЦ)</b>\n\n" + "\n".join(lines), "parse_mode": "HTML", "buttons": buttons}
+    if callback_id.startswith("stc_open_issue:"):
+        issue_key = callback_id.split(":", 1)[-1].strip()
+        return await _handle_stc_open_issue_max(user_id, issue_key)
+    if callback_id.startswith("stc_open_jira:"):
+        issue_key = callback_id.split(":", 1)[-1].strip()
+        url = support_api.get_jira_browse_url(issue_key)
+        return {
+            "text": f'🔗 <a href="{url}">Открыть {issue_key} в Jira</a>' if url else "Ссылка недоступна.",
+            "parse_mode": "HTML",
+            "buttons": [
+                {"id": f"stc_open_issue:{issue_key}", "label": "⬅️ Назад к задаче"},
+                {"id": "back_to_main", "label": "🔙 В главное меню"},
+            ],
+        }
+    if callback_id.startswith("stc_set_status:"):
+        issue_key = callback_id.split(":", 1)[-1].strip()
+        if not await can_stc_user_access_issue("max", user_id, issue_key):
+            return {"text": "Заявка недоступна.", "parse_mode": "HTML", "buttons": back_btn}
+        transitions = await get_issue_transitions(issue_key)
+        if not transitions:
+            return {
+                "text": "Нет доступных переходов.",
+                "parse_mode": "HTML",
+                "buttons": [{"id": f"stc_open_issue:{issue_key}", "label": "⬅️ Назад к задаче"}],
+            }
+        buttons = []
+        def _needs_timespent(t: dict) -> bool:
+            name = ((t.get("name") or "") + " " + (t.get("to_name") or "")).strip().lower()
+            markers = ("resolve", "resolved", "done", "close", "закры", "выполн", "реш")
+            return any(m in name for m in markers)
+        for t in transitions[:10]:
+            tid = (t.get("id") or "").strip()
+            if not tid:
+                continue
+            label = (t.get("to_name") or t.get("name") or "Переход").strip()
+            cb = f"stc_ask_timespent:{issue_key}:{tid}" if _needs_timespent(t) else f"stc_apply_status:{issue_key}:{tid}"
+            buttons.append({"id": cb, "label": label})
+        buttons.append({"id": f"stc_open_issue:{issue_key}", "label": "⬅️ Назад"})
+        return {
+            "text": f"🔄 <b>Установить статус</b>\n\nЗаявка: {issue_key}\nВыберите новый статус:",
+            "parse_mode": "HTML",
+            "buttons": buttons,
+        }
+    if callback_id.startswith("stc_ask_timespent:"):
+        parts = callback_id.split(":")
+        if len(parts) < 3:
+            return {"text": "Некорректный переход.", "parse_mode": "HTML", "buttons": back_btn}
+        issue_key = parts[1].strip()
+        transition_id = parts[2].strip()
+        return {
+            "text": f"⏱ <b>Time Spent</b>\n\nЗаявка: {issue_key}\nВыберите затраченное время:",
+            "parse_mode": "HTML",
+            "buttons": [
+                {"id": f"stc_apply_status_ts:{issue_key}:{transition_id}:5m", "label": "5m"},
+                {"id": f"stc_apply_status_ts:{issue_key}:{transition_id}:15m", "label": "15m"},
+                {"id": f"stc_apply_status_ts:{issue_key}:{transition_id}:30m", "label": "30m"},
+                {"id": f"stc_apply_status_ts:{issue_key}:{transition_id}:1h", "label": "1h"},
+                {"id": f"stc_set_status:{issue_key}", "label": "⬅️ Назад"},
+            ],
+        }
+    if callback_id.startswith("stc_apply_status_ts:"):
+        parts = callback_id.split(":")
+        if len(parts) < 4:
+            return {"text": "Некорректный переход.", "parse_mode": "HTML", "buttons": back_btn}
+        issue_key = parts[1].strip()
+        transition_id = parts[2].strip()
+        time_spent = parts[3].strip()
+        if not await can_stc_user_access_issue("max", user_id, issue_key):
+            return {"text": "Заявка недоступна.", "parse_mode": "HTML", "buttons": back_btn}
+        from user_storage import get_user_profile
+        profile = get_user_profile(user_id, "max") or {}
+        preserve_assignee = (profile.get("jira_username") or "").strip() or None
+        ok, msg = await transition_issue(
+            issue_key,
+            transition_id,
+            preserve_assignee_username=preserve_assignee,
+            default_time_spent=time_spent or "5m",
+        )
+        if not ok:
+            return {
+                "text": f"❌ {msg}",
+                "parse_mode": "HTML",
+                "buttons": [{"id": f"stc_set_status:{issue_key}", "label": "⬅️ К статусам"}],
+            }
+        return await _handle_stc_open_issue_max(user_id, issue_key)
+    if callback_id.startswith("stc_apply_status:"):
+        parts = callback_id.split(":")
+        if len(parts) < 3:
+            return {"text": "Некорректный переход.", "parse_mode": "HTML", "buttons": back_btn}
+        issue_key = parts[1].strip()
+        transition_id = parts[2].strip()
+        if not await can_stc_user_access_issue("max", user_id, issue_key):
+            return {"text": "Заявка недоступна.", "parse_mode": "HTML", "buttons": back_btn}
+        from user_storage import get_user_profile
+        profile = get_user_profile(user_id, "max") or {}
+        preserve_assignee = (profile.get("jira_username") or "").strip() or None
+        ok, msg = await transition_issue(
+            issue_key,
+            transition_id,
+            preserve_assignee_username=preserve_assignee,
+        )
+        if not ok:
+            return {
+                "text": f"❌ {msg}",
+                "parse_mode": "HTML",
+                "buttons": [{"id": f"stc_set_status:{issue_key}", "label": "⬅️ К статусам"}],
+            }
+        return await _handle_stc_open_issue_max(user_id, issue_key)
+    return {"text": "Раздел недоступен.", "parse_mode": "HTML", "buttons": back_btn}
+
+
 # Текущий экземпляр бота MAX (для доставки уведомлений из Core)
 _current_max_bot = None
 
@@ -764,8 +977,26 @@ _pending_admin_delete_search_max: dict[int, bool] = {}
 # Ожидание подтверждения номера телефона (контакт) для мигрированных пользователей
 _pending_verify_phone_max: dict[int, bool] = {}
 
+# Регистрация из MAX: user_id -> {"step": "email" | "contact", "email": "..."}
+_pending_registration_max: dict[int, dict] = {}
+
 # user_id (MAX) -> {chat_id, user_id, mid} последнего сообщения бота (удаляем перед новым ответом, как в on_dute)
 _last_bot_message_max: dict[int, dict] = {}
+
+# Антиспам MAX: последнее время события по user_id
+_throttle_max: dict[int, float] = {}
+
+
+def _is_max_rate_limited(user_id: int, cooldown: float) -> bool:
+    """True, если запрос от user_id пришёл раньше cooldown секунд."""
+    if cooldown <= 0:
+        return False
+    now = time.monotonic()
+    last = _throttle_max.get(user_id, 0.0)
+    if now - last < cooldown:
+        return True
+    _throttle_max[user_id] = now
+    return False
 
 
 def _message_id_from_send_response(result: dict | None) -> str | None:
@@ -872,6 +1103,7 @@ async def run_max_bot() -> None:
     if not token:
         logger.info("MAX: MAX_BOT_TOKEN не задан, бот в MAX не запускается")
         return
+    max_cooldown = float(os.getenv("ANTISPAM_COOLDOWN", "1.5"))
 
     # Сначала MaxBotAPI — полные кнопки и все сценарии (WMS, Lupa, callback).
     if not HAS_MAX_SDK:
@@ -888,7 +1120,18 @@ async def run_max_bot() -> None:
         return
 
     from adapters.max.handlers import handle_start, handle_callback, handle_main_menu
-    from adapters.max import wms_flow, lupa_flow
+    from adapters.max import (
+        wms_flow,
+        lupa_flow,
+        pc_flow,
+        email_flow,
+        email_forwarding_flow,
+        email_groups_flow,
+        orgtech_flow,
+        peripheral_flow,
+        network_flow,
+        electronic_queue_flow,
+    )
     from core.support.api import support_api
     from user_storage import bind_account_by_phone
 
@@ -897,9 +1140,14 @@ async def run_max_bot() -> None:
     _current_max_bot = bot
     try:
         logger.info("MAX: бот запущен (long polling)")
+        # offset для /updates: защищает от повторной доставки тех же апдейтов
+        next_offset: int | None = None
+        # Дедуп на случай, если апдейт пришёл без update_id (встречается у некоторых реализаций MAX API)
+        import time
+        recent_noid: dict[str, float] = {}
         while True:
             try:
-                raw_updates = await _get_updates_raw(bot, timeout=25, limit=10)
+                raw_updates = await _get_updates_raw(bot, timeout=25, limit=10, offset=next_offset)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -907,9 +1155,43 @@ async def run_max_bot() -> None:
                 await asyncio.sleep(5)
                 continue
 
+            # продвигаем offset по максимуму update_id в пачке
+            max_update_id: int | None = None
+            for u in raw_updates:
+                if not isinstance(u, dict):
+                    continue
+                uid = u.get("update_id") or u.get("updateId") or u.get("id")
+                if isinstance(uid, int):
+                    max_update_id = uid if max_update_id is None else max(max_update_id, uid)
+                elif isinstance(uid, str) and uid.isdigit():
+                    iv = int(uid)
+                    max_update_id = iv if max_update_id is None else max(max_update_id, iv)
+            if max_update_id is not None:
+                next_offset = max_update_id + 1
+
             for raw in raw_updates:
                 if not isinstance(raw, dict):
                     continue
+                # если update_id нет — пытаемся отсеять повторы в коротком окне
+                if (raw.get("update_id") is None) and (raw.get("updateId") is None) and (raw.get("id") is None):
+                    payload = raw.get("payload") or raw
+                    key = None
+                    try:
+                        # Стабильный отпечаток: тип события + sender + callback/text (чтобы дубли кнопок/сообщений уходили)
+                        r_chat, r_user, user_id, source = _parse_update(raw)
+                        if user_id is not None and source is not None:
+                            key = f"{user_id}|{r_chat or ''}|{r_user or ''}|{source!r}"
+                    except Exception:
+                        key = None
+                    if key:
+                        now = time.time()
+                        # чистим старые ключи
+                        for k, ts in list(recent_noid.items()):
+                            if now - ts > 3.0:
+                                recent_noid.pop(k, None)
+                        if key in recent_noid:
+                            continue
+                        recent_noid[key] = now
                 try:
                     r_chat, r_user, user_id, source = _parse_update(raw)
                     if (r_chat is None and r_user is None) or user_id is None:
@@ -923,6 +1205,9 @@ async def run_max_bot() -> None:
                                 list(msg.keys()) if isinstance(msg, dict) else type(msg).__name__,
                                 _get_message_text(msg) if isinstance(msg, dict) else None,
                             )
+                        continue
+                    # Антиспам для MAX: ограничиваем частоту событий от одного user_id
+                    if _is_max_rate_limited(user_id, max_cooldown):
                         continue
 
                     if source == "start":
@@ -950,16 +1235,72 @@ async def run_max_bot() -> None:
                         if callback_id == "cancel":
                             _pending_password_max.pop(user_id, None)
                             _pending_comment_max.pop(user_id, None)
+                        if callback_id == "back_to_main":
+                            _pending_registration_max.pop(user_id, None)
                         if callback_id == "bind_account":
                             _pending_bind_max[user_id] = True
-                        if callback_id == "ticket_wms_issue":
+                        if callback_id == "start_registration":
+                            _pending_registration_max[user_id] = {"step": "email"}
+                            response = {
+                                "text": (
+                                    "📝 <b>Регистрация</b>\n\n"
+                                    "Шаг 1/2: Введите вашу <b>рабочую почту</b> (@petrovich.ru или @petrovich.tech):"
+                                ),
+                                "parse_mode": "HTML",
+                                "buttons": [{"id": "back_to_main", "label": "◀️ Отмена"}],
+                            }
+                        elif callback_id == "pc_issue_start":
+                            response = await pc_flow.start_pc(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "orgtech_issue_start":
+                            response = await orgtech_flow.start_orgtech(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "peripheral_issue_start":
+                            response = await peripheral_flow.start_peripheral(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "network_issue_start":
+                            response = await network_flow.start_network(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "electronic_queue_start":
+                            response = await electronic_queue_flow.start_electronic_queue(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "tp_email_owa_outlook":
+                            response = await email_flow.start_email_owa(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "tp_email_forwarding":
+                            response = await email_forwarding_flow.start_email_forwarding(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "tp_email_groups":
+                            response = await email_groups_flow.start_email_groups(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id in ("ticket_wms_issue", "tp_section_wms"):
                             response = await wms_flow.start_wms(user_id)
                             if response is None:
                                 response = handle_start(user_id)
-                        elif callback_id == "ticket_lupa_search":
+                        elif callback_id in ("ticket_lupa_search", "tp_section_site"):
                             response = await lupa_flow.start_lupa(user_id)
                             if response is None:
                                 response = handle_start(user_id)
+                        elif callback_id in ("sa_stc_menu", "sa_stc_my_tasks") or (
+                            callback_id
+                            and (
+                                callback_id.startswith("stc_open_issue:")
+                                or callback_id.startswith("stc_set_status:")
+                                or callback_id.startswith("stc_apply_status:")
+                                or callback_id.startswith("stc_ask_timespent:")
+                                or callback_id.startswith("stc_apply_status_ts:")
+                                or callback_id.startswith("stc_open_jira:")
+                            )
+                        ):
+                            response = await _handle_stc_callback_max(user_id, callback_id)
                         elif callback_id and callback_id.startswith("open_issue:"):
                             response = await _handle_open_issue_max(user_id, callback_id)
                             if response is None:
@@ -968,7 +1309,17 @@ async def run_max_bot() -> None:
                             from core.support.api import support_api as _support_api
                             from user_storage import is_user_registered
                             issue_key = (callback_id or "").split(":", 1)[-1].strip()
-                            if issue_key and is_user_registered(user_id, "max") and _support_api.user_owns_issue("max", user_id, issue_key):
+                            allow = False
+                            if issue_key and is_user_registered(user_id, "max"):
+                                if _support_api.user_owns_issue("max", user_id, issue_key):
+                                    allow = True
+                                else:
+                                    try:
+                                        from core.stc_tasks import can_stc_user_access_issue
+                                        allow = await can_stc_user_access_issue("max", user_id, issue_key)
+                                    except Exception:
+                                        allow = False
+                            if allow:
                                 _pending_comment_max[user_id] = issue_key
                                 response = {
                                     "text": f"✍️ Введите текст комментария к заявке <b>{issue_key}</b> (или нажмите Отмена):",
@@ -978,16 +1329,44 @@ async def run_max_bot() -> None:
                             else:
                                 response = {"text": "Заявка не найдена или доступ запрещён.", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
                         elif callback_id == "ticket_rubik_password_change":
-                            from user_storage import is_user_registered
+                            from user_storage import is_user_registered, get_user_profile as _get_profile_max
+                            from core.ad_ldap import is_password_expired as _is_password_expired_max
+                            import asyncio as _asyncio_max
                             if not is_user_registered(user_id, "max"):
                                 response = {"text": "Сначала пройдите регистрацию или привяжите аккаунт.", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
                             else:
-                                _pending_password_max[user_id] = True
-                                response = {
-                                    "text": "🔑 <b>Смена пароля</b>\n\nРубик поможет! Введите новый пароль (или нажмите Отмена):",
-                                    "parse_mode": "HTML",
-                                    "buttons": [{"id": "cancel", "label": "❌ Отмена"}],
-                                }
+                                profile = _get_profile_max(user_id, "max") or {}
+                                login = (profile.get("login") or "").strip()
+                                if not login:
+                                    response = {
+                                        "text": "В профиле не указан рабочий логин. Обратитесь в поддержку для смены пароля.",
+                                        "parse_mode": "HTML",
+                                        "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
+                                    }
+                                else:
+                                    try:
+                                        expired = await _asyncio_max.to_thread(_is_password_expired_max, login)
+                                    except Exception:
+                                        expired = None
+                                    if expired is False:
+                                        response = {
+                                            "text": "Смена пароля через бота доступна только если срок действия вашего пароля истёк.",
+                                            "parse_mode": "HTML",
+                                            "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
+                                        }
+                                    elif expired is None:
+                                        response = {
+                                            "text": "Не удалось проверить в AD, истёк ли ваш пароль. Обратитесь на первую линию поддержки.",
+                                            "parse_mode": "HTML",
+                                            "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
+                                        }
+                                    else:
+                                        _pending_password_max[user_id] = True
+                                        response = {
+                                            "text": "🔑 <b>Смена пароля</b>\n\nРубик поможет! Введите новый пароль (или нажмите Отмена):",
+                                            "parse_mode": "HTML",
+                                            "buttons": [{"id": "cancel", "label": "❌ Отмена"}],
+                                        }
                         elif lupa_flow.is_in_lupa_flow(user_id) and (callback_id == "cancel" or callback_id.startswith("lupa_")):
                             response = lupa_flow.handle_lupa_callback(user_id, callback_id)
                             if response is None:
@@ -1049,6 +1428,236 @@ async def run_max_bot() -> None:
                                             pass
                                 msg_show = user_msg if success else issue_key
                                 response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                        elif pc_flow.is_in_pc_flow(user_id) and (
+                            callback_id == "cancel"
+                            or callback_id.startswith("pc_kind_")
+                            or callback_id in ("pc_skip_description", "pc_finish_ticket", "pc_skip_attachments")
+                        ):
+                            response = await pc_flow.handle_pc_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                attachment_tokens = ct.get("attachment_tokens") or []
+                                import tempfile
+                                import os as _os
+                                temp_paths = []
+                                try:
+                                    for att in attachment_tokens[:10]:
+                                        if not isinstance(att, dict) or not att.get("url"):
+                                            continue
+                                        downloaded = await _download_attachment_max(bot, att)
+                                        if downloaded:
+                                            content, name = downloaded
+                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
+                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="pc_")
+                                            f.write(content)
+                                            f.close()
+                                            temp_paths.append(f.name)
+                                    success, issue_key, user_msg = await support_api.create_ticket(
+                                        "max", user_id, "pc_problem", form_data, attachment_paths=temp_paths
+                                    )
+                                finally:
+                                    for p in temp_paths:
+                                        try:
+                                            _os.unlink(p)
+                                        except Exception:
+                                            pass
+                                msg_show = user_msg if success else issue_key
+                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                        elif orgtech_flow.is_in_orgtech_flow(user_id) and (
+                            callback_id == "cancel"
+                            or callback_id.startswith("orgtech_kind_")
+                            or callback_id in ("orgtech_skip_description", "orgtech_finish_ticket", "orgtech_skip_attachments")
+                        ):
+                            response = await orgtech_flow.handle_orgtech_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                attachment_tokens = ct.get("attachment_tokens") or []
+                                import tempfile
+                                import os as _os
+                                temp_paths = []
+                                try:
+                                    for att in attachment_tokens[:10]:
+                                        if not isinstance(att, dict) or not att.get("url"):
+                                            continue
+                                        downloaded = await _download_attachment_max(bot, att)
+                                        if downloaded:
+                                            content, name = downloaded
+                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
+                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="orgtech_")
+                                            f.write(content)
+                                            f.close()
+                                            temp_paths.append(f.name)
+                                    success, issue_key, user_msg = await support_api.create_ticket(
+                                        "max", user_id, "orgtech_problem", form_data, attachment_paths=temp_paths
+                                    )
+                                finally:
+                                    for p in temp_paths:
+                                        try:
+                                            _os.unlink(p)
+                                        except Exception:
+                                            pass
+                                msg_show = user_msg if success else issue_key
+                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                        elif peripheral_flow.is_in_peripheral_flow(user_id) and (
+                            callback_id == "cancel"
+                            or callback_id.startswith("peripheral_kind_")
+                            or callback_id in ("peripheral_skip_description", "peripheral_finish_ticket", "peripheral_skip_attachments")
+                        ):
+                            response = await peripheral_flow.handle_peripheral_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                attachment_tokens = ct.get("attachment_tokens") or []
+                                import tempfile
+                                import os as _os
+                                temp_paths = []
+                                try:
+                                    for att in attachment_tokens[:10]:
+                                        if not isinstance(att, dict) or not att.get("url"):
+                                            continue
+                                        downloaded = await _download_attachment_max(bot, att)
+                                        if downloaded:
+                                            content, name = downloaded
+                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
+                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="peripheral_")
+                                            f.write(content)
+                                            f.close()
+                                            temp_paths.append(f.name)
+                                    success, issue_key, user_msg = await support_api.create_ticket(
+                                        "max", user_id, "peripheral_equipment", form_data, attachment_paths=temp_paths
+                                    )
+                                finally:
+                                    for p in temp_paths:
+                                        try:
+                                            _os.unlink(p)
+                                        except Exception:
+                                            pass
+                                msg_show = user_msg if success else issue_key
+                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                        elif network_flow.is_in_network_flow(user_id) and (
+                            callback_id == "cancel"
+                            or callback_id.startswith("network_type_")
+                            or callback_id.startswith("network_wifi_owner_")
+                            or callback_id.startswith("network_pc_type_")
+                            or callback_id.startswith("network_provider_")
+                            or callback_id in ("network_skip_rms", "network_skip_description", "network_finish_ticket", "network_skip_attachments")
+                        ):
+                            response = await network_flow.handle_network_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                attachment_tokens = ct.get("attachment_tokens") or []
+                                import tempfile
+                                import os as _os
+                                temp_paths = []
+                                try:
+                                    for att in attachment_tokens[:10]:
+                                        if not isinstance(att, dict) or not att.get("url"):
+                                            continue
+                                        downloaded = await _download_attachment_max(bot, att)
+                                        if downloaded:
+                                            content, name = downloaded
+                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
+                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="network_")
+                                            f.write(content)
+                                            f.close()
+                                            temp_paths.append(f.name)
+                                    success, issue_key, user_msg = await support_api.create_ticket(
+                                        "max", user_id, "network_problem", form_data, attachment_paths=temp_paths
+                                    )
+                                finally:
+                                    for p in temp_paths:
+                                        try:
+                                            _os.unlink(p)
+                                        except Exception:
+                                            pass
+                                msg_show = user_msg if success else issue_key
+                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                        elif electronic_queue_flow.is_in_electronic_queue_flow(user_id) and (
+                            callback_id == "cancel" or callback_id.startswith("eq_type_")
+                        ):
+                            response = await electronic_queue_flow.handle_electronic_queue_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                ticket_type_id = ct.get("ticket_type_id") or "electronic_queue"
+                                success, issue_key, user_msg = await support_api.create_ticket("max", user_id, ticket_type_id, form_data)
+                                msg_show = user_msg if success else issue_key
+                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                        elif email_flow.is_in_email_owa_flow(user_id) and (
+                            callback_id == "cancel"
+                            or callback_id.startswith("email_owa_req_")
+                            or callback_id in ("email_owa_skip_workplace", "email_owa_finish_ticket", "email_owa_skip_attachments")
+                        ):
+                            response = await email_flow.handle_email_owa_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                attachment_tokens = ct.get("attachment_tokens") or []
+                                import tempfile
+                                import os as _os
+                                temp_paths = []
+                                try:
+                                    for att in attachment_tokens[:10]:
+                                        if not isinstance(att, dict) or not att.get("url"):
+                                            continue
+                                        downloaded = await _download_attachment_max(bot, att)
+                                        if downloaded:
+                                            content, name = downloaded
+                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
+                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="email_owa_")
+                                            f.write(content)
+                                            f.close()
+                                            temp_paths.append(f.name)
+                                    success, issue_key, user_msg = await support_api.create_ticket(
+                                        "max", user_id, "email_owa_outlook", form_data, attachment_paths=temp_paths
+                                    )
+                                finally:
+                                    for p in temp_paths:
+                                        try:
+                                            _os.unlink(p)
+                                        except Exception:
+                                            pass
+                                msg_show = user_msg if success else issue_key
+                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                        elif email_forwarding_flow.is_in_email_forwarding_flow(user_id) and (
+                            callback_id == "cancel" or callback_id.startswith("email_fwd_onoff:")
+                        ):
+                            response = await email_forwarding_flow.handle_email_forwarding_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                success, issue_key, user_msg = await support_api.create_ticket("max", user_id, "email_forwarding", form_data)
+                                msg_show = user_msg if success else issue_key
+                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                        elif email_groups_flow.is_in_email_groups_flow(user_id) and (
+                            callback_id == "cancel" or callback_id.startswith("email_groups_do:")
+                        ):
+                            response = await email_groups_flow.handle_email_groups_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                success, issue_key, user_msg = await support_api.create_ticket("max", user_id, "email_groups", form_data)
+                                msg_show = user_msg if success else issue_key
+                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
                         elif callback_id == "admin_lupa_excel_report":
                             from config import is_lupa_report_allowed
                             from core.lupa_report import get_report_path
@@ -1090,7 +1699,67 @@ async def run_max_bot() -> None:
                                 response = handle_start(user_id)
                     elif isinstance(source, tuple) and source[0] == "contact":
                         phone = source[1]
-                        if user_id in _pending_bind_max:
+                        if user_id in _pending_registration_max:
+                            reg = _pending_registration_max.pop(user_id, None)
+                            if reg and reg.get("step") == "contact":
+                                from validators import validate_phone
+                                from core.ad_ldap import search_user_by_phone
+                                from core.registration import register_user_from_ad
+                                from user_storage import get_user_profile, save_user_profile
+                                from config import CONFIG
+                                ok_phone, err_phone = validate_phone(phone or "")
+                                if not ok_phone:
+                                    _pending_registration_max[user_id] = reg
+                                    response = {
+                                        "text": f"❗ {err_phone}\n\nПоделитесь контактом снова.",
+                                        "parse_mode": "HTML",
+                                        "buttons": [
+                                            {"type": "request_contact", "label": "📱 Поделиться контактом"},
+                                            {"id": "back_to_main", "label": "◀️ Отмена"},
+                                        ],
+                                    }
+                                else:
+                                    profile = await asyncio.to_thread(search_user_by_phone, phone)
+                                    if not profile:
+                                        url = (CONFIG.get("SUPPORT_PORTAL_URL") or "").strip()
+                                        response = {
+                                            "text": f"По этому номеру сотрудник не найден в базе. Обратитесь в поддержку: {url}" if url else "По этому номеру сотрудник не найден. Обратитесь в поддержку.",
+                                            "parse_mode": "HTML",
+                                            "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
+                                        }
+                                    else:
+                                        email_entered = (reg.get("email") or "").strip().lower()
+                                        if email_entered and profile.get("email") and (profile["email"].lower() != email_entered):
+                                            _pending_registration_max[user_id] = reg
+                                            response = {
+                                                "text": "❌ Почта не совпадает с записью в базе по этому номеру. Проверьте почту или поделитесь контактом с правильного номера.",
+                                                "parse_mode": "HTML",
+                                                "buttons": [
+                                                    {"type": "request_contact", "label": "📱 Поделиться контактом"},
+                                                    {"id": "back_to_main", "label": "◀️ Отмена"},
+                                                ],
+                                            }
+                                        else:
+                                            success, msg = register_user_from_ad(user_id, profile)
+                                            if not success:
+                                                response = {"text": f"❌ {msg}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                            else:
+                                                try:
+                                                    current = get_user_profile(user_id)
+                                                    if current:
+                                                        from core.registration import _enrich_profile_with_jira_username
+                                                        enriched = await _enrich_profile_with_jira_username(dict(current))
+                                                        save_user_profile(user_id, enriched)
+                                                except Exception:
+                                                    pass
+                                                response = {
+                                                    "text": "✅ <b>Регистрация завершена!</b>",
+                                                    "parse_mode": "HTML",
+                                                    "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
+                                                }
+                            else:
+                                response = handle_start(user_id)
+                        elif user_id in _pending_bind_max:
                             del _pending_bind_max[user_id]
                             ok, msg = bind_account_by_phone(user_id, phone, "max")
                             response = {"text": f"✅ {msg}" if ok else f"❌ {msg}", "parse_mode": "HTML", "buttons": []}
@@ -1110,7 +1779,55 @@ async def run_max_bot() -> None:
                     elif isinstance(source, tuple) and source[0] == "message":
                         text = source[1]
                         from user_storage import is_user_registered as _is_user_registered_max
-                        if not _is_user_registered_max(user_id, "max"):
+                        if user_id in _pending_registration_max:
+                            reg = _pending_registration_max[user_id]
+                            if (text or "").strip().lower() in ("отмена", "cancel", "/cancel"):
+                                _pending_registration_max.pop(user_id, None)
+                                response = handle_start(user_id)
+                            elif reg.get("step") == "email":
+                                from validators import validate_corporate_email
+                                ok, err = validate_corporate_email((text or "").strip())
+                                if not ok:
+                                    response = {
+                                        "text": f"❗ {err}\n\nПопробуйте снова или нажмите Отмена.",
+                                        "parse_mode": "HTML",
+                                        "buttons": [{"id": "back_to_main", "label": "◀️ Отмена"}],
+                                    }
+                                else:
+                                    _pending_registration_max[user_id] = {"step": "contact", "email": (text or "").strip().lower()}
+                                    try:
+                                        pl = raw.get("payload") or raw
+                                        um = pl.get("message") or pl.get("edited_message")
+                                        if isinstance(um, dict):
+                                            user_mid = um.get("mid") or um.get("message_id") or um.get("id")
+                                            body = um.get("body") or um
+                                            if not user_mid and isinstance(body, dict):
+                                                user_mid = body.get("mid") or body.get("message_id")
+                                            if user_mid:
+                                                await _delete_message_max(bot, r_chat, r_user, str(user_mid))
+                                    except Exception:
+                                        pass
+                                    response = {
+                                        "text": (
+                                            "✅ Почта сохранена.\n\n"
+                                            "Шаг 2/2: Поделитесь номером телефона — нажмите кнопку ниже (так мы проверим вас в базе сотрудников):"
+                                        ),
+                                        "parse_mode": "HTML",
+                                        "buttons": [
+                                            {"type": "request_contact", "label": "📱 Поделиться контактом"},
+                                            {"id": "back_to_main", "label": "◀️ Отмена"},
+                                        ],
+                                    }
+                            else:
+                                response = {
+                                    "text": "Поделитесь контактом по кнопке ниже.",
+                                    "parse_mode": "HTML",
+                                    "buttons": [
+                                        {"type": "request_contact", "label": "📱 Поделиться контактом"},
+                                        {"id": "back_to_main", "label": "◀️ Отмена"},
+                                    ],
+                                }
+                        elif not _is_user_registered_max(user_id, "max"):
                             response = {
                                 "text": "Привет! Для работы с ботом отправьте команду /start.",
                                 "parse_mode": "HTML",
@@ -1335,6 +2052,207 @@ async def run_max_bot() -> None:
                                                 _os.unlink(p)
                                             except Exception:
                                                 pass
+                                    msg_show = user_msg if success else issue_key
+                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                            elif pc_flow.is_in_pc_flow(user_id):
+                                response = await pc_flow.handle_pc_message(user_id, text, attachment_list=attachment_list)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    attachment_tokens = ct.get("attachment_tokens") or []
+                                    import tempfile
+                                    import os as _os
+                                    temp_paths = []
+                                    try:
+                                        for att in attachment_tokens[:10]:
+                                            if not isinstance(att, dict) or not att.get("url"):
+                                                continue
+                                            downloaded = await _download_attachment_max(bot, att)
+                                            if downloaded:
+                                                content, name = downloaded
+                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
+                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="pc_")
+                                                f.write(content)
+                                                f.close()
+                                                temp_paths.append(f.name)
+                                        success, issue_key, user_msg = await support_api.create_ticket(
+                                            "max", user_id, "pc_problem", form_data, attachment_paths=temp_paths
+                                        )
+                                    finally:
+                                        for p in temp_paths:
+                                            try:
+                                                _os.unlink(p)
+                                            except Exception:
+                                                pass
+                                    msg_show = user_msg if success else issue_key
+                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                            elif orgtech_flow.is_in_orgtech_flow(user_id):
+                                response = await orgtech_flow.handle_orgtech_message(user_id, text, attachment_list=attachment_list)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    attachment_tokens = ct.get("attachment_tokens") or []
+                                    import tempfile
+                                    import os as _os
+                                    temp_paths = []
+                                    try:
+                                        for att in attachment_tokens[:10]:
+                                            if not isinstance(att, dict) or not att.get("url"):
+                                                continue
+                                            downloaded = await _download_attachment_max(bot, att)
+                                            if downloaded:
+                                                content, name = downloaded
+                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
+                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="orgtech_")
+                                                f.write(content)
+                                                f.close()
+                                                temp_paths.append(f.name)
+                                        success, issue_key, user_msg = await support_api.create_ticket(
+                                            "max", user_id, "orgtech_problem", form_data, attachment_paths=temp_paths
+                                        )
+                                    finally:
+                                        for p in temp_paths:
+                                            try:
+                                                _os.unlink(p)
+                                            except Exception:
+                                                pass
+                                    msg_show = user_msg if success else issue_key
+                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                            elif peripheral_flow.is_in_peripheral_flow(user_id):
+                                response = await peripheral_flow.handle_peripheral_message(user_id, text, attachment_list=attachment_list)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    attachment_tokens = ct.get("attachment_tokens") or []
+                                    import tempfile
+                                    import os as _os
+                                    temp_paths = []
+                                    try:
+                                        for att in attachment_tokens[:10]:
+                                            if not isinstance(att, dict) or not att.get("url"):
+                                                continue
+                                            downloaded = await _download_attachment_max(bot, att)
+                                            if downloaded:
+                                                content, name = downloaded
+                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
+                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="peripheral_")
+                                                f.write(content)
+                                                f.close()
+                                                temp_paths.append(f.name)
+                                        success, issue_key, user_msg = await support_api.create_ticket(
+                                            "max", user_id, "peripheral_equipment", form_data, attachment_paths=temp_paths
+                                        )
+                                    finally:
+                                        for p in temp_paths:
+                                            try:
+                                                _os.unlink(p)
+                                            except Exception:
+                                                pass
+                                    msg_show = user_msg if success else issue_key
+                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                            elif network_flow.is_in_network_flow(user_id):
+                                response = await network_flow.handle_network_message(user_id, text, attachment_list=attachment_list)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    attachment_tokens = ct.get("attachment_tokens") or []
+                                    import tempfile
+                                    import os as _os
+                                    temp_paths = []
+                                    try:
+                                        for att in attachment_tokens[:10]:
+                                            if not isinstance(att, dict) or not att.get("url"):
+                                                continue
+                                            downloaded = await _download_attachment_max(bot, att)
+                                            if downloaded:
+                                                content, name = downloaded
+                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
+                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="network_")
+                                                f.write(content)
+                                                f.close()
+                                                temp_paths.append(f.name)
+                                        success, issue_key, user_msg = await support_api.create_ticket(
+                                            "max", user_id, "network_problem", form_data, attachment_paths=temp_paths
+                                        )
+                                    finally:
+                                        for p in temp_paths:
+                                            try:
+                                                _os.unlink(p)
+                                            except Exception:
+                                                pass
+                                    msg_show = user_msg if success else issue_key
+                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                            elif electronic_queue_flow.is_in_electronic_queue_flow(user_id):
+                                response = await electronic_queue_flow.handle_electronic_queue_message(user_id, text, attachment_list=attachment_list)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    ticket_type_id = ct.get("ticket_type_id") or "electronic_queue"
+                                    success, issue_key, user_msg = await support_api.create_ticket("max", user_id, ticket_type_id, form_data)
+                                    msg_show = user_msg if success else issue_key
+                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                            elif email_flow.is_in_email_owa_flow(user_id):
+                                response = await email_flow.handle_email_owa_message(user_id, text, attachment_list=attachment_list)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    attachment_tokens = ct.get("attachment_tokens") or []
+                                    import tempfile
+                                    import os as _os
+                                    temp_paths = []
+                                    try:
+                                        for att in attachment_tokens[:10]:
+                                            if not isinstance(att, dict) or not att.get("url"):
+                                                continue
+                                            downloaded = await _download_attachment_max(bot, att)
+                                            if downloaded:
+                                                content, name = downloaded
+                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
+                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="email_owa_")
+                                                f.write(content)
+                                                f.close()
+                                                temp_paths.append(f.name)
+                                        success, issue_key, user_msg = await support_api.create_ticket(
+                                            "max", user_id, "email_owa_outlook", form_data, attachment_paths=temp_paths
+                                        )
+                                    finally:
+                                        for p in temp_paths:
+                                            try:
+                                                _os.unlink(p)
+                                            except Exception:
+                                                pass
+                                    msg_show = user_msg if success else issue_key
+                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                            elif email_forwarding_flow.is_in_email_forwarding_flow(user_id):
+                                response = await email_forwarding_flow.handle_email_forwarding_message(user_id, text)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    success, issue_key, user_msg = await support_api.create_ticket("max", user_id, "email_forwarding", form_data)
+                                    msg_show = user_msg if success else issue_key
+                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                            elif email_groups_flow.is_in_email_groups_flow(user_id):
+                                response = await email_groups_flow.handle_email_groups_message(user_id, text)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    success, issue_key, user_msg = await support_api.create_ticket("max", user_id, "email_groups", form_data)
                                     msg_show = user_msg if success else issue_key
                                     response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
                             elif lupa_flow.is_in_lupa_flow(user_id):

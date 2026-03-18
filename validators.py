@@ -4,6 +4,8 @@
 import re
 from typing import Tuple
 
+ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]+-\d+$")
+
 
 def validate_full_name(full_name: str) -> Tuple[bool, str]:
     """ФИО только кириллицей (русские буквы), пробелы и дефис."""
@@ -111,3 +113,32 @@ def normalize_phone_for_jira(phone: str) -> str:
     if len(digits) == 10:
         return digits
     return digits
+
+
+def validate_issue_key(issue_key: str) -> Tuple[bool, str]:
+    """
+    Jira issue key: PROJECT-123 (например AA-12345, PW-25774).
+    Используется для безопасной сборки URL к Jira API.
+    """
+    s = (issue_key or "").strip()
+    if not s:
+        return False, "Issue key не может быть пустым."
+    if len(s) > 64:
+        return False, "Issue key слишком длинный."
+    if not ISSUE_KEY_RE.match(s):
+        return False, "Неверный формат issue key."
+    return True, ""
+
+
+def sanitize_jira_text(text: str, max_len: int = 4000) -> str:
+    """
+    Базовая санитизация текста для Jira:
+    - удаляет управляющие символы (кроме \\n и \\t),
+    - нормализует переносы строк,
+    - обрезает до max_len.
+    """
+    s = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", s)
+    if max_len > 0 and len(s) > max_len:
+        s = s[:max_len]
+    return s.strip()
