@@ -237,12 +237,42 @@ async def stc_set_status(callback: CallbackQuery):
         name = ((t.get("name") or "") + " " + (t.get("to_name") or "")).strip().lower()
         markers = ("resolve", "resolved", "done", "close", "закры", "выполн", "реш")
         return any(m in name for m in markers)
-    for t in transitions[:10]:
-        label = (t.get("to_name") or t.get("name") or "Переход").strip()
+    def _pick_transition(kind: str) -> dict | None:
+        """
+        Выбираем один переход для нужного статуса.
+        kind: in_progress | pause | done
+        """
+        def norm(s: str) -> str:
+            return (s or "").strip().lower()
+        for t in transitions:
+            to_name = norm(t.get("to_name") or "")
+            name = norm(t.get("name") or "")
+            blob = f"{to_name} {name}".strip()
+            if kind == "in_progress":
+                if ("in progress" in blob) or ("в работе" in blob) or ("работ" in to_name and "в" in to_name):
+                    return t
+            if kind == "pause":
+                if any(x in blob for x in ("pause", "paused", "on hold", "hold", "пауза", "приост", "ожид")):
+                    return t
+            if kind == "done":
+                if any(x in blob for x in ("resolved", "resolve", "done", "close", "closed", "готов", "выполн", "закры", "решен", "решён")):
+                    return t
+        return None
+
+    ordered = [
+        ("in_progress", "🟢 В работе"),
+        ("pause", "⏸ Пауза"),
+        ("done", "✅ Готово"),
+    ]
+    for kind, label in ordered:
+        t = _pick_transition(kind)
+        if not t:
+            continue
         tid = (t.get("id") or "").strip()
-        if tid:
-            cb = f"stc_ask_timespent:{issue_key}:{tid}" if _needs_timespent(t) else f"stc_apply_status:{issue_key}:{tid}"
-            buttons.append([InlineKeyboardButton(text=label, callback_data=cb)])
+        if not tid:
+            continue
+        cb = f"stc_ask_timespent:{issue_key}:{tid}" if _needs_timespent(t) else f"stc_apply_status:{issue_key}:{tid}"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=cb)])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"stc_open_issue:{issue_key}")])
     await callback.message.edit_text(
         f"🔄 <b>Установить статус</b>\n\nЗаявка: {issue_key}\nВыберите новый статус:",

@@ -857,11 +857,36 @@ async def _handle_stc_callback_max(user_id: int, callback_id: str) -> dict:
             name = ((t.get("name") or "") + " " + (t.get("to_name") or "")).strip().lower()
             markers = ("resolve", "resolved", "done", "close", "закры", "выполн", "реш")
             return any(m in name for m in markers)
-        for t in transitions[:10]:
+        def _pick_transition(kind: str) -> dict | None:
+            def norm(s: str) -> str:
+                return (s or "").strip().lower()
+            for t in transitions:
+                to_name = norm(t.get("to_name") or "")
+                name = norm(t.get("name") or "")
+                blob = f"{to_name} {name}".strip()
+                if kind == "in_progress":
+                    if ("in progress" in blob) or ("в работе" in blob) or ("работ" in to_name and "в" in to_name):
+                        return t
+                if kind == "pause":
+                    if any(x in blob for x in ("pause", "paused", "on hold", "hold", "пауза", "приост", "ожид")):
+                        return t
+                if kind == "done":
+                    if any(x in blob for x in ("resolved", "resolve", "done", "close", "closed", "готов", "выполн", "закры", "решен", "решён")):
+                        return t
+            return None
+
+        ordered = [
+            ("in_progress", "🟢 В работе"),
+            ("pause", "⏸ Пауза"),
+            ("done", "✅ Готово"),
+        ]
+        for kind, label in ordered:
+            t = _pick_transition(kind)
+            if not t:
+                continue
             tid = (t.get("id") or "").strip()
             if not tid:
                 continue
-            label = (t.get("to_name") or t.get("name") or "Переход").strip()
             cb = f"stc_ask_timespent:{issue_key}:{tid}" if _needs_timespent(t) else f"stc_apply_status:{issue_key}:{tid}"
             buttons.append({"id": cb, "label": label})
         buttons.append({"id": f"stc_open_issue:{issue_key}", "label": "⬅️ Назад"})
@@ -1881,7 +1906,21 @@ async def run_max_bot() -> None:
                                             "mid": new_mid,
                                         }
                                 continue
-                            if user_id in _pending_admin_delete_search_max:
+                            # Админ-удаление пользователя — отдельный режим ввода.
+                            # Не должен перехватывать сообщения, если пользователь находится в любом другом сценарии (Lupa/WMS/формы).
+                            in_any_flow = (
+                                wms_flow.is_in_wms_flow(user_id)
+                                or lupa_flow.is_in_lupa_flow(user_id)
+                                or pc_flow.is_in_pc_flow(user_id)
+                                or orgtech_flow.is_in_orgtech_flow(user_id)
+                                or peripheral_flow.is_in_peripheral_flow(user_id)
+                                or network_flow.is_in_network_flow(user_id)
+                                or electronic_queue_flow.is_in_electronic_queue_flow(user_id)
+                                or email_flow.is_in_email_owa_flow(user_id)
+                                or email_forwarding_flow.is_in_email_forwarding_flow(user_id)
+                                or email_groups_flow.is_in_email_groups_flow(user_id)
+                            )
+                            if (user_id in _pending_admin_delete_search_max) and (not in_any_flow):
                                 _pending_admin_delete_search_max.pop(user_id, None)
                                 from config import is_channel_admin
                                 from user_storage import search_users_by_fio
@@ -1904,7 +1943,7 @@ async def run_max_bot() -> None:
                                                 buttons.append({"id": f"admin_del_uid_{uid}", "label": label})
                                             buttons.append({"id": "admin_del_back_choice", "label": "🔙 К выбору способа"})
                                             response = {"text": f"Найдено по «{inp}»: {len(matches)}. Выберите пользователя для удаления:", "parse_mode": "HTML", "buttons": buttons}
-                            elif user_id in _pending_admin_delete_max:
+                            elif (user_id in _pending_admin_delete_max) and (not in_any_flow):
                                 _pending_admin_delete_max.pop(user_id, None)
                                 from config import is_channel_admin
                                 from user_storage import delete_user, get_user_profile, find_by_login, resolve_channel_user_id
