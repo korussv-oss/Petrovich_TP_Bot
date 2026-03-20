@@ -104,14 +104,27 @@ async def _run_telegram_bot() -> None:
     cooldown = float(os.getenv("ANTISPAM_COOLDOWN", "1.5"))
     dp.update.outer_middleware(AntispamMiddleware(cooldown=cooldown))
 
-    dp.include_router(start_router)
-    dp.include_router(registration_router)
-    dp.include_router(password_router)
-    dp.include_router(admin_router)
-    dp.include_router(comments_router)
-    dp.include_router(my_tickets_router)
-    dp.include_router(create_ticket_router)
-    dp.include_router(menu_extra_router)
+    # Aiogram v3 не позволяет включить один и тот же Router в Dispatcher повторно.
+    # У нас роутеры импортируются как singletons, поэтому при рестарте (_supervise)
+    # нужно “отцеплять” Router от предыдущего Dispatcher.
+    def _safe_include(dp_obj: Dispatcher, router_obj) -> None:
+        try:
+            if getattr(router_obj, "parent_router", None) is not None:
+                router_obj.parent_router = None
+        except Exception:
+            # Если setter не даст обнулить parent_router — включение всё равно может упасть,
+            # но мы не будем скрывать причины.
+            pass
+        dp_obj.include_router(router_obj)
+
+    _safe_include(dp, start_router)
+    _safe_include(dp, registration_router)
+    _safe_include(dp, password_router)
+    _safe_include(dp, admin_router)
+    _safe_include(dp, comments_router)
+    _safe_include(dp, my_tickets_router)
+    _safe_include(dp, create_ticket_router)
+    _safe_include(dp, menu_extra_router)
 
     logger.info("TELEGRAM: бот запущен (polling)")
     try:
