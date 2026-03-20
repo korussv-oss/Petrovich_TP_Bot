@@ -6,6 +6,7 @@
 import asyncio
 import logging
 import json
+from datetime import datetime
 from typing import Optional, Dict, Any, Set
 from urllib.parse import urljoin
 
@@ -540,7 +541,14 @@ def _is_internal_comment(comment: Dict[str, Any]) -> bool:
 
 
 async def get_issue_comments(issue_key: str, include_internal: bool = False) -> list:
-    """Возвращает список комментариев задачи. Внутренние (internal) по умолчанию исключаются."""
+    """
+    Возвращает список комментариев задачи.
+
+    Внутренние (internal) по умолчанию исключаются (для JSM внутренних заметок `sd.public.comment.internal == true`).
+
+    Важно: Jira REST отдает комментарии постранично. Раньше код без `startAt/maxResults` мог возвращать
+    только первые комментарии, из-за чего уведомления “о новых комментариях” не срабатывали.
+    """
     jira = CONFIG.get("JIRA", {})
     base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
     token = (jira.get("TOKEN") or "").strip()
@@ -550,18 +558,68 @@ async def get_issue_comments(issue_key: str, include_internal: bool = False) -> 
     if not issue_key:
         return []
     # expand=properties нужен, чтобы отличать public/internal комментарии в JSM.
-    url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/comment?expand=properties")
+    url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/comment")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    all_comments: list = []
+    start_at = 0
+    # Большое maxResults снижает кол-во запросов к Jira при типичных объемах.
+    page_size = 100
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                comments = list(data.get("comments") or [])
-                if include_internal:
-                    return comments
-                return [c for c in comments if not _is_internal_comment(c)]
+            while True:
+                params = {
+                    "expand": "properties",
+                    "startAt": start_at,
+                    "maxResults": page_size,
+                }
+                async with session.get(
+                    url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status != 200:
+                        return []
+                    data = await resp.json()
+                    comments_page = list(data.get("comments") or [])
+                    if not comments_page:
+                        break
+                    all_comments.extend(comments_page)
+
+                    total = data.get("total")
+                    # total может отсутствовать в некоторых конфигурациях; тогда ориентируемся на размер страницы.
+                    if isinstance(total, int) and start_at + len(all_comments) >= total:
+                        break
+
+                    # Jira может вернуть меньше page_size в последней странице.
+                    if len(comments_page) < page_size:
+                        break
+                    start_at += len(comments_page)
+
+        # Сделаем порядок комментариев детерминированным: Jira обычно возвращает в нужном порядке,
+        # но при пагинации/настройках лучше сортировать явно.
+        def _sort_key(c: dict) -> tuple:
+            created_raw = (c.get("created") or "")
+            cid = c.get("id")
+            try:
+                cid_num = int(cid)
+            except Exception:
+                cid_num = 0
+
+            # Формат от Jira Cloud: 2021-01-17T12:34:00.000+0000 (без ':' в смещении)
+            # datetime.fromisoformat понимает только с двоеточием (+00:00), поэтому нормализуем.
+            if created_raw:
+                created_norm = created_raw
+                if len(created_norm) > 5 and created_norm[-5] in ("+", "-") and created_norm[-3] != ":":
+                    created_norm = created_norm[:-5] + created_norm[-5:-2] + ":" + created_norm[-2:]
+                try:
+                    dt = datetime.fromisoformat(created_norm)
+                    return (dt, cid_num)
+                except Exception:
+                    pass
+            return (created_raw, cid_num)
+
+        all_comments.sort(key=_sort_key)
+        if include_internal:
+            return all_comments
+        return [c for c in all_comments if not _is_internal_comment(c)]
     except Exception as e:
         logger.warning("get_issue_comments %s: %s", issue_key, e)
         return []
