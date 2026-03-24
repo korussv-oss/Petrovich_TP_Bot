@@ -23,6 +23,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _singleton_lock_fp = None
+_telegram_dp = None  # создаём один раз, чтобы не повторять dp.include_router на рестартах
+
+
+def _env_flag_enabled(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    return v not in ("0", "false", "no", "off")
 
 
 def _acquire_singleton_lock() -> bool:
@@ -99,32 +108,24 @@ async def _run_telegram_bot() -> None:
         return
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
+    global _telegram_dp
+    if _telegram_dp is None:
+        dp = Dispatcher(storage=MemoryStorage())
+        cooldown = float(os.getenv("ANTISPAM_COOLDOWN", "1.5"))
+        dp.update.outer_middleware(AntispamMiddleware(cooldown=cooldown))
 
-    cooldown = float(os.getenv("ANTISPAM_COOLDOWN", "1.5"))
-    dp.update.outer_middleware(AntispamMiddleware(cooldown=cooldown))
-
-    # Aiogram v3 не позволяет включить один и тот же Router в Dispatcher повторно.
-    # У нас роутеры импортируются как singletons, поэтому при рестарте (_supervise)
-    # нужно “отцеплять” Router от предыдущего Dispatcher.
-    def _safe_include(dp_obj: Dispatcher, router_obj) -> None:
-        try:
-            if getattr(router_obj, "parent_router", None) is not None:
-                router_obj.parent_router = None
-        except Exception:
-            # Если setter не даст обнулить parent_router — включение всё равно может упасть,
-            # но мы не будем скрывать причины.
-            pass
-        dp_obj.include_router(router_obj)
-
-    _safe_include(dp, start_router)
-    _safe_include(dp, registration_router)
-    _safe_include(dp, password_router)
-    _safe_include(dp, admin_router)
-    _safe_include(dp, comments_router)
-    _safe_include(dp, my_tickets_router)
-    _safe_include(dp, create_ticket_router)
-    _safe_include(dp, menu_extra_router)
+        # Роутеры импортируются как singletons, поэтому include_router делаем один раз.
+        dp.include_router(start_router)
+        dp.include_router(registration_router)
+        dp.include_router(password_router)
+        dp.include_router(admin_router)
+        dp.include_router(comments_router)
+        dp.include_router(my_tickets_router)
+        dp.include_router(create_ticket_router)
+        dp.include_router(menu_extra_router)
+        _telegram_dp = dp
+    else:
+        dp = _telegram_dp
 
     logger.info("TELEGRAM: бот запущен (polling)")
     try:
@@ -151,19 +152,33 @@ async def main():
         logger.critical("Rubik уже запущен (singleton lock). Остановите второй экземпляр.")
         return
 
-    telegram_enabled = bool((CONFIG.get("TELEGRAM", {}) or {}).get("TOKEN", "").strip())
+    telegram_token_present = bool((CONFIG.get("TELEGRAM", {}) or {}).get("TOKEN", "").strip())
+    # Совместимость с the_bot_on_dute: USED_TELEGRAMM=0 принудительно отключает Telegram.
+    telegram_enabled = telegram_token_present and _env_flag_enabled("USED_TELEGRAMM", True)
     max_enabled = bool((CONFIG.get("MAX", {}) or {}).get("BOT_TOKEN", "").strip())
 
     if not telegram_enabled and not max_enabled:
-        logger.critical("Не задан ни TELEGRAM_TOKEN, ни MAX_BOT_TOKEN — нечего запускать")
+        logger.critical(
+            "Telegram отключён/не настроен и MAX_BOT_TOKEN не задан — нечего запускать"
+        )
         return
 
     # Delivery не должен связывать жизненный цикл сервисов: если Telegram не запущен,
     # доставка в Telegram просто логируется и пропускается, MAX продолжает работать.
+    import time as _time
+    telegram_delivery_timeout_seconds = float(os.getenv("TELEGRAM_DELIVERY_TIMEOUT_SECONDS", "3.0"))
+    telegram_delivery_cooldown_seconds = float(os.getenv("TELEGRAM_DELIVERY_COOLDOWN_SECONDS", "30.0"))
+    telegram_send_disabled_until = 0.0
     async def deliver_to_channel(channel_id: str, channel_user_id: int, text: str, reply_markup=None):
+        nonlocal telegram_send_disabled_until
         if (channel_id or "").strip().lower() == "telegram":
             if not telegram_enabled:
                 logger.warning("Доставка в Telegram пропущена (бот выключен): user_id=%s", channel_user_id)
+                return
+            # Если Telegram уже “падает”, не трогаем сеть слишком часто.
+            now = _time.monotonic()
+            if now < telegram_send_disabled_until:
+                logger.debug("Доставка в Telegram пропущена (cooldown): user_id=%s", channel_user_id)
                 return
             from aiogram import Bot
             from aiogram.client.default import DefaultBotProperties
@@ -180,7 +195,21 @@ async def main():
                         for row in reply_markup
                     ]
                     markup = InlineKeyboardMarkup(inline_keyboard=rows)
-                await bot.send_message(channel_user_id, text, reply_markup=markup)
+                # Не блокируем общий event-loop на долгие сетевые таймауты.
+                await asyncio.wait_for(
+                    bot.send_message(channel_user_id, text, reply_markup=markup),
+                    timeout=telegram_delivery_timeout_seconds,
+                )
+            except Exception as e:
+                # При проблемах с сетью/TG временно отключаем доставку, чтобы не тормозить MAX.
+                telegram_send_disabled_until = _time.monotonic() + telegram_delivery_cooldown_seconds
+                logger.warning(
+                    "Доставка в Telegram отключена на %.0fs (timeout/ошибка): user_id=%s: %s",
+                    telegram_delivery_cooldown_seconds,
+                    channel_user_id,
+                    e,
+                )
+                return
             finally:
                 await bot.session.close()
             return
@@ -220,18 +249,24 @@ async def main():
 
     service_tasks = []
     if telegram_enabled:
-        service_tasks.append(asyncio.create_task(_supervise("TELEGRAM", _run_telegram_bot, restart_delay_seconds=5.0)))
+        telegram_task = asyncio.create_task(_supervise("TELEGRAM", _run_telegram_bot, restart_delay_seconds=5.0))
     if max_enabled:
-        service_tasks.append(asyncio.create_task(_supervise("MAX", _run_max_bot, restart_delay_seconds=5.0)))
+        max_task = asyncio.create_task(_supervise("MAX", _run_max_bot, restart_delay_seconds=5.0))
 
     try:
-        results = await asyncio.gather(*service_tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, Exception):
-                logger.exception("Сервис завершился исключением: %s", r)
+        # Telegram не ждём: если Telegram падает/перезапускается — это не должно ломать MAX/уведомления.
+        await asyncio.gather(
+            status_task,
+            comments_task,
+            *( [max_task] if max_enabled else [] ),
+        )
     finally:
         status_task.cancel()
         comments_task.cancel()
+        if telegram_enabled:
+            telegram_task.cancel()
+        if max_enabled:
+            max_task.cancel()
         for t in (status_task, comments_task):
             try:
                 await t

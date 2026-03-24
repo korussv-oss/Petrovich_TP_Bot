@@ -4,6 +4,7 @@
 """
 import asyncio
 import logging
+import json
 import os
 import random
 import re
@@ -11,6 +12,127 @@ import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Состояние polling-offset по update_id, чтобы после рестарта MAX не переобрабатывал “старые” команды.
+_MAX_POLL_STATE_FILE = Path(__file__).resolve().parents[2] / "data" / "max_poll_state.json"
+_MAX_UPDATE_DEDUP_FILE = Path(__file__).resolve().parents[2] / "data" / "max_update_dedup.json"
+_MAX_UPDATE_DEDUP_SAVE_EVERY_UPDATES = int(os.getenv("MAX_UPDATE_DEDUP_SAVE_EVERY_UPDATES", "25"))
+
+
+def _load_max_poll_state() -> dict:
+    try:
+        if not _MAX_POLL_STATE_FILE.exists():
+            return {}
+        with open(_MAX_POLL_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_max_poll_state(state: dict) -> None:
+    try:
+        _MAX_POLL_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_MAX_POLL_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # Не валим бот, если не удалось сохранить baseline.
+        return
+
+
+def _get_max_last_update_id(token: str) -> int | None:
+    token_key = (token or "").strip()
+    if not token_key:
+        return None
+    state = _load_max_poll_state()
+    last = state.get(token_key, {}).get("last_update_id")
+    try:
+        return int(last) if last is not None else None
+    except Exception:
+        return None
+
+
+def _set_max_last_update_id(token: str, last_update_id: int) -> None:
+    token_key = (token or "").strip()
+    if not token_key:
+        return
+    state = _load_max_poll_state()
+    if token_key not in state:
+        state[token_key] = {}
+    state[token_key]["last_update_id"] = int(last_update_id)
+    _save_max_poll_state(state)
+
+
+def _load_max_update_dedup_map() -> dict:
+    """
+    Задача: не переобрабатывать “старые” апдейты после рестарта (особенно когда update_id отсутствует/не работает offset).
+    Храним отпечатки апдейтов с TTL.
+    """
+    ttl_seconds = int(os.getenv("MAX_UPDATE_DEDUP_TTL_SECONDS", "300"))
+    now = time.monotonic()
+    try:
+        if not _MAX_UPDATE_DEDUP_FILE.exists():
+            return {}
+        with open(_MAX_UPDATE_DEDUP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        # значения могут быть как float (monotonic), так и string/None — аккуратно фильтруем
+        out: dict = {}
+        for k, v in data.items():
+            try:
+                ts = float(v)
+            except Exception:
+                continue
+            if now - ts <= ttl_seconds:
+                out[str(k)] = ts
+        return out
+    except Exception:
+        return {}
+
+
+def _save_max_update_dedup_map(dedup_map: dict) -> None:
+    try:
+        _MAX_UPDATE_DEDUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_MAX_UPDATE_DEDUP_FILE, "w", encoding="utf-8") as f:
+            json.dump(dedup_map, f, ensure_ascii=False, indent=2)
+    except Exception:
+        return
+
+
+def _extract_message_mid_from_raw(raw: dict) -> str:
+    payload = raw.get("payload") or raw
+    if not isinstance(payload, dict):
+        return ""
+    msg = payload.get("message") or payload.get("edited_message")
+    if not isinstance(msg, dict):
+        cb = payload.get("callback")
+        if isinstance(cb, dict):
+            msg = cb.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    mid = msg.get("mid") or msg.get("message_id") or msg.get("id") or ""
+    return str(mid).strip()
+
+
+def _fingerprint_max_update(
+    *,
+    r_chat,
+    r_user,
+    sender_uid,
+    source,
+    msg_mid: str,
+    update_id: object = None,
+) -> str:
+    update_id_part = str(update_id).strip() if update_id is not None else ""
+    if isinstance(source, tuple) and len(source) == 2:
+        src_kind, src_val = source
+        src_val_s = str(src_val).strip()
+        src_val_s = src_val_s[:80]
+        src_part = f"{src_kind}:{src_val_s}"
+    else:
+        src_part = str(source).strip()[:80] if source is not None else ""
+    return f"{update_id_part}|{r_chat or ''}|{r_user or ''}|{sender_uid or ''}|{src_part}|{msg_mid or ''}"
 
 # Импорт под другим именем: PyPI-пакет MaxBotAPI, модуль maxbotapi
 try:
@@ -967,6 +1089,11 @@ async def _handle_stc_callback_max(user_id: int, callback_id: str) -> dict:
 _current_max_bot = None
 
 
+# Throttle исходящих уведомлений из Core (защита от "волн" сообщений).
+# Ограничиваем частоту отправки одному user_id в MAX, чтобы исключить бурст при сбитых baseline/count.
+_last_core_notification_ts_by_user: dict[int, float] = {}
+
+
 async def send_notification_to_max_user(user_id: int, text: str, reply_markup=None) -> bool:
     """
     Отправка уведомления пользователю MAX (из Core delivery).
@@ -976,6 +1103,22 @@ async def send_notification_to_max_user(user_id: int, text: str, reply_markup=No
     if _current_max_bot is None:
         logger.debug("MAX: уведомление не отправлено (бот не запущен), user_id=%s", user_id)
         return False
+
+    min_interval_seconds = float(os.getenv("MAX_CORE_NOTIFY_MIN_INTERVAL_SECONDS", "4.0"))
+    now = time.monotonic()
+    last_ts = _last_core_notification_ts_by_user.get(int(user_id))
+    if last_ts is not None and min_interval_seconds > 0:
+        if now - last_ts < min_interval_seconds:
+            # Не спамим: если baseline/счётчики "разъехались", будет идти бурст.
+            logger.debug(
+                "MAX: уведомление подавлено throttling (user_id=%s, dt=%.2fs < %.2fs).",
+                user_id,
+                now - last_ts,
+                min_interval_seconds,
+            )
+            return False
+    _last_core_notification_ts_by_user[int(user_id)] = now
+
     buttons = []
     if reply_markup:
         for row in reply_markup or []:
@@ -1166,10 +1309,18 @@ async def run_max_bot() -> None:
     try:
         logger.info("MAX: бот запущен (long polling)")
         # offset для /updates: защищает от повторной доставки тех же апдейтов
-        next_offset: int | None = None
+        persisted_last_update_id = _get_max_last_update_id(token)
+        next_offset: int | None = (persisted_last_update_id + 1) if persisted_last_update_id is not None else None
         # Дедуп на случай, если апдейт пришёл без update_id (встречается у некоторых реализаций MAX API)
         import time
         recent_noid: dict[str, float] = {}
+        # Persistent дедуп — чтобы после рестарта не прогонять старые start/callback/message обновления.
+        max_update_dedup_map: dict = _load_max_update_dedup_map()
+        max_update_dedup_dirty = False
+        ttl_seconds = int(os.getenv("MAX_UPDATE_DEDUP_TTL_SECONDS", "300"))
+        dedup_initial_window_seconds = float(os.getenv("MAX_UPDATE_DEDUP_INITIAL_WINDOW_SECONDS", "60"))
+        max_process_start_mono = time.monotonic()
+        dedup_check_counter = 0
         while True:
             try:
                 raw_updates = await _get_updates_raw(bot, timeout=25, limit=10, offset=next_offset)
@@ -1193,6 +1344,9 @@ async def run_max_bot() -> None:
                     max_update_id = iv if max_update_id is None else max(max_update_id, iv)
             if max_update_id is not None:
                 next_offset = max_update_id + 1
+                # Пишем persist baseline после получения пачки,
+                # чтобы после рестарта не переобрабатывать “старые” команды.
+                _set_max_last_update_id(token, max_update_id)
 
             for raw in raw_updates:
                 if not isinstance(raw, dict):
@@ -1231,6 +1385,35 @@ async def run_max_bot() -> None:
                                 _get_message_text(msg) if isinstance(msg, dict) else None,
                             )
                         continue
+
+                    # Persistent дедуп по отпечатку апдейта (с TTL).
+                    # Включаем только в первые N секунд после старта, чтобы “волна” ушла,
+                    # но пользовательские клики позже не глушились дедупом.
+                    update_id = raw.get("update_id") or raw.get("updateId") or raw.get("id")
+                    msg_mid = _extract_message_mid_from_raw(raw)
+                    fp = _fingerprint_max_update(
+                        r_chat=r_chat,
+                        r_user=r_user,
+                        sender_uid=user_id,
+                        source=source,
+                        msg_mid=msg_mid,
+                        update_id=update_id,
+                    )
+                    now_mono = time.monotonic()
+                    if now_mono - max_process_start_mono <= dedup_initial_window_seconds:
+                        last_seen = max_update_dedup_map.get(fp)
+                        if last_seen is not None and (now_mono - float(last_seen)) <= ttl_seconds:
+                            continue
+                        max_update_dedup_map[fp] = now_mono
+                        max_update_dedup_dirty = True
+                        dedup_check_counter += 1
+                        if (
+                            max_update_dedup_dirty
+                            and dedup_check_counter % _MAX_UPDATE_DEDUP_SAVE_EVERY_UPDATES == 0
+                        ):
+                            _save_max_update_dedup_map(max_update_dedup_map)
+                            max_update_dedup_dirty = False
+
                     # Антиспам для MAX: ограничиваем частоту событий от одного user_id
                     if _is_max_rate_limited(user_id, max_cooldown):
                         continue
@@ -1347,7 +1530,11 @@ async def run_max_bot() -> None:
                             if allow:
                                 _pending_comment_max[user_id] = issue_key
                                 response = {
-                                    "text": f"✍️ Введите текст комментария к заявке <b>{issue_key}</b> (или нажмите Отмена):",
+                                    "text": (
+                                        f"✍️ Введите текст комментария к заявке <b>{issue_key}</b> "
+                                        "(или нажмите Отмена).\n\n"
+                                        "Можно в этом же сообщении приложить картинку/файл."
+                                    ),
                                     "parse_mode": "HTML",
                                     "buttons": [{"id": "cancel", "label": "❌ Отмена"}],
                                 }
@@ -1976,15 +2163,28 @@ async def run_max_bot() -> None:
                                         else:
                                             response = {"text": "Не удалось удалить пользователя.", "parse_mode": "HTML", "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}]}
                             elif user_id in _pending_comment_max:
-                                issue_key = _pending_comment_max.pop(user_id, None)
-                                if (text or "").strip().lower() in ("отмена", "cancel", "/cancel"):
+                                issue_key = _pending_comment_max.get(user_id)
+                                text_clean = (text or "").strip()
+                                if text_clean.lower() in ("отмена", "cancel", "/cancel"):
+                                    _pending_comment_max.pop(user_id, None)
                                     response = handle_main_menu(user_id)
-                                elif issue_key and (text or "").strip():
+                                elif issue_key and (text_clean or attachment_list):
+                                    if not text_clean:
+                                        response = {
+                                            "text": (
+                                                "Добавьте текст комментария (можно в подписи к картинке/файлу) "
+                                                "или нажмите Отмена."
+                                            ),
+                                            "parse_mode": "HTML",
+                                            "buttons": [{"id": "cancel", "label": "❌ Отмена"}],
+                                        }
+                                        continue
+                                    _pending_comment_max.pop(user_id, None)
                                     from core.jira_aa import add_comment as jira_add_comment
                                     from user_storage import get_user_profile
                                     profile = get_user_profile(user_id, "max") or {}
                                     full_name = (profile.get("full_name") or "").strip() or "Пользователь"
-                                    comment_body = f"[{full_name}] {(text or '').strip()}"
+                                    comment_body = f"[{full_name}] {text_clean}"
                                     ok = await jira_add_comment(issue_key, comment_body)
 
                                     # Вложения из сообщения (если есть): добавляем к заявке
@@ -2026,8 +2226,14 @@ async def run_max_bot() -> None:
                                         "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
                                     }
                                 else:
-                                    _pending_comment_max[user_id] = issue_key
-                                    response = {"text": "Введите текст комментария или нажмите Отмена.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                    response = {
+                                        "text": (
+                                            "Введите текст комментария (или подпись к картинке/файлу) "
+                                            "или нажмите Отмена."
+                                        ),
+                                        "parse_mode": "HTML",
+                                        "buttons": [{"id": "cancel", "label": "❌ Отмена"}],
+                                    }
                             elif user_id in _pending_bind_max:
                                 del _pending_bind_max[user_id]
                                 ok, msg = bind_account_by_phone(user_id, text, "max")
