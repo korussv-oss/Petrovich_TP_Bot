@@ -331,6 +331,20 @@ def handle_callback(callback_id: str, user_id: int, my_tickets: Optional[list] =
             "buttons": [{"id": "admin_del_back_choice", "label": "🔙 К выбору способа"}],
             "_set_pending_admin_delete": True,
         }
+    if callback_id == "admin_ticket_counter":
+        from config import is_channel_admin
+        from core.admin_ticket_report import get_total_created_tickets_count
+        if not is_channel_admin(CHANNEL_ID, user_id):
+            return handle_main_menu(user_id)
+        cnt = get_total_created_tickets_count()
+        return {
+            "text": f"Через бот создано <b>{cnt}</b> заявок.",
+            "parse_mode": "HTML",
+            "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}],
+        }
+    if callback_id == "admin_detailed_report":
+        # Асинхронная выгрузка файла обрабатывается в main_max.py
+        return None
     # Отчёт Лупа (Excel): в MAX файл не отправляется — предлагаем скачать в Telegram
     if callback_id == "admin_lupa_excel_report":
         from config import is_lupa_report_allowed

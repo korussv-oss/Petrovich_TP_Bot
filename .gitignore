@@ -31,6 +31,7 @@ data/*.json
 data/*.log
 data/*.lock
 data/lupa_tickets_log.xlsx
+data/admin_tickets_report.xlsx
 
 ### Logs
 *.log

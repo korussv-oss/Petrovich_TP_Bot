@@ -11,6 +11,7 @@ from user_storage import (
 from core.support.issue_binding_registry import get_all_issue_keys, get_bindings_by_issue
 from core.jira_aa import get_issue_admin_details
 from core.support.api import MY_TICKETS_EXCLUDED_STATUSES
+from core.jira_status_ru import jira_status_display_ru
 
 
 def _norm(s: str) -> str:
@@ -96,7 +97,7 @@ async def get_stc_assignee_tasks(channel_id: str, user_id: int) -> List[Dict[str
                 "request_type_label": get_ticket_type_label(first.get("ticket_type_id"), first.get("project_key")),
                 "creator": _creator_label(first),
                 "summary": info.get("summary") or "—",
-                "status": info.get("status") or "—",
+                "status": jira_status_display_ru(info.get("status")),
                 "description": info.get("description") or "",
                 "assignee_display": info.get("assignee_display") or "",
                 "reporter_display": info.get("reporter_display") or "",

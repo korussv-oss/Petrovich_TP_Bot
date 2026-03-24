@@ -1545,7 +1545,7 @@ async def psi_user_title(message: Message, state: FSMContext):
     await state.update_data(summary=title)
     await state.set_state(PsiUserStates.WAITING_FULL_NAME)
     await message.reply(
-        "👤 Введите ФИО полностью + должность пользователя PSIwms:",
+        "👤 Введите ФИО полностью и должность пользователя, кому нужно внести корректировки или создать учетную запись",
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
     )
@@ -1564,7 +1564,7 @@ async def psi_user_full_name(message: Message, state: FSMContext):
         await state.update_data(department=dept_wms)
         await state.set_state(PsiUserStates.WAITING_COMMENT)
         await message.reply(
-            "👤 Введите комментарий (или «-» для пропуска):",
+            "👤 Что нужно сделать?",
             parse_mode="HTML",
             reply_markup=get_cancel_keyboard(),
         )
@@ -1615,7 +1615,7 @@ async def psi_user_department_select(callback: CallbackQuery, state: FSMContext)
     await state.update_data(department=value)
     await state.set_state(PsiUserStates.WAITING_COMMENT)
     await callback.message.edit_text(
-        "👤 <b>Создать/изменить/удалить пользователя PSIwms</b>\n\nВведите комментарий (или «-» для пропуска):",
+        "👤 <b>Создать/изменить/удалить пользователя PSIwms</b>\n\nЧто нужно сделать?",
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
     )

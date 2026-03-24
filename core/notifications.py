@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 from core.support import delivery as delivery_module
 from core.support.issue_binding_registry import get_all_issue_keys, get_user_ids_by_issue, get_bindings_by_issue
+from core.jira_status_ru import jira_status_display_ru
 
 logger = logging.getLogger(__name__)
 
@@ -161,13 +162,13 @@ def _format_stc_new_task_message(
 ) -> str:
     assignee_username = (info.get("assignee_username") or "").strip().lower()
     summary = (info.get("summary") or "—").strip()
-    status = (info.get("status") or "—").strip()
+    status_ru = jira_status_display_ru(info.get("status"))
     assignee_display = (info.get("assignee_display") or assignee_username).strip()
     text = (
         f"🛠️ <b>Новая задача для СА СТЦ</b>\n\n"
         f"Заявка: {issue_key}\n"
         f"Тема: {summary}\n"
-        f"Статус: {status}\n"
+        f"Статус: {status_ru}\n"
         f"Assignee: {assignee_display}\n"
     )
     if browse_url:
@@ -413,6 +414,7 @@ async def check_registry_statuses_and_notify() -> None:
             if not status:
                 continue
             status_lower = status.lower().strip()
+            status_ru = jira_status_display_ru(status)
             last = _get_last_status(issue_key)
             text = None
             if last is None:
@@ -420,10 +422,10 @@ async def check_registry_statuses_and_notify() -> None:
                 # Первый опрос: уведомляем только если статус уже финальный (заявку успели закрыть до первого опроса)
                 if status_lower in STATUS_RESOLVED:
                     remove_pending(issue_key)
-                    text = f"✅ <b>Заявка {issue_key}</b> выполнена.\n\nСтатус: {status}"
+                    text = f"✅ <b>Заявка {issue_key}</b> выполнена.\n\nСтатус: {status_ru}"
                 elif status_lower in STATUS_REJECTED:
                     remove_pending(issue_key)
-                    text = f"❌ <b>Заявка {issue_key}</b> отклонена.\n\nСтатус: {status}"
+                    text = f"❌ <b>Заявка {issue_key}</b> отклонена.\n\nСтатус: {status_ru}"
             else:
                 last_lower = last.lower().strip()
                 if status_lower in STATUS_RESOLVED:
@@ -431,20 +433,20 @@ async def check_registry_statuses_and_notify() -> None:
                     if last_lower in STATUS_RESOLVED:
                         _set_last_status(issue_key, status)
                         continue
-                    text = f"✅ <b>Заявка {issue_key}</b> выполнена.\n\nСтатус: {status}"
+                    text = f"✅ <b>Заявка {issue_key}</b> выполнена.\n\nСтатус: {status_ru}"
                 elif status_lower in STATUS_REJECTED:
                     remove_pending(issue_key)
                     if last_lower in STATUS_REJECTED:
                         _set_last_status(issue_key, status)
                         continue
-                    text = f"❌ <b>Заявка {issue_key}</b> отклонена.\n\nСтатус: {status}"
+                    text = f"❌ <b>Заявка {issue_key}</b> отклонена.\n\nСтатус: {status_ru}"
                 else:
                     if last and last_lower == status_lower:
                         continue
                     if status_lower in STATUS_SILENT:
                         _set_last_status(issue_key, status)
                         continue
-                    text = f"📋 <b>Заявка {issue_key}</b>\n\nНовый статус: {status}"
+                    text = f"📋 <b>Заявка {issue_key}</b>\n\nНовый статус: {status_ru}"
                 _set_last_status(issue_key, status)
 
             if text:
@@ -468,6 +470,10 @@ async def check_registry_comments_and_notify() -> None:
     # Защита от “волны” уведомлений при резком росте числа комментариев
     # (часто бывает после рестарта/изменений способа выборки комментариев).
     comments_wave_delta_threshold = int(os.getenv("COMMENTS_WAVE_DELTA_THRESHOLD", "20"))
+    # При last_comment_count==0 и несвежей привязке молчаливая синхронизация нужна против «волны»
+    # после сброшенного state; но при малых current_count это отрезает законный первый комментарий
+    # (пользователь создал заявку, подождал > окна «свежести», появился первый публичный комментарий).
+    zero_baseline_skip_min = max(2, int(os.getenv("COMMENTS_ZERO_BASELINE_SKIP_MIN", "8")))
 
     issue_keys = get_all_issue_keys()
     if not issue_keys:
@@ -486,8 +492,14 @@ async def check_registry_comments_and_notify() -> None:
                 continue
             # Если бот был выключен/перезапускался, а baseline по комментариям "пустой" (0),
             # то при старте может полететь "волна" уведомлений по старым тикетам.
-            # Для несвежих заявок просто выставляем baseline без уведомления.
-            if last_count == 0 and current_count > 0 and not _is_recent_issue_binding(issue_key):
+            # Для несвежих заявок с уже большим числом комментариев — только baseline; при
+            # малых current_count идём в обычную ветку и шлём уведомления (см. zero_baseline_skip_min).
+            if (
+                last_count == 0
+                and current_count > 0
+                and not _is_recent_issue_binding(issue_key)
+                and current_count >= zero_baseline_skip_min
+            ):
                 _set_last_comment_count(issue_key, current_count)
                 continue
             # После включения фильтра internal-комментариев счётчик может уменьшиться.

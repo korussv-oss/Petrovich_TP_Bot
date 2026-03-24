@@ -11,6 +11,8 @@ import re
 import time
 from pathlib import Path
 
+from core.jira_status_ru import jira_status_display_ru
+
 logger = logging.getLogger(__name__)
 
 # Состояние polling-offset по update_id, чтобы после рестарта MAX не переобрабатывал “старые” команды.
@@ -241,7 +243,8 @@ async def _upload_image_max(bot, image_path: str) -> str | None:
     # Ответ может содержать token сразу или url для загрузки (после загрузки — token)
     token = resp.get("token") or resp.get("file_token") or resp.get("photo_id")
     upload_url = resp.get("url") or resp.get("upload_url")
-    if upload_url and not token:
+    if upload_url:
+        pre_token = token
         import aiohttp
         from aiohttp import FormData
 
@@ -253,7 +256,7 @@ async def _upload_image_max(bot, image_path: str) -> str | None:
                 v = up_resp.headers.get(h)
                 if v and str(v).strip():
                     return str(v).strip()
-            if "application/json" in ct and body.strip():
+            if body.strip():
                 try:
                     import json
                     data = json.loads(body)
@@ -293,12 +296,18 @@ async def _upload_image_max(bot, image_path: str) -> str | None:
                 upload_timeout = aiohttp.ClientTimeout(total=30, sock_connect=10)
                 for attempt in range(3):
                     try:
+                        fd = FormData()
+                        # По документации MAX файл передаётся полем "data".
+                        fd.add_field("data", raw, filename=file_name, content_type=mime_type)
                         async with session.post(
-                            upload_url, data=raw, headers={"Content-Type": mime_type}, timeout=upload_timeout
+                            upload_url,
+                            data=fd,
+                            headers={"Authorization": token_val},
+                            timeout=upload_timeout,
                         ) as up_resp:
                             if up_resp.status >= 400:
                                 logger.warning(
-                                    "MAX upload file POST (body): HTTP %s %s",
+                                    "MAX upload file POST (multipart:data): HTTP %s %s",
                                     up_resp.status,
                                     (await up_resp.text())[:300],
                                 )
@@ -307,33 +316,16 @@ async def _upload_image_max(bot, image_path: str) -> str | None:
                         if token:
                             break
                     except (aiohttp.ServerDisconnectedError, aiohttp.ClientError, ConnectionError, OSError) as e:
-                        logger.warning("MAX upload file POST (body), попытка %s: %s", attempt + 1, e)
+                        logger.warning("MAX upload file POST (multipart:data), попытка %s: %s", attempt + 1, e)
                         if attempt < 2:
                             await asyncio.sleep(0.5 * (attempt + 1))
-                if token is None:
-                    fd = FormData()
-                    fd.add_field("file", raw, filename=file_name, content_type=mime_type)
-                    for attempt in range(3):
-                        try:
-                            async with session.post(upload_url, data=fd, timeout=upload_timeout) as up_resp:
-                                if up_resp.status >= 400:
-                                    logger.warning(
-                                        "MAX upload file POST (multipart): HTTP %s %s",
-                                        up_resp.status,
-                                        (await up_resp.text())[:300],
-                                    )
-                                else:
-                                    token = await _parse_token(up_resp)
-                            if token:
-                                break
-                        except (aiohttp.ServerDisconnectedError, aiohttp.ClientError, ConnectionError, OSError) as e:
-                            logger.warning("MAX upload file POST (multipart), попытка %s: %s", attempt + 1, e)
-                            if attempt < 2:
-                                await asyncio.sleep(0.5 * (attempt + 1))
         except Exception as e:
             logger.warning("MAX upload file: %s", e)
             token = None
+        if token is None:
+            token = pre_token
     if token:
+        logger.info("MAX upload file: token получен после upload_url")
         return token
     logger.warning("MAX upload: в ответе нет token (get_upload_url keys: %s)", list(resp.keys()) if isinstance(resp, dict) else "?")
     return None
@@ -381,7 +373,14 @@ async def _upload_file_max(bot, file_path: str, mime_type: str = None) -> str | 
         return None
     token = resp.get("token") or resp.get("file_token") or resp.get("document_id")
     upload_url = resp.get("url") or resp.get("upload_url")
-    if upload_url and not token:
+    logger.info(
+        "MAX upload file: init response keys=%s, has_upload_url=%s, has_token=%s",
+        list(resp.keys()),
+        bool(upload_url),
+        bool(token),
+    )
+    if upload_url:
+        pre_token = token
         import aiohttp
         from aiohttp import FormData
         async def _parse_token(up_resp):
@@ -391,7 +390,7 @@ async def _upload_file_max(bot, file_path: str, mime_type: str = None) -> str | 
                 v = up_resp.headers.get(h)
                 if v and str(v).strip():
                     return str(v).strip()
-            if "application/json" in ct and body_text.strip():
+            if body_text.strip():
                 try:
                     import json
                     data = json.loads(body_text)
@@ -410,33 +409,33 @@ async def _upload_file_max(bot, file_path: str, mime_type: str = None) -> str | 
                 upload_timeout = aiohttp.ClientTimeout(total=30, sock_connect=10)
                 for attempt in range(3):
                     try:
+                        fd = FormData()
+                        # По документации MAX файл передаётся полем "data".
+                        fd.add_field("data", raw, filename=file_name, content_type=mime)
                         async with session.post(
-                            upload_url, data=raw, headers={"Content-Type": mime}, timeout=upload_timeout
+                            upload_url,
+                            data=fd,
+                            headers={"Authorization": token_val},
+                            timeout=upload_timeout,
                         ) as up_resp:
                             if up_resp.status < 400:
                                 token = await _parse_token(up_resp)
+                            else:
+                                logger.warning(
+                                    "MAX upload file POST (multipart:data): HTTP %s %s",
+                                    up_resp.status,
+                                    (await up_resp.text())[:300],
+                                )
                         if token:
                             break
                     except (aiohttp.ServerDisconnectedError, aiohttp.ClientError, ConnectionError, OSError) as e:
-                        logger.warning("MAX upload file POST, попытка %s: %s", attempt + 1, e)
+                        logger.warning("MAX upload file (multipart:data), попытка %s: %s", attempt + 1, e)
                         if attempt < 2:
                             await asyncio.sleep(0.5 * (attempt + 1))
-                if token is None:
-                    fd = FormData()
-                    fd.add_field("file", raw, filename=file_name, content_type=mime)
-                    for attempt in range(3):
-                        try:
-                            async with session.post(upload_url, data=fd, timeout=upload_timeout) as up_resp:
-                                if up_resp.status < 400:
-                                    token = await _parse_token(up_resp)
-                            if token:
-                                break
-                        except (aiohttp.ServerDisconnectedError, aiohttp.ClientError, ConnectionError, OSError) as e:
-                            logger.warning("MAX upload file (multipart), попытка %s: %s", attempt + 1, e)
-                            if attempt < 2:
-                                await asyncio.sleep(0.5 * (attempt + 1))
         except Exception as e:
             logger.warning("MAX upload file: %s", e)
+        if token is None:
+            token = pre_token
     if token:
         return token
     logger.warning("MAX upload file: в ответе нет token (keys: %s)", list(resp.keys()) if isinstance(resp, dict) else "?")
@@ -481,22 +480,43 @@ async def _download_attachment_max(bot, att: dict) -> tuple[bytes, str] | None:
     return None
 
 
-async def _post_messages_and_log_error(bot, json_body: dict, query_params: dict = None) -> dict | None:
+async def _post_messages_and_log_error(
+    bot,
+    json_body: dict,
+    query_params: dict = None,
+    return_error_code: bool = False,
+) -> dict | tuple[dict | None, str | None] | None:
     """POST /messages. query_params добавляются к access_token. При 400 логируем тело ответа."""
     url = f"{bot.BASE_URL}/messages"
     params = {"access_token": bot.token}
+    headers = {"Authorization": bot.token, "Content-Type": "application/json"}
     if query_params:
         params.update(query_params)
     try:
-        async with bot.session.post(url, params=params, json=json_body) as resp:
+        async with bot.session.post(url, params=params, headers=headers, json=json_body) as resp:
             body = await resp.text()
             if resp.status >= 400:
+                err_code = None
+                try:
+                    import json as _json
+                    parsed = _json.loads(body) if body.strip() else {}
+                    if isinstance(parsed, dict):
+                        err_code = (parsed.get("code") or "").strip() or None
+                except Exception:
+                    err_code = None
                 logger.warning("MAX API %s (params=%s): %s", resp.status, params, body[:500])
+                if return_error_code:
+                    return None, err_code
                 return None
             import json
-            return json.loads(body) if body.strip() else {}
+            data = json.loads(body) if body.strip() else {}
+            if return_error_code:
+                return data, None
+            return data
     except Exception as e:
         logger.debug("MAX _post_messages: %s", e)
+        if return_error_code:
+            return None, None
         return None
 
 
@@ -507,6 +527,7 @@ async def _send_message_max(
     text: str,
     attachments_max: list = None,
     parse_mode: str = None,
+    log_source: str | None = None,
 ) -> str | None:
     """
     Отправка в MAX. Возвращает message_id отправленного сообщения или None.
@@ -517,29 +538,86 @@ async def _send_message_max(
         body["attachments"] = attachments_max
     if parse_mode:
         body["format"] = parse_mode  # maxapi использует "format"
+    max_attachment_send_retries = int(os.getenv("MAX_ATTACHMENT_SEND_RETRIES", "30"))
+    max_attachment_send_delay = float(os.getenv("MAX_ATTACHMENT_SEND_RETRY_DELAY_SECONDS", "1.0"))
 
     # 1) chat_id в query (часто работает; user_id даёт 403 "Invalid chatId: 0" у части ботов)
     if recipient_chat_id:
-        result = await _post_messages_and_log_error(
-            bot, body, query_params={"chat_id": recipient_chat_id}
-        )
+        attempts = 1 + (max_attachment_send_retries if attachments_max else 0)
+        result = None
+        last_err_code = None
+        for attempt in range(attempts):
+            resp = await _post_messages_and_log_error(
+                bot,
+                body,
+                query_params={"chat_id": recipient_chat_id},
+                return_error_code=True,
+            )
+            result, err_code = resp if isinstance(resp, tuple) else (resp, None)
+            last_err_code = err_code
+            if result is not None:
+                break
+            if (
+                attachments_max
+                and err_code == "attachment.not.ready"
+                and attempt < attempts - 1
+            ):
+                await asyncio.sleep(max_attachment_send_delay)
+                continue
+            break
         if result is not None:
             mid = _message_id_from_send_response(result)
             if mid is None and isinstance(result, dict):
                 logger.info("MAX: сообщение отправлено, но message_id не в ответе (ключи: %s)", list(result.keys()))
-            logger.info("MAX: отправлено сообщение (chat_id=%s)", recipient_chat_id)
+            preview = (text or "").replace("\n", " ").strip()
+            if len(preview) > 120:
+                preview = preview[:120] + "..."
+            logger.info(
+                "MAX: отправлено сообщение (chat_id=%s, source=%s, text=%r)",
+                recipient_chat_id,
+                log_source or "-",
+                preview,
+            )
             return mid
+        # Если chat_id задан и вложение ещё не готово — не дублируем ту же ошибку fallback-ом в user_id.
+        if attachments_max and last_err_code == "attachment.not.ready":
+            return None
 
     # 2) user_id в query (личный чат)
     if recipient_user_id is not None:
-        result = await _post_messages_and_log_error(
-            bot, body, query_params={"user_id": recipient_user_id}
-        )
+        attempts = 1 + (max_attachment_send_retries if attachments_max else 0)
+        result = None
+        for attempt in range(attempts):
+            resp = await _post_messages_and_log_error(
+                bot,
+                body,
+                query_params={"user_id": recipient_user_id},
+                return_error_code=True,
+            )
+            result, err_code = resp if isinstance(resp, tuple) else (resp, None)
+            if result is not None:
+                break
+            if (
+                attachments_max
+                and err_code == "attachment.not.ready"
+                and attempt < attempts - 1
+            ):
+                await asyncio.sleep(max_attachment_send_delay)
+                continue
+            break
         if result is not None:
             mid = _message_id_from_send_response(result)
             if mid is None and isinstance(result, dict):
                 logger.info("MAX: сообщение отправлено, но message_id не в ответе (ключи: %s)", list(result.keys()))
-            logger.info("MAX: отправлено сообщение (user_id=%s)", recipient_user_id)
+            preview = (text or "").replace("\n", " ").strip()
+            if len(preview) > 120:
+                preview = preview[:120] + "..."
+            logger.info(
+                "MAX: отправлено сообщение (user_id=%s, source=%s, text=%r)",
+                recipient_user_id,
+                log_source or "-",
+                preview,
+            )
             return mid
 
     # 3) Fallback: MaxBotAPI (chat_id в body, без кнопок) — возвращает Message с message_id
@@ -548,7 +626,14 @@ async def _send_message_max(
         try:
             msg_body = maxbotapi.NewMessageBody(chat_id=cid, text=text, inline_keyboard=None)
             sent = await bot.send_message(msg_body)
-            logger.info("MAX: отправлено сообщение (NewMessageBody)")
+            preview = (text or "").replace("\n", " ").strip()
+            if len(preview) > 120:
+                preview = preview[:120] + "..."
+            logger.info(
+                "MAX: отправлено сообщение (NewMessageBody, source=%s, text=%r)",
+                log_source or "-",
+                preview,
+            )
             return getattr(sent, "message_id", None) if sent else None
         except Exception as e:
             logger.debug("MAX send_message (NewMessageBody): %s", e)
@@ -639,7 +724,7 @@ def _extract_file_attachments_from_max_message(msg: dict) -> list[dict]:
         elif isinstance(val, str) and val.strip():
             out.append({"type": kind, "token": val.strip()})
     if out:
-        logger.info("MAX: из сообщения извлечено вложений: %s", len(out))
+        logger.debug("MAX: из сообщения извлечено вложений: %s", len(out))
     return out
 
 
@@ -673,6 +758,31 @@ def _extract_phone_from_contact_attachments(msg: dict) -> str | None:
             if phone:
                 return re.sub(r"\D", "", phone) or None
     return None
+
+
+def _source_to_log_tag(source) -> str:
+    """Короткая метка источника для логов отправки ответа."""
+    if source == "start":
+        return "source:start"
+    if isinstance(source, tuple) and len(source) >= 2:
+        kind = source[0]
+        payload = source[1]
+        if kind == "callback":
+            p = (str(payload) if payload is not None else "").strip()
+            if len(p) > 48:
+                p = p[:48] + "..."
+            return f"source:callback:{p or '-'}"
+        if kind == "message":
+            txt = (str(payload) if payload is not None else "").strip()
+            if not txt:
+                return "source:message:attachment_only"
+            if len(txt) > 32:
+                txt = txt[:32] + "..."
+            return f"source:message:{txt}"
+        if kind == "contact":
+            return "source:contact"
+        return f"source:{kind}"
+    return "source:unknown"
 
 
 def _get_message_text(msg: dict) -> str:
@@ -825,7 +935,7 @@ async def _handle_open_issue_max(user_id: int, callback_id: str) -> dict | None:
     info = await get_issue_info(issue_key)
     comments = await get_issue_comments(issue_key)
     summary = (info or {}).get("summary") or "—"
-    status = (info or {}).get("status") or "—"
+    status = jira_status_display_ru((info or {}).get("status"))
     def _fmt(comments_list, max_len=200):
         out = []
         for c in reversed((comments_list or [])[-10:]):
@@ -879,7 +989,7 @@ async def _handle_stc_open_issue_max(user_id: int, issue_key: str) -> dict:
             req_label = t.get("request_type_label") or "—"
             break
     summary = info.get("summary") or "—"
-    status = info.get("status") or "—"
+    status = jira_status_display_ru(info.get("status"))
     desc = info.get("description") or "—"
     reporter = info.get("reporter_display") or "—"
     assignee = info.get("assignee_display") or "—"
@@ -1126,7 +1236,15 @@ async def send_notification_to_max_user(user_id: int, text: str, reply_markup=No
                 if isinstance(b, dict) and b.get("callback_data"):
                     buttons.append({"id": b["callback_data"], "label": b.get("text", b["callback_data"])})
     attachments = _buttons_to_attachments_max(buttons)
-    mid = await _send_message_max(_current_max_bot, None, user_id, text, attachments, "HTML")
+    mid = await _send_message_max(
+        _current_max_bot,
+        None,
+        user_id,
+        text,
+        attachments,
+        "HTML",
+        log_source="source:notify",
+    )
     return mid is not None
 
 
@@ -1321,13 +1439,29 @@ async def run_max_bot() -> None:
         dedup_initial_window_seconds = float(os.getenv("MAX_UPDATE_DEDUP_INITIAL_WINDOW_SECONDS", "60"))
         max_process_start_mono = time.monotonic()
         dedup_check_counter = 0
+        require_fresh_command_after_restart = os.getenv(
+            "MAX_REQUIRE_FRESH_COMMAND_AFTER_RESTART", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        max_unlocked_by_fresh_command = not require_fresh_command_after_restart
+        fresh_command_wait_seconds = float(
+            os.getenv("MAX_FRESH_COMMAND_WAIT_SECONDS", "30")
+        )
+        if require_fresh_command_after_restart:
+            logger.info(
+                "MAX: до первой новой команды после рестарта входящие события пропускаются "
+                "(авто-разблокировка через %.0fs)",
+                fresh_command_wait_seconds,
+            )
         while True:
             try:
                 raw_updates = await _get_updates_raw(bot, timeout=25, limit=10, offset=next_offset)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.exception("MAX get_updates: %s", e)
+                if isinstance(e, asyncio.TimeoutError):
+                    logger.warning("MAX get_updates timeout: %s", e)
+                else:
+                    logger.exception("MAX get_updates: %s", e)
                 await asyncio.sleep(5)
                 continue
 
@@ -1417,6 +1551,33 @@ async def run_max_bot() -> None:
                     # Антиспам для MAX: ограничиваем частоту событий от одного user_id
                     if _is_max_rate_limited(user_id, max_cooldown):
                         continue
+
+                    # После рестарта обрабатываем только новые команды пользователя (например /start),
+                    # чтобы не отрабатывать "фантомные" callback-и из очереди.
+                    if not max_unlocked_by_fresh_command:
+                        if (time.monotonic() - max_process_start_mono) >= max(1.0, fresh_command_wait_seconds):
+                            max_unlocked_by_fresh_command = True
+                            logger.info(
+                                "MAX: авто-разблокировка обработки апдейтов после рестарта (таймаут %.0fs)",
+                                fresh_command_wait_seconds,
+                            )
+                        else:
+                            is_fresh_command = False
+                            if source == "start":
+                                is_fresh_command = True
+                            elif isinstance(source, tuple) and len(source) >= 2 and source[0] == "message":
+                                txt = (source[1] or "").strip()
+                                if txt.startswith("/"):
+                                    is_fresh_command = True
+                            if not is_fresh_command:
+                                logger.debug(
+                                    "MAX: пропуск апдейта до новой команды (user_id=%s, source=%s)",
+                                    user_id,
+                                    source,
+                                )
+                                continue
+                            max_unlocked_by_fresh_command = True
+                            logger.info("MAX: получена новая команда, обработка апдейтов включена")
 
                     if source == "start":
                         from user_storage import needs_phone_verification_channel
@@ -1870,6 +2031,41 @@ async def run_max_bot() -> None:
                                 success, issue_key, user_msg = await support_api.create_ticket("max", user_id, "email_groups", form_data)
                                 msg_show = user_msg if success else issue_key
                                 response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                        elif callback_id == "admin_detailed_report":
+                            from config import is_channel_admin
+                            from core.admin_ticket_report import build_admin_detailed_report
+                            if is_channel_admin("max", user_id):
+                                path = await build_admin_detailed_report()
+                                if path and path.exists():
+                                    token = await _upload_file_max(
+                                        bot,
+                                        str(path),
+                                        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    )
+                                    if token:
+                                        await asyncio.sleep(2)
+                                        file_att = _file_attachment_from_token(token, path.name)
+                                        admin_btn = [{"id": "admin_panel", "label": "🔙 В админ-панель"}]
+                                        response = {
+                                            "text": "📥 Подробный отчёт по заявкам:",
+                                            "parse_mode": "HTML",
+                                            "buttons": admin_btn,
+                                            "_attachments_max": file_att + _buttons_to_attachments_max(admin_btn),
+                                        }
+                                    else:
+                                        response = {
+                                            "text": "❌ Не удалось загрузить файл отчёта в MAX.",
+                                            "parse_mode": "HTML",
+                                            "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}],
+                                        }
+                                else:
+                                    response = {
+                                        "text": "❌ Не удалось сформировать отчёт. Проверьте доступ к Jira и наличие openpyxl.",
+                                        "parse_mode": "HTML",
+                                        "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}],
+                                    }
+                            else:
+                                response = handle_main_menu(user_id)
                         elif callback_id == "admin_lupa_excel_report":
                             from config import is_lupa_report_allowed
                             from core.lupa_report import get_report_path
@@ -2068,7 +2264,7 @@ async def run_max_bot() -> None:
                                                 )
                                             att = _image_attachment_from_token(token)
                                             new_mid = await _send_message_max(
-                                                bot, r_chat, r_user, "\u200b", att, None
+                                                bot, r_chat, r_user, "\u200b", att, None, "source:showracemenu"
                                             )
                                             if new_mid:
                                                 _last_bot_message_max[user_id] = {
@@ -2084,7 +2280,7 @@ async def run_max_bot() -> None:
                                             bot, last.get("chat_id"), last.get("user_id"), last["mid"]
                                         )
                                     new_mid = await _send_message_max(
-                                        bot, r_chat, r_user, "…", None, None
+                                        bot, r_chat, r_user, "…", None, None, "source:showracemenu"
                                     )
                                     if new_mid:
                                         _last_bot_message_max[user_id] = {
@@ -2169,23 +2365,15 @@ async def run_max_bot() -> None:
                                     _pending_comment_max.pop(user_id, None)
                                     response = handle_main_menu(user_id)
                                 elif issue_key and (text_clean or attachment_list):
-                                    if not text_clean:
-                                        response = {
-                                            "text": (
-                                                "Добавьте текст комментария (можно в подписи к картинке/файлу) "
-                                                "или нажмите Отмена."
-                                            ),
-                                            "parse_mode": "HTML",
-                                            "buttons": [{"id": "cancel", "label": "❌ Отмена"}],
-                                        }
-                                        continue
                                     _pending_comment_max.pop(user_id, None)
                                     from core.jira_aa import add_comment as jira_add_comment
                                     from user_storage import get_user_profile
                                     profile = get_user_profile(user_id, "max") or {}
                                     full_name = (profile.get("full_name") or "").strip() or "Пользователь"
-                                    comment_body = f"[{full_name}] {text_clean}"
-                                    ok = await jira_add_comment(issue_key, comment_body)
+                                    ok = True
+                                    if text_clean:
+                                        comment_body = f"[{full_name}] {text_clean}"
+                                        ok = await jira_add_comment(issue_key, comment_body)
 
                                     # Вложения из сообщения (если есть): добавляем к заявке
                                     added_files = 0
@@ -2220,8 +2408,15 @@ async def run_max_bot() -> None:
 
                                     suffix = f" (вложений: {added_files})" if ok and added_files else ""
                                     response = {
-                                        "text": (f"✅ Комментарий добавлен к заявке {issue_key}{suffix}."
-                                                 if ok else "❌ Не удалось добавить комментарий."),
+                                        "text": (
+                                            (
+                                                f"✅ Комментарий добавлен к заявке {issue_key}{suffix}."
+                                                if text_clean
+                                                else f"✅ Вложение добавлено к заявке {issue_key}{suffix}."
+                                            )
+                                            if ok
+                                            else "❌ Не удалось добавить комментарий."
+                                        ),
                                         "parse_mode": "HTML",
                                         "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
                                     }
@@ -2540,7 +2735,13 @@ async def run_max_bot() -> None:
                         attachments_max = _buttons_to_attachments_max(buttons)
                     parse_mode = response.get("parse_mode") or "HTML"
                     new_mid = await _send_message_max(
-                        bot, r_chat, r_user, response["text"], attachments_max, parse_mode
+                        bot,
+                        r_chat,
+                        r_user,
+                        response["text"],
+                        attachments_max,
+                        parse_mode,
+                        _source_to_log_tag(source),
                     )
                     if new_mid:
                         _last_bot_message_max[user_id] = {

@@ -340,6 +340,7 @@ async def create_wms_settings(
     full_name: str = "",
     phone: str = "",
     file_paths: Optional[List[str]] = None,
+    jira_username: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
     Создаёт заявку «Изменение настроек системы WMS» (как the_bot_wms).
@@ -406,8 +407,17 @@ async def create_wms_settings(
         request_field_values=request_field_values,
     )
     if result and result.get("key"):
-        logger.info("WMS заявка создана через JSM: %s (Request type = Изменение настроек системы WMS)", result["key"])
-        return True, result["key"]
+        issue_key = result["key"]
+        logger.info("WMS заявка создана через JSM: %s (Request type = Изменение настроек системы WMS)", issue_key)
+        ju = (jira_username or "").strip()
+        if ju:
+            try:
+                from core.jira_aa import _set_reporter  # type: ignore[attr-defined]
+
+                await _set_reporter(base_url, token, issue_key, ju)
+            except Exception as e:
+                logger.warning("WMS settings: не удалось сменить reporter для %s на %s: %s", issue_key, ju, e)
+        return True, issue_key
     return False, (result or "Не удалось создать заявку.")
 
 
@@ -418,10 +428,12 @@ async def create_wms_psi_user(
     full_name: str,
     full_name_contact: str = "",
     phone: str = "",
+    jira_username: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """
     Создаёт заявку «Создать/изменить/удалить пользователя PSIwms» (как the_bot_wms).
-    full_name — ФИО и должность пользователя PSIwms (поле customfield_12406).
+    full_name — значение поля «Полное имя» в Jira (customfield_12406).
+    Если переданы full_name_contact/phone, в начало description добавляется блок «Контактное лицо: …».
     В Jira: Request Type (REQUEST_TYPE_ID_PSI_USER) должен быть с Issue Type = Поддержка, не Ошибка.
     """
     jira = CONFIG.get("JIRA", {})
@@ -469,8 +481,17 @@ async def create_wms_psi_user(
         request_field_values=request_field_values,
     )
     if result and result.get("key"):
-        logger.info("WMS заявка создана через JSM: %s (Request type = Пользователь PSIwms)", result["key"])
-        return True, result["key"]
+        issue_key = result["key"]
+        logger.info("WMS заявка создана через JSM: %s (Request type = Пользователь PSIwms)", issue_key)
+        ju = (jira_username or "").strip()
+        if ju:
+            try:
+                from core.jira_aa import _set_reporter  # type: ignore[attr-defined]
+
+                await _set_reporter(base_url, token, issue_key, ju)
+            except Exception as e:
+                logger.warning("WMS PSI user: не удалось сменить reporter для %s на %s: %s", issue_key, ju, e)
+        return True, issue_key
     return False, (result or "Не удалось создать заявку.")
 
 

@@ -291,7 +291,7 @@ async def handle_wms_callback(user_id: int, callback_id: str) -> Optional[dict]:
             data["department"] = value
             _flow[user_id] = {"step": "psi_comment", "data": data}
             return {
-                "text": "👤 <b>Создать/изменить/удалить пользователя PSIwms</b>\n\nВведите комментарий (или «-» для пропуска):",
+                "text": "👤 <b>Создать/изменить/удалить пользователя PSIwms</b>\n\nЧто нужно сделать?",
                 "parse_mode": "HTML",
                 "buttons": CANCEL_BTN,
             }
@@ -444,7 +444,7 @@ async def handle_wms_message(user_id: int, text: str, attachment_list: Optional[
         state["step"] = "psi_full_name"
         state["data"] = data
         return {
-            "text": "👤 Введите ФИО полностью + должность пользователя PSIwms:",
+            "text": "👤 Введите ФИО полностью и должность пользователя, кому нужно внести корректировки или создать учетную запись",
             "parse_mode": "HTML",
             "buttons": CANCEL_BTN,
         }
@@ -457,7 +457,7 @@ async def handle_wms_message(user_id: int, text: str, attachment_list: Optional[
             data["department"] = dept_wms
             state["step"] = "psi_comment"
             return {
-                "text": "👤 Введите комментарий (или «-» для пропуска):",
+                "text": "👤 Что нужно сделать?",
                 "parse_mode": "HTML",
                 "buttons": CANCEL_BTN,
             }

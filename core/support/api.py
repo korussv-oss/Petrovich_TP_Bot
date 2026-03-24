@@ -80,6 +80,9 @@ def get_admin_panel_response(channel_id: str, user_id: int) -> Menu | Error:
     buttons: List[MenuButton] = []
     if is_channel_admin(channel_id or "telegram", user_id):
         buttons.append(MenuButton(id="admin_delete_user", label="👤 Удалить пользователя"))
+        if (channel_id or "telegram").strip().lower() == "max":
+            buttons.append(MenuButton(id="admin_ticket_counter", label="🔢 Счётчик заявок"))
+            buttons.append(MenuButton(id="admin_detailed_report", label="📥 Подробный отчёт"))
     if is_lupa_report_allowed(channel_id or "telegram", user_id):
         buttons.append(MenuButton(id="admin_lupa_excel_report", label="📊 Отчёт Лупа (Excel)"))
     buttons.append(MenuButton(id="back_to_main", label="🔙 В главное меню"))
@@ -494,6 +497,7 @@ async def create_ticket(
             return False, "Добавьте хотя бы один файл (вложения обязательны для этого типа заявки).", None
         full_name = (profile.get("full_name") or "").strip()
         phone = (profile.get("phone") or "").strip()
+        jira_username = (profile.get("jira_username") or "").strip() or None
         ok, result = await create_wms_settings(
             department=department,
             service_type=service_type,
@@ -501,6 +505,7 @@ async def create_ticket(
             full_name=full_name,
             phone=phone,
             file_paths=file_paths,
+            jira_username=jira_username,
         )
         if not ok:
             return False, result, None
@@ -528,9 +533,12 @@ async def create_ticket(
             return False, "Укажите ФИО и должность пользователя PSIwms.", None
         full_name_contact = (profile.get("full_name") or "").strip()
         phone = (profile.get("phone") or "").strip()
-        description = f"ФИО и должность: {full_name}\n\nКомментарий: {comment or '—'}\n\n"
-        if full_name_contact or phone:
-            description += f"Контактное лицо: {full_name_contact or '—'}, {phone or '—'}"
+        jira_username = (profile.get("jira_username") or "").strip() or None
+        # Тело описания; строка «Контактное лицо» один раз добавляется в create_wms_psi_user (jira_wms).
+        description = (
+            f"Учетная запись для корректировки: {full_name}\n\n"
+            f"Суть изменений: {comment or '—'}"
+        )
         ok, result = await create_wms_psi_user(
             summary=summary,
             description=description,
@@ -538,6 +546,7 @@ async def create_ticket(
             full_name=full_name,
             full_name_contact=full_name_contact,
             phone=phone,
+            jira_username=jira_username,
         )
         if not ok:
             return False, result, None

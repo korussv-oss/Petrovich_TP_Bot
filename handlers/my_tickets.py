@@ -7,6 +7,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 
 from user_storage import is_user_registered
 from core.support.api import support_api
+from core.jira_status_ru import jira_status_display_ru
 from config import is_stc_sa
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ async def open_issue_view(callback: CallbackQuery):
     info = await get_issue_info(issue_key)
     comments = await get_issue_comments(issue_key)
     summary = (info or {}).get("summary") or "—"
-    status = (info or {}).get("status") or "—"
+    status = jira_status_display_ru((info or {}).get("status"))
     def _fmt(comments, max_len=200):
         out = []
         for c in reversed(comments[-10:]):
@@ -172,7 +173,7 @@ async def _render_stc_issue_view(callback: CallbackQuery, issue_key: str):
             req_label = t.get("request_type_label") or "—"
             break
     summary = info.get("summary") or "—"
-    status = info.get("status") or "—"
+    status = jira_status_display_ru(info.get("status"))
     desc = info.get("description") or "—"
     reporter = info.get("reporter_display") or "—"
     assignee = info.get("assignee_display") or "—"
