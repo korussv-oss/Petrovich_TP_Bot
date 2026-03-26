@@ -114,6 +114,29 @@ async def process_ad_contact(message: Message, state: FSMContext):
     from core.ad_ldap import search_user_by_phone
     profile = await asyncio.to_thread(search_user_by_phone, raw_phone)
     if not profile:
+        # Fallback: телефон не найден, но возможно в AD есть запись по email
+        if email_entered:
+            from core.ad_ldap import search_users_by_query
+
+            found_by_email = await asyncio.to_thread(search_users_by_query, email_entered, limit=5)
+            if found_by_email:
+                url = (CONFIG.get("SUPPORT_PORTAL_URL") or "").strip()
+                support = (
+                    f" Обратитесь в службу поддержки через портал: <a href=\"{url}\">{url}</a>."
+                    if url
+                    else " Обратитесь в службу поддержки."
+                )
+                await message.reply(
+                    "❌ Сотрудник найден в базе сотрудников (AD) по email, но по этому номеру телефона не найден. "
+                    "Возможно, в контакте другой номер. "
+                    "Попробуйте поделиться контактом с правильного номера."
+                    + support,
+                    parse_mode="HTML",
+                    reply_markup=remove_reply_keyboard(),
+                )
+                await message.reply("Начните заново:", reply_markup=get_start_keyboard(message.from_user.id))
+                return
+
         await message.reply(
             _support_portal_message(),
             parse_mode="HTML",

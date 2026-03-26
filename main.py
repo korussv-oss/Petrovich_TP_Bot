@@ -11,9 +11,24 @@ from config import CONFIG
 from core.support.delivery import set_delivery
 from core.notifications import run_registry_status_loop, run_registry_comments_loop
 
+
+def _env_strip_inline_comment(raw: str | None) -> str | None:
+    """
+    Docker --env-file и часть окружений отдают значение целиком, без вырезания комментария после #.
+    Пример: PASSWORD_STATUS_CHECK_INTERVAL=15 # по умолчанию 90
+    """
+    if raw is None:
+        return None
+    return raw.split("#", 1)[0].strip() or None
+
+
 os.makedirs("data", exist_ok=True)
 logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    level=getattr(
+        logging,
+        (_env_strip_inline_comment(os.getenv("LOG_LEVEL")) or "INFO").upper(),
+        logging.INFO,
+    ),
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     handlers=[
         logging.FileHandler("data/bot.log", encoding="utf-8"),
@@ -26,11 +41,43 @@ _singleton_lock_fp = None
 _telegram_dp = None  # создаём один раз, чтобы не повторять dp.include_router на рестартах
 
 
-def _env_flag_enabled(name: str, default: bool = True) -> bool:
-    raw = os.getenv(name)
+def _env_int(name: str, default: int) -> int:
+    raw = _env_strip_inline_comment(os.getenv(name))
     if raw is None:
         return default
-    v = raw.strip().lower()
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Некорректное целое для %s=%r, используем %s",
+            name,
+            os.getenv(name),
+            default,
+        )
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = _env_strip_inline_comment(os.getenv(name))
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Некорректное число для %s=%r, используем %s",
+            name,
+            os.getenv(name),
+            default,
+        )
+        return default
+
+
+def _env_flag_enabled(name: str, default: bool = True) -> bool:
+    raw = _env_strip_inline_comment(os.getenv(name))
+    if raw is None:
+        return default
+    v = raw.lower()
     return v not in ("0", "false", "no", "off")
 
 
@@ -111,7 +158,7 @@ async def _run_telegram_bot() -> None:
     global _telegram_dp
     if _telegram_dp is None:
         dp = Dispatcher(storage=MemoryStorage())
-        cooldown = float(os.getenv("ANTISPAM_COOLDOWN", "1.5"))
+        cooldown = _env_float("ANTISPAM_COOLDOWN", 1.5)
         dp.update.outer_middleware(AntispamMiddleware(cooldown=cooldown))
 
         # Роутеры импортируются как singletons, поэтому include_router делаем один раз.
@@ -166,8 +213,8 @@ async def main():
     # Delivery не должен связывать жизненный цикл сервисов: если Telegram не запущен,
     # доставка в Telegram просто логируется и пропускается, MAX продолжает работать.
     import time as _time
-    telegram_delivery_timeout_seconds = float(os.getenv("TELEGRAM_DELIVERY_TIMEOUT_SECONDS", "3.0"))
-    telegram_delivery_cooldown_seconds = float(os.getenv("TELEGRAM_DELIVERY_COOLDOWN_SECONDS", "30.0"))
+    telegram_delivery_timeout_seconds = _env_float("TELEGRAM_DELIVERY_TIMEOUT_SECONDS", 3.0)
+    telegram_delivery_cooldown_seconds = _env_float("TELEGRAM_DELIVERY_COOLDOWN_SECONDS", 30.0)
     telegram_send_disabled_until = 0.0
     async def deliver_to_channel(channel_id: str, channel_user_id: int, text: str, reply_markup=None):
         nonlocal telegram_send_disabled_until
@@ -230,8 +277,8 @@ async def main():
     set_delivery(deliver_to_channel)
 
     logger.info("Rubik: сервисы запускаются независимо (MAX и Telegram не ждут друг друга)")
-    status_interval = int(os.getenv("PASSWORD_STATUS_CHECK_INTERVAL", "90"))
-    comments_interval = int(os.getenv("COMMENTS_CHECK_INTERVAL", "30"))
+    status_interval = _env_int("PASSWORD_STATUS_CHECK_INTERVAL", 90)
+    comments_interval = _env_int("COMMENTS_CHECK_INTERVAL", 30)
     status_task = asyncio.create_task(
         _supervise(
             "REGISTRY_STATUS",

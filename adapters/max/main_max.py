@@ -2127,16 +2127,36 @@ async def run_max_bot() -> None:
                                         ],
                                     }
                                 else:
+                                    email_entered = (reg.get("email") or "").strip().lower()
                                     profile = await asyncio.to_thread(search_user_by_phone, phone)
                                     if not profile:
+                                        found_by_email = []
+                                        if email_entered:
+                                            from core.ad_ldap import search_users_by_query
+
+                                            found_by_email = await asyncio.to_thread(
+                                                search_users_by_query, email_entered, limit=5
+                                            )
                                         url = (CONFIG.get("SUPPORT_PORTAL_URL") or "").strip()
-                                        response = {
-                                            "text": f"По этому номеру сотрудник не найден в базе. Обратитесь в поддержку: {url}" if url else "По этому номеру сотрудник не найден. Обратитесь в поддержку.",
-                                            "parse_mode": "HTML",
-                                            "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
-                                        }
+                                        if found_by_email:
+                                            response = {
+                                                "text": (
+                                                    f"Сотрудник найден в AD по email, но по этому номеру телефона не найден. "
+                                                    f"Попробуйте поделиться контактом с правильного номера. Обратитесь в поддержку: {url}"
+                                                    if url
+                                                    else "Сотрудник найден в AD по email, но по этому номеру телефона не найден. "
+                                                    "Попробуйте поделиться контактом с правильного номера. Обратитесь в поддержку."
+                                                ),
+                                                "parse_mode": "HTML",
+                                                "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
+                                            }
+                                        else:
+                                            response = {
+                                                "text": f"По этому номеру сотрудник не найден в базе. Обратитесь в поддержку: {url}" if url else "По этому номеру сотрудник не найден. Обратитесь в поддержку.",
+                                                "parse_mode": "HTML",
+                                                "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
+                                            }
                                     else:
-                                        email_entered = (reg.get("email") or "").strip().lower()
                                         if email_entered and profile.get("email") and (profile["email"].lower() != email_entered):
                                             _pending_registration_max[user_id] = reg
                                             response = {
