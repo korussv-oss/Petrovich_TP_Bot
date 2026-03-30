@@ -58,7 +58,8 @@ def add_binding(
         "created_at": extra.get("created_at") if isinstance(extra, dict) else None,
         **(extra or {}),
     })
-    if "created_at" not in records[-1]:
+    # created_at может прийти как ключ со значением null/None — это ломает определение «свежести».
+    if not records[-1].get("created_at"):
         records[-1]["created_at"] = round(time.time(), 2)
     _save(records)
     logger.debug("Реестр: добавлена привязка %s -> %s/%s", key, channel_id, channel_user_id)
