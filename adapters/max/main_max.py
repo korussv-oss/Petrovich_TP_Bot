@@ -945,13 +945,15 @@ async def _handle_open_issue_max(user_id: int, callback_id: str) -> dict | None:
                 body = body[:max_len] + "..."
             out.append(f"👤 {author}: {body}")
         return out
-    lines = _fmt(comments)
+    comm_note = "\n\n⚠️ Не удалось загрузить комментарии из Jira." if comments is None else ""
+    lines = _fmt(comments if comments is not None else [])
     jira_url = support_api.get_jira_customer_request_url(issue_key)
     jira_line = f'\n🔗 <a href="{jira_url}">Открыть заявку в Jira</a>' if jira_url else ""
     text = (
         f"💬 <b>Заявка {issue_key}</b>\n"
         f"Тема: {summary}\nСтатус: {status}{jira_line}\n\n"
         + ("\n\n".join(lines) if lines else "Пока нет комментариев.")
+        + comm_note
     )
     buttons = [
         {"id": f"add_comment:{issue_key}", "label": "✏️ Добавить комментарий"},
@@ -981,6 +983,8 @@ async def _handle_stc_open_issue_max(user_id: int, issue_key: str) -> dict:
         }
     info = await get_issue_admin_details(issue_key) or {}
     comments = await get_issue_comments(issue_key)
+    comments_list = comments if comments is not None else []
+    comments_warn = "\n\n⚠️ Не удалось загрузить комментарии из Jira." if comments is None else ""
     creator = "—"
     req_label = "—"
     for t in await get_stc_assignee_tasks("max", user_id):
@@ -994,7 +998,7 @@ async def _handle_stc_open_issue_max(user_id: int, issue_key: str) -> dict:
     reporter = info.get("reporter_display") or "—"
     assignee = info.get("assignee_display") or "—"
     lines = []
-    for c in reversed((comments or [])[-5:]):
+    for c in reversed(comments_list[-5:]):
         author = (c.get("author") or {}).get("displayName", "—")
         body = (c.get("body") or "").strip()
         if len(body) > 180:
@@ -1012,6 +1016,7 @@ async def _handle_stc_open_issue_max(user_id: int, issue_key: str) -> dict:
         f"Тема: {summary}{jira_line}\n\n"
         f"Описание:\n{desc}\n\n"
         + ("Последние комментарии:\n" + "\n\n".join(lines) if lines else "Комментариев пока нет.")
+        + comments_warn
     )
     buttons = [
         {"id": f"stc_open_jira:{issue_key}", "label": "🔗 Открыть в JIRA"},

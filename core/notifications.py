@@ -287,6 +287,41 @@ def _set_last_comment_count(issue_key: str, count: int) -> None:
     _save_state(data)
 
 
+_NOTIFIED_COMMENT_IDS_CAP = 400
+
+
+def _get_notified_comment_ids(issue_key: str) -> set:
+    key = (issue_key or "").strip().upper()
+    if not key:
+        return set()
+    data = _load_state()
+    raw = (data.get(key) or {}).get("notified_comment_ids")
+    if not isinstance(raw, list):
+        return set()
+    return {str(x) for x in raw if x is not None and str(x).strip()}
+
+
+def _add_notified_comment_ids(issue_key: str, ids: List[str]) -> None:
+    key = (issue_key or "").strip().upper()
+    if not key or not ids:
+        return
+    data = _load_state()
+    if key not in data:
+        data[key] = {}
+    seen = data[key].get("notified_comment_ids")
+    if not isinstance(seen, list):
+        seen = []
+    for i in ids:
+        si = str(i).strip()
+        if si and si not in seen:
+            seen.append(si)
+    cap = max(50, int(os.getenv("COMMENTS_NOTIFIED_IDS_CAP", str(_NOTIFIED_COMMENT_IDS_CAP))))
+    while len(seen) > cap:
+        seen.pop(0)
+    data[key]["notified_comment_ids"] = seen
+    _save_state(data)
+
+
 def _get_last_status(issue_key: str) -> Optional[str]:
     key = (issue_key or "").strip().upper()
     if not key:
@@ -485,6 +520,12 @@ async def check_registry_comments_and_notify() -> None:
             if not recipients:
                 continue
             comments = await get_issue_comments(issue_key)
+            if comments is None:
+                logger.debug(
+                    "Комментарии %s: пропуск цикла (Jira недоступен или ошибка запроса), baseline не меняем",
+                    issue_key,
+                )
+                continue
             current_count = len(comments)
             last_count = _get_last_comment_count(issue_key)
             if last_count is None:
@@ -502,7 +543,16 @@ async def check_registry_comments_and_notify() -> None:
             ):
                 _set_last_comment_count(issue_key, current_count)
                 continue
-            # После включения фильтра internal-комментариев счётчик может уменьшиться.
+            # Пустой список при last_count>0 часто означает сбой Jira (раньше ошибка маскировалась под []).
+            # Не сбрасываем baseline — иначе после восстановления связи прилетит «волна» старых уведомлений.
+            if current_count == 0 and last_count > 0:
+                logger.warning(
+                    "Комментарии %s: получено 0 комментариев при сохранённом baseline=%s — не обновляем счётчик (вероятен сбой API)",
+                    issue_key,
+                    last_count,
+                )
+                continue
+            # После включения фильтра internal-комментариев счётчик может уменьшиться (но не до нуля «из N» выше).
             # Сбрасываем baseline, чтобы цикл уведомлений не "залипал".
             if current_count < last_count:
                 _set_last_comment_count(issue_key, current_count)
@@ -525,6 +575,7 @@ async def check_registry_comments_and_notify() -> None:
             if current_count <= last_count:
                 continue
             new_comments = comments[-new_count:]
+            already_notified = _get_notified_comment_ids(issue_key)
             # Префиксы комментариев, написанных получателями через бота (TG/MAX): "[ФИО] текст"
             from user_storage import get_user_profile
             bot_comment_prefixes: set = set()
@@ -533,9 +584,14 @@ async def check_registry_comments_and_notify() -> None:
                 full_name = (profile.get("full_name") or "").strip()
                 if full_name:
                     bot_comment_prefixes.add(f"[{full_name}]")
-            # Не уведомляем о комментариях, которые получатели сами написали через бота
+            # Не уведомляем о комментариях, которые получатели сами написали через бота;
+            # повторно не шлём по id (защита от сбоев baseline).
             lines = []
+            new_ids_for_state: List[str] = []
             for c in new_comments:
+                cid = c.get("id")
+                if cid is not None and str(cid).strip() in already_notified:
+                    continue
                 plain = _comment_body_plain(c)
                 plain_stripped = (plain or "").strip()
                 if bot_comment_prefixes and plain_stripped:
@@ -546,6 +602,8 @@ async def check_registry_comments_and_notify() -> None:
                     lines.append(f"👤 {author}:\n{plain}")
                 else:
                     lines.append(f"👤 {author}: (без текста)")
+                if cid is not None and str(cid).strip():
+                    new_ids_for_state.append(str(cid).strip())
             if not lines:
                 _set_last_comment_count(issue_key, current_count)
                 continue
@@ -559,11 +617,15 @@ async def check_registry_comments_and_notify() -> None:
             reply_markup = [
                 [{"text": "✏️ Написать комментарий", "callback_data": f"add_comment:{issue_key}"}],
             ]
+            delivered_any = False
             for channel_id, user_id in recipients:
                 try:
                     await delivery_module.deliver(channel_id, user_id, text, reply_markup=reply_markup)
+                    delivered_any = True
                 except Exception as e:
                     logger.warning("Не удалось отправить уведомление о комментарии %s -> %s/%s: %s", issue_key, channel_id, user_id, e)
+            if delivered_any:
+                _add_notified_comment_ids(issue_key, new_ids_for_state)
             _set_last_comment_count(issue_key, current_count)
         except Exception as e:
             logger.warning("Ошибка проверки комментариев %s: %s", issue_key, e)

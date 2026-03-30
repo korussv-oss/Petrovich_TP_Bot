@@ -67,21 +67,27 @@ async def open_issue_view(callback: CallbackQuery):
     comments = await get_issue_comments(issue_key)
     summary = (info or {}).get("summary") or "—"
     status = jira_status_display_ru((info or {}).get("status"))
-    def _fmt(comments, max_len=200):
+    def _fmt(comments_list, max_len=200):
         out = []
-        for c in reversed(comments[-10:]):
+        for c in reversed(comments_list[-10:]):
             author = (c.get("author") or {}).get("displayName", "—")
             body = (c.get("body") or "").strip()
             if len(body) > max_len:
                 body = body[:max_len] + "..."
             out.append(f"👤 {author}: {body}")
         return out
-    lines = _fmt(comments)
+    comm_note = ""
+    if comments is None:
+        comm_note = "\n\n⚠️ Не удалось загрузить комментарии из Jira."
+        lines = []
+    else:
+        lines = _fmt(comments)
     jira_url = support_api.get_jira_customer_request_url(issue_key)
     text = (
         f"💬 <b>Заявка {issue_key}</b>\n"
         f"Тема: {summary}\nСтатус: {status}\n\n"
         + ("\n\n".join(lines) if lines else "Пока нет комментариев.")
+        + comm_note
     )
     keyboard_rows = []
     if jira_url:
@@ -164,6 +170,8 @@ async def _render_stc_issue_view(callback: CallbackQuery, issue_key: str):
         return
     info = await get_issue_admin_details(issue_key) or {}
     comments = await get_issue_comments(issue_key)
+    comments_list = comments if comments is not None else []
+    comments_warn = "\n\n⚠️ Не удалось загрузить комментарии из Jira." if comments is None else ""
     # creator и type из списка задач (чтобы не делать лишний проход по реестру)
     creator = "—"
     req_label = "—"
@@ -178,7 +186,7 @@ async def _render_stc_issue_view(callback: CallbackQuery, issue_key: str):
     reporter = info.get("reporter_display") or "—"
     assignee = info.get("assignee_display") or "—"
     comm_lines = []
-    for c in reversed((comments or [])[-5:]):
+    for c in reversed(comments_list[-5:]):
         author = (c.get("author") or {}).get("displayName", "—")
         body = (c.get("body") or "").strip()
         if len(body) > 180:
@@ -195,6 +203,7 @@ async def _render_stc_issue_view(callback: CallbackQuery, issue_key: str):
         f"Тема: {summary}\n\n"
         f"Описание:\n{desc}\n\n"
         + ("Последние комментарии:\n" + "\n\n".join(comm_lines) if comm_lines else "Комментариев пока нет.")
+        + comments_warn
     )
     rows = []
     if jira_url:

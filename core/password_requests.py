@@ -185,6 +185,8 @@ async def check_comments_and_notify() -> None:
     for issue_key, user_id, channel_id in pending:
         try:
             comments = await get_issue_comments(issue_key)
+            if comments is None:
+                continue
             current_count = len(comments)
             last_count = data.get(issue_key, {}).get("last_comment_count")
             if last_count is None:

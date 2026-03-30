@@ -47,6 +47,9 @@ async def request_comments_start(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     comments = await get_issue_comments(issue_key)
+    if comments is None:
+        await callback.answer("Не удалось загрузить комментарии из Jira.", show_alert=True)
+        return
     lines = _format_comments(comments)
     text = (
         f"💬 <b>Комментарии к заявке {issue_key}</b>\n\n"

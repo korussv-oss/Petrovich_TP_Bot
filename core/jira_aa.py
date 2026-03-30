@@ -7,7 +7,7 @@ import asyncio
 import logging
 import json
 from datetime import datetime
-from typing import Optional, Dict, Any, Set
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin
 
 import aiohttp
@@ -540,9 +540,11 @@ def _is_internal_comment(comment: Dict[str, Any]) -> bool:
     return False
 
 
-async def get_issue_comments(issue_key: str, include_internal: bool = False) -> list:
+async def get_issue_comments(
+    issue_key: str, include_internal: bool = False
+) -> Optional[List[Dict[str, Any]]]:
     """
-    Возвращает список комментариев задачи.
+    Возвращает список комментариев задачи или None при сетевой/HTTP ошибке (не путать с пустым списком).
 
     Внутренние (internal) по умолчанию исключаются (для JSM внутренних заметок `sd.public.comment.internal == true`).
 
@@ -553,10 +555,10 @@ async def get_issue_comments(issue_key: str, include_internal: bool = False) -> 
     base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
     token = (jira.get("TOKEN") or "").strip()
     if not base_url or not token:
-        return []
+        return None
     issue_key = _safe_issue_key(issue_key)
     if not issue_key:
-        return []
+        return None
     # expand=properties нужен, чтобы отличать public/internal комментарии в JSM.
     url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/comment")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
@@ -576,7 +578,14 @@ async def get_issue_comments(issue_key: str, include_internal: bool = False) -> 
                     url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
                     if resp.status != 200:
-                        return []
+                        body = await resp.text()
+                        logger.warning(
+                            "get_issue_comments %s: HTTP %s %s",
+                            issue_key,
+                            resp.status,
+                            (body or "")[:300],
+                        )
+                        return None
                     data = await resp.json()
                     comments_page = list(data.get("comments") or [])
                     if not comments_page:
@@ -622,7 +631,7 @@ async def get_issue_comments(issue_key: str, include_internal: bool = False) -> 
         return [c for c in all_comments if not _is_internal_comment(c)]
     except Exception as e:
         logger.warning("get_issue_comments %s: %s", issue_key, e)
-        return []
+        return None
 
 
 async def add_comment(issue_key: str, body: str) -> bool:
