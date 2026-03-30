@@ -411,6 +411,12 @@ def _expand_recipients_to_linked_channels(recipients: List[tuple]) -> List[tuple
             if key not in seen:
                 seen.add(key)
                 out.append(key)
+    # Глобальный приоритет MAX: если есть MAX-получатель — отрезаем Telegram,
+    # чтобы не было дублей при включении Telegram в будущем.
+    only_max = (os.getenv("ONLY_MAX_NOTIFICATIONS", "1") or "").strip().lower() not in ("0", "false", "no", "off")
+    if only_max:
+        max_only = [(c, u) for (c, u) in out if (c or "").strip().lower() == "max"]
+        return max_only if max_only else out
     return out
 
 
@@ -510,6 +516,11 @@ async def check_registry_comments_and_notify() -> None:
     # (пользователь создал заявку, подождал > окна «свежести», появился первый публичный комментарий).
     zero_baseline_skip_min = max(2, int(os.getenv("COMMENTS_ZERO_BASELINE_SKIP_MIN", "8")))
 
+    # Автоочистка реестра для issue_key, которые стабильно не читаются Jira (404/401).
+    comments_cleanup_threshold = int(os.getenv("COMMENTS_CLEANUP_ERROR_STREAK_THRESHOLD", "5"))
+    comments_cleanup_window_hours = float(os.getenv("COMMENTS_CLEANUP_ERROR_STREAK_WINDOW_HOURS", "12"))
+    comments_cleanup_statuses = {s.strip() for s in os.getenv("COMMENTS_CLEANUP_ERROR_STATUSES", "404,401").split(",") if s.strip()}
+
     issue_keys = get_all_issue_keys()
     if not issue_keys:
         return
@@ -519,12 +530,60 @@ async def check_registry_comments_and_notify() -> None:
             recipients = _expand_recipients_to_linked_channels(recipients)
             if not recipients:
                 continue
-            comments = await get_issue_comments(issue_key)
+            comments_resp = await get_issue_comments(issue_key, return_http_status=True)
+            # comments_resp: (comments_or_none, http_status_or_none)
+            comments, http_status = comments_resp if isinstance(comments_resp, tuple) and len(comments_resp) == 2 else (None, None)
             if comments is None:
-                logger.debug(
-                    "Комментарии %s: пропуск цикла (Jira недоступен или ошибка запроса), baseline не меняем",
-                    issue_key,
-                )
+                # Автоочистка реестра при стабильно повторяющихся HTTP ошибках.
+                if http_status is not None and str(http_status) in comments_cleanup_statuses:
+                    now_ts = time.time()
+                    key = (issue_key or "").strip().upper()
+                    if key:
+                        state = _load_state()
+                        rec = state.get(key, {})
+                        last_err = rec.get("jira_comment_error_streak") or {}
+                        last_status = last_err.get("status")
+                        last_count = int(last_err.get("count") or 0)
+                        last_ts = last_err.get("last_ts")
+                        try:
+                            last_ts_f = float(last_ts) if last_ts is not None else None
+                        except Exception:
+                            last_ts_f = None
+
+                        # Сбрасываем streak, если статус другой или прошло слишком много времени.
+                        if last_status != str(http_status) or last_ts_f is None or (now_ts - last_ts_f) > comments_cleanup_window_hours * 3600:
+                            new_count = 1
+                        else:
+                            new_count = last_count + 1
+
+                        rec["jira_comment_error_streak"] = {"status": str(http_status), "count": new_count, "last_ts": now_ts}
+                        state[key] = rec
+                        _save_state(state)
+
+                        if (
+                            new_count >= comments_cleanup_threshold
+                            and not _is_recent_issue_binding(issue_key)
+                        ):
+                            from core.support.issue_binding_registry import remove_bindings_by_issue
+
+                            removed = remove_bindings_by_issue(issue_key)
+                            logger.warning(
+                                "Комментарии %s: Jira стабильно отвечает HTTP %s (streak=%s). Удалены привязки: %s",
+                                issue_key,
+                                http_status,
+                                new_count,
+                                removed,
+                            )
+                            # Чтобы не продолжать попытки уведомлений по этому issue_key в цикле состояния.
+                            # Привязки удалятся из реестра, но базу счётчика на всякий случай обновим.
+                            _set_last_comment_count(issue_key, 0)
+                            # Сбросим streak.
+                            state2 = _load_state()
+                            k2 = (issue_key or "").strip().upper()
+                            if k2 and k2 in state2:
+                                state2[k2].pop("jira_comment_error_streak", None)
+                                _save_state(state2)
+                continue
                 continue
             current_count = len(comments)
             last_count = _get_last_comment_count(issue_key)

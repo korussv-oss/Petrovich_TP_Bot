@@ -541,8 +541,10 @@ def _is_internal_comment(comment: Dict[str, Any]) -> bool:
 
 
 async def get_issue_comments(
-    issue_key: str, include_internal: bool = False
-) -> Optional[List[Dict[str, Any]]]:
+    issue_key: str,
+    include_internal: bool = False,
+    return_http_status: bool = False,
+) -> Any:
     """
     Возвращает список комментариев задачи или None при сетевой/HTTP ошибке (не путать с пустым списком).
 
@@ -555,10 +557,10 @@ async def get_issue_comments(
     base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
     token = (jira.get("TOKEN") or "").strip()
     if not base_url or not token:
-        return None
+        return (None, None) if return_http_status else None
     issue_key = _safe_issue_key(issue_key)
     if not issue_key:
-        return None
+        return (None, None) if return_http_status else None
     # expand=properties нужен, чтобы отличать public/internal комментарии в JSM.
     url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/comment")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
@@ -585,7 +587,7 @@ async def get_issue_comments(
                             resp.status,
                             (body or "")[:300],
                         )
-                        return None
+                        return (None, resp.status) if return_http_status else None
                     data = await resp.json()
                     comments_page = list(data.get("comments") or [])
                     if not comments_page:
@@ -627,11 +629,12 @@ async def get_issue_comments(
 
         all_comments.sort(key=_sort_key)
         if include_internal:
-            return all_comments
-        return [c for c in all_comments if not _is_internal_comment(c)]
+            return (all_comments, 200) if return_http_status else all_comments
+        filtered = [c for c in all_comments if not _is_internal_comment(c)]
+        return (filtered, 200) if return_http_status else filtered
     except Exception as e:
         logger.warning("get_issue_comments %s: %s", issue_key, e)
-        return None
+        return (None, None) if return_http_status else None
 
 
 async def add_comment(issue_key: str, body: str) -> bool:

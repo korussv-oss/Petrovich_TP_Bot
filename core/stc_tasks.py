@@ -118,11 +118,22 @@ def get_stc_recipients_by_jira_username(jira_username: str) -> List[Tuple[str, i
     recipients: List[Tuple[str, int]] = []
     seen = set()
     for tg_uid in find_users_by_jira_username(target):
+        # 1) Если профиль реально хранится как telegram_id для роли СА СТЦ — добавляем как telegram.
         if is_stc_sa("telegram", tg_uid):
             key = ("telegram", tg_uid)
             if key not in seen:
                 seen.add(key)
                 recipients.append(key)
+
+        # 2) Если профиль реально является MAX пользователем (в аккаунте USE_TELEGRAMM=0 иногда нет привязки
+        # Telegram↔MAX в index_by_max_user.json), добавляем MAX получателя напрямую по STC_SA_MAX_IDS.
+        if is_stc_sa("max", tg_uid):
+            key = ("max", tg_uid)
+            if key not in seen:
+                seen.add(key)
+                recipients.append(key)
+
+        # 3) Дополнительно раскрываем привязки Telegram↔MAX, если они настроены.
         for max_uid in get_linked_max_user_ids(tg_uid):
             if is_stc_sa("max", max_uid):
                 key = ("max", max_uid)

@@ -217,17 +217,43 @@ def get_linked_channel_user_pairs(channel_id: str, user_id: int) -> List[Tuple[s
     Возвращает список (channel_id, channel_user_id) для этого пользователя:
     текущий канал + привязанные (MAX↔Telegram). Нужно для «Мои заявки» — показывать заявки из обоих ботов.
     """
-    out = [(channel_id.strip().lower() or "telegram", int(user_id))]
+    import os
+    ch0 = (channel_id or "").strip().lower() or "telegram"
+    uid0 = int(user_id)
     idx = _load_json(INDEX_MAX_USER, {})
-    if (channel_id or "").strip().lower() == "max":
-        tg_id = idx.get(str(user_id))
+    prefer_max = (os.getenv("PREFER_MAX_CHANNEL", "1") or "").strip().lower() not in ("0", "false", "no", "off")
+    deliver_both = (os.getenv("DELIVER_TO_BOTH_CHANNELS", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    # Соберём возможные связанные пары.
+    linked: List[Tuple[str, int]] = []
+    if ch0 == "max":
+        tg_id = idx.get(str(uid0))
         if tg_id:
-            out.append(("telegram", int(tg_id)))
+            linked.append(("telegram", int(tg_id)))
     else:
-        tg_id = int(user_id)
+        tg_id = uid0
         for mid, tid in idx.items():
             if str(tid) == str(tg_id):
-                out.append(("max", int(mid)))
+                linked.append(("max", int(mid)))
+
+    # Если MAX — приоритетный канал и есть MAX-связка, то по умолчанию возвращаем только MAX,
+    # чтобы не дублировать уведомления в Telegram (даже если Telegram включат позже).
+    if prefer_max and not deliver_both:
+        # Если текущий уже MAX — просто он.
+        if ch0 == "max":
+            return [("max", uid0)]
+        # Если есть MAX линк — выбираем его.
+        for c, u in linked:
+            if c == "max":
+                return [("max", u)]
+        # Иначе возвращаем текущий канал (скорее всего telegram, если MAX не привязан).
+        return [(ch0, uid0)]
+
+    # Иначе — возвращаем оба (с приоритетом MAX в порядке).
+    out = [(ch0, uid0)]
+    out.extend(linked)
+    if prefer_max:
+        out.sort(key=lambda x: 0 if x[0] == "max" else 1)
     return out
 
 
