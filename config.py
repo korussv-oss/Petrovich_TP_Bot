@@ -26,6 +26,20 @@ JIRA_AA_ASSIGNEE_USERNAME = (os.getenv("JIRA_AA_ASSIGNEE_USERNAME") or "Robot_Sc
 # Временно отключить установку исполнителя (0/false/no — не назначать)
 JIRA_AA_SET_ASSIGNEE = os.getenv("JIRA_AA_SET_ASSIGNEE", "1").strip().lower() not in ("0", "false", "no", "off")
 
+# Фича-флаги
+TICKET_WIZARD_WMS_ISSUE_ENABLED = os.getenv("TICKET_WIZARD_WMS_ISSUE", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_LUPA_SEARCH_ENABLED = os.getenv("TICKET_WIZARD_LUPA_SEARCH", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_WMS_SETTINGS_ENABLED = os.getenv("TICKET_WIZARD_WMS_SETTINGS", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_WMS_PSI_USER_ENABLED = os.getenv("TICKET_WIZARD_WMS_PSI_USER", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_PC_PROBLEM_ENABLED = os.getenv("TICKET_WIZARD_PC_PROBLEM", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_ORGTECH_PROBLEM_ENABLED = os.getenv("TICKET_WIZARD_ORGTECH_PROBLEM", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_PERIPHERAL_EQUIPMENT_ENABLED = os.getenv("TICKET_WIZARD_PERIPHERAL_EQUIPMENT", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_NETWORK_PROBLEM_ENABLED = os.getenv("TICKET_WIZARD_NETWORK_PROBLEM", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_ELECTRONIC_QUEUE_ENABLED = os.getenv("TICKET_WIZARD_ELECTRONIC_QUEUE", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_EMAIL_OWA_ENABLED = os.getenv("TICKET_WIZARD_EMAIL_OWA", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_EMAIL_FORWARDING_ENABLED = os.getenv("TICKET_WIZARD_EMAIL_FORWARDING", "0").strip().lower() in ("1", "true", "yes", "on")
+TICKET_WIZARD_EMAIL_GROUPS_ENABLED = os.getenv("TICKET_WIZARD_EMAIL_GROUPS", "0").strip().lower() in ("1", "true", "yes", "on")
+
 # Создание через Service Desk API (как в the_bot_wms): тип «Смена пароля» задаётся requestTypeId, не полем 10500.
 # Из AA-78207: servicedesk/23/requesttype/964 → service_desk_id=23, request_type_id=964
 JIRA_AA_SERVICE_DESK_ID = (os.getenv("JIRA_AA_SERVICE_DESK_ID") or "").strip()

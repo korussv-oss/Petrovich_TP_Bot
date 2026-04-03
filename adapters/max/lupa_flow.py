@@ -5,6 +5,7 @@
 import logging
 from typing import Optional
 
+from core.support import ticket_wizard
 from user_storage import (
     is_user_registered,
     get_user_profile,
@@ -13,15 +14,15 @@ from user_storage import (
     check_employee_id_taken,
 )
 
+from adapters.max._wizard_flow import WizardFlowStore
+
 logger = logging.getLogger(__name__)
 CHANNEL_ID = "max"
 
-# user_id (MAX) -> { step, data }
-_flow: dict[int, dict] = {}
+_store = WizardFlowStore()
 
 CANCEL_BTN = [{"id": "cancel", "label": "❌ Отмена"}]
 
-# Значения для Jira (как в the_bot_lupa и keyboards.LUPA_*)
 LUPA_SERVICE_VALUES = {"lupa_service_app": "Приложение", "lupa_service_site": "Сайт (petrovich.ru)"}
 LUPA_REQUEST_TYPE_VALUES = {
     "lupa_request_search_issue": "проблемы с поиском",
@@ -29,7 +30,6 @@ LUPA_REQUEST_TYPE_VALUES = {
     "lupa_request_discount": "валидация сленга",
 }
 
-# Кнопки в формате MAX (id, label)
 LUPA_SERVICE_BUTTONS = [
     {"id": "lupa_service_app", "label": "📱 Приложение"},
     {"id": "lupa_service_site", "label": "🌐 Сайт (petrovich.ru)"},
@@ -48,7 +48,6 @@ ITEMS_PER_PAGE = 8
 
 
 def _buttons_lupa_departments(departments: list, page: int = 0) -> list:
-    """Кнопки выбора подразделения из Jira (для Lupa) + пагинация + Отмена."""
     if not departments:
         return CANCEL_BTN
     start = page * ITEMS_PER_PAGE
@@ -64,47 +63,38 @@ def _buttons_lupa_departments(departments: list, page: int = 0) -> list:
 
 
 def _city_buttons() -> list:
-    """Кнопки городов (первые 4 из конфига) + «Ввести вручную», как the_bot_lupa."""
     from config import CONFIG
     cities = CONFIG.get("JIRA_LUPA", {}).get("CITIES", [])[:4]
     buttons = []
     for i in range(0, min(4, len(cities)), 2):
-        row = []
         for j in range(2):
             if i + j < len(cities):
                 city = cities[i + j]
-                row.append({"id": f"lupa_city_{city.replace(' ', '_')}", "label": city})
-        if row:
-            buttons.extend(row)
+                buttons.append({"id": f"lupa_city_{city.replace(' ', '_')}", "label": city})
     buttons.append({"id": "lupa_city_manual", "label": "✏️ Ввести вручную"})
     return buttons
 
 
 def is_in_lupa_flow(user_id: int) -> bool:
-    return user_id in _flow
+    return _store.has(user_id)
 
 
 def _lupa_service_screen() -> dict:
-    """Экран выбора сервиса (шаг 1 Lupa)."""
     return {
-        "text": "🔍 <b>Создание заявки о поиске</b>\n\nШаг 1/5: Выберите проблемный сервис:",
+        "text": ticket_wizard.lupa_service_screen().text,
         "parse_mode": "HTML",
         "buttons": LUPA_SERVICE_BUTTONS + CANCEL_BTN,
     }
 
 
 async def start_lupa(user_id: int) -> Optional[dict]:
-    """
-    Начало сценария Lupa. Если нет employee_id — запрос табельного.
-    Если нет department в профиле — запрос подразделения из Jira (как в TG); иначе шаг 1 — выбор сервиса.
-    """
     if not is_user_registered(user_id, CHANNEL_ID):
         return None
-    _flow.pop(user_id, None)
+    _store.clear(user_id)
     profile = get_user_profile(user_id, CHANNEL_ID) or {}
     employee_id = (profile.get("employee_id") or "").strip()
     if not employee_id:
-        _flow[user_id] = {"step": "employee_id", "data": {"ticket_type_id": "lupa_search"}}
+        _store.create(user_id, ticket_type_id="lupa_search", step="employee_id", data={"ticket_type_id": "lupa_search"})
         return {
             "text": (
                 "🌐 <b>Сайт (Lupa)</b>\n\n"
@@ -124,46 +114,38 @@ async def start_lupa(user_id: int) -> Optional[dict]:
                 "parse_mode": "HTML",
                 "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
             }
-        _flow[user_id] = {
-            "step": "department",
-            "data": {"ticket_type_id": "lupa_search"},
-            "departments": depts,
-            "dept_page": 0,
-        }
+        _store.create(user_id, ticket_type_id="lupa_search", step="department",
+                      data={"ticket_type_id": "lupa_search", "departments": depts, "dept_page": 0})
         return {
-            "text": "🔍 <b>Создание заявки о поиске (Lupa)</b>\n\nВыберите ваше подразделение (оно будет сохранено в профиль):",
+            "text": ticket_wizard.lupa_department_screen(depts).text,
             "parse_mode": "HTML",
             "buttons": _buttons_lupa_departments(depts, 0),
         }
-    _flow[user_id] = {"step": "service", "data": {"ticket_type_id": "lupa_search"}}
+    _store.create(user_id, ticket_type_id="lupa_search", step="service", data={"ticket_type_id": "lupa_search"})
     return _lupa_service_screen()
 
 
 def handle_lupa_callback(user_id: int, callback_id: str) -> Optional[dict]:
-    """Обработка callback в сценарии Lupa: cancel, lupa_service_*, lupa_request_*, lupa_city_*, lupa_skip_comment."""
-    state = _flow.get(user_id)
-    if not state:
+    session = _store.get(user_id)
+    if not session:
         return None
 
     if callback_id == "cancel":
-        _flow.pop(user_id, None)
+        _store.clear(user_id)
         from adapters.max.handlers import handle_main_menu
         return handle_main_menu(user_id)
 
-    step = state.get("step")
-    data = state.get("data", {})
-
-    # Шаг: выбор подразделения (если не было в профиле)
-    if step == "department":
+    # Шаг: выбор подразделения
+    if session.step == "department":
         if callback_id.startswith("lupa_dept_page_"):
             try:
                 page = int(callback_id.replace("lupa_dept_page_", ""))
             except ValueError:
                 return None
-            depts = state.get("departments") or []
-            state["dept_page"] = page
+            depts = session.data.get("departments") or []
+            _store.update_data(user_id, dept_page=page)
             return {
-                "text": "🔍 <b>Создание заявки о поиске (Lupa)</b>\n\nВыберите ваше подразделение (оно будет сохранено в профиль):",
+                "text": ticket_wizard.lupa_department_screen(depts).text,
                 "parse_mode": "HTML",
                 "buttons": _buttons_lupa_departments(depts, page),
             }
@@ -172,7 +154,7 @@ def handle_lupa_callback(user_id: int, callback_id: str) -> Optional[dict]:
                 idx = int(callback_id.replace("lupa_dept_", ""))
             except ValueError:
                 return None
-            depts = state.get("departments") or []
+            depts = session.data.get("departments") or []
             if idx < 0 or idx >= len(depts):
                 return None
             value = depts[idx]
@@ -180,99 +162,81 @@ def handle_lupa_callback(user_id: int, callback_id: str) -> Optional[dict]:
             profile = get_user_profile(user_id, CHANNEL_ID) or {}
             profile["department"] = value
             save_user_profile(primary, profile)
-            state["step"] = "service"
-            state["data"] = data
-            _flow[user_id] = state
+            _store.set_step(user_id, "service")
             return _lupa_service_screen()
 
     # Шаг 1: выбор сервиса
-    if step == "service" and callback_id in LUPA_SERVICE_VALUES:
+    if session.step == "service" and callback_id in LUPA_SERVICE_VALUES:
         service = LUPA_SERVICE_VALUES[callback_id]
-        data["problematic_service"] = service
-        state["data"] = data
-        state["step"] = "request_type"
+        _store.set_step(user_id, "request_type", data={"problematic_service": service})
         return {
-            "text": f"🔍 <b>Создание заявки о поиске</b>\n\n✅ Сервис: {service}\n\nШаг 2/5: Выберите тип запроса:",
+            "text": ticket_wizard.lupa_request_type_screen(service=service).text,
             "parse_mode": "HTML",
             "buttons": LUPA_REQUEST_TYPE_BUTTONS + CANCEL_BTN,
         }
 
     # Шаг 2: выбор типа запроса
-    if step == "request_type" and callback_id in LUPA_REQUEST_TYPE_VALUES:
+    if session.step == "request_type" and callback_id in LUPA_REQUEST_TYPE_VALUES:
         request_type = LUPA_REQUEST_TYPE_VALUES[callback_id]
-        data["request_type"] = request_type
         profile = get_user_profile(user_id, CHANNEL_ID) or {}
-        data["subdivision"] = (profile.get("department") or "").strip()
-        state["data"] = data
-        state["step"] = "city"
-        subdiv = data.get("subdivision") or "не указано"
+        subdivision = (profile.get("department") or "").strip()
+        _store.set_step(user_id, "city", data={"request_type": request_type, "subdivision": subdivision})
+        session = _store.get(user_id)
         return {
-            "text": (
-                "🔍 <b>Создание заявки о поиске</b>\n\n"
-                f"✅ Тип запроса: {request_type}\n"
-                f"✅ Подразделение: {subdiv}\n\n"
-                "Шаг 3/5: Укажите город:"
-            ),
+            "text": ticket_wizard.lupa_city_screen(request_type=request_type, subdivision=subdivision).text,
             "parse_mode": "HTML",
             "buttons": _city_buttons() + CANCEL_BTN,
         }
 
     # Шаг 3: выбор города
-    if step == "city" and callback_id.startswith("lupa_city_"):
+    if session.step == "city" and callback_id.startswith("lupa_city_"):
         if callback_id == "lupa_city_manual":
-            state["step"] = "city_manual"
+            _store.set_step(user_id, "city_manual")
             return {
-                "text": "🔍 <b>Создание заявки о поиске</b>\n\nШаг 3/5: Введите название города:",
+                "text": ticket_wizard.lupa_city_manual_screen().text,
                 "parse_mode": "HTML",
                 "buttons": CANCEL_BTN,
             }
         city = callback_id.replace("lupa_city_", "", 1).replace("_", " ")
-        data["city"] = city
-        state["data"] = data
-        state["step"] = "description"
+        _store.set_step(user_id, "description", data={"city": city})
+        session = _store.get(user_id)
         return {
-            "text": (
-                f"🔍 <b>Создание заявки о поиске</b>\n\n✅ Город: {city}\n\n"
-                "Шаг 4/5: Введите комментарий (описание проблемы). Можно пропустить, нажав кнопку ниже."
-            ),
+            "text": ticket_wizard.lupa_description_screen(city=city).text,
             "parse_mode": "HTML",
             "buttons": [{"id": "lupa_skip_comment", "label": "⏭ Пропустить комментарий"}, {"id": "cancel", "label": "❌ Отмена"}],
         }
 
     # Шаг 4: пропуск комментария → создание
-    if step == "description" and callback_id == "lupa_skip_comment":
-        data["description"] = ""
+    if session.step == "description" and callback_id == "lupa_skip_comment":
+        data = session.data
         profile = get_user_profile(user_id, CHANNEL_ID) or {}
         subdivision = (data.get("subdivision") or profile.get("department") or "").strip()
         form_data = {
-            "description": data.get("description", ""),
+            "description": "",
             "problematic_service": data.get("problematic_service", ""),
             "request_type": data.get("request_type", ""),
             "subdivision": subdivision,
             "city": data.get("city", ""),
         }
-        _flow.pop(user_id, None)
+        _store.clear(user_id)
         return {"create_ticket": {"ticket_type_id": "lupa_search", "form_data": form_data}}
 
     return None
 
 
 async def handle_lupa_message(user_id: int, text: str) -> Optional[dict]:
-    """Обработка текста: employee_id, город (вручную), комментарий → создание."""
-    state = _flow.get(user_id)
-    if not state:
+    session = _store.get(user_id)
+    if not session:
         return None
-    step = state.get("step")
-    data = state.get("data", {})
 
     if (text or "").strip().lower() in ("отмена", "cancel", "/cancel"):
-        _flow.pop(user_id, None)
+        _store.clear(user_id)
         from adapters.max.handlers import handle_main_menu
         return handle_main_menu(user_id)
 
     text_val = (text or "").strip()
 
-    if step == "employee_id":
+    if session.step == "employee_id":
         from validators import validate_employee_id
         ok, err = validate_employee_id(text_val)
         if not ok:
@@ -293,50 +257,39 @@ async def handle_lupa_message(user_id: int, text: str) -> Optional[dict]:
             from core.jira_departments import get_departments_async
             depts = await get_departments_async()
             if not depts:
-                _flow[user_id] = {"step": "service", "data": {**data}}
-                return {
-                    "text": "Список подразделений недоступен. Выберите сервис — подразделение можно указать в Личном кабинете.",
-                    "parse_mode": "HTML",
-                    "buttons": LUPA_SERVICE_BUTTONS + CANCEL_BTN,
-                }
-            _flow[user_id] = {
-                "step": "department",
-                "data": {**data},
-                "departments": depts,
-                "dept_page": 0,
-            }
+                _store.set_step(user_id, "service")
+                return {"text": "Список подразделений недоступен. Выберите сервис.", "parse_mode": "HTML", "buttons": LUPA_SERVICE_BUTTONS + CANCEL_BTN}
+            _store.set_step(user_id, "department", data={"departments": depts, "dept_page": 0})
             return {
-                "text": "🔍 <b>Создание заявки о поиске (Lupa)</b>\n\nВыберите ваше подразделение (оно будет сохранено в профиль):",
+                "text": ticket_wizard.lupa_department_screen(depts).text,
                 "parse_mode": "HTML",
                 "buttons": _buttons_lupa_departments(depts, 0),
             }
-        _flow[user_id] = {"step": "service", "data": {**data}}
+        _store.set_step(user_id, "service")
         return _lupa_service_screen()
 
-    if step == "city_manual":
+    if session.step == "city_manual":
         if not text_val:
             return {"text": "Введите название города или нажмите Отмена.", "parse_mode": "HTML", "buttons": CANCEL_BTN}
-        data["city"] = text_val
-        state["data"] = data
-        state["step"] = "description"
+        _store.set_step(user_id, "description", data={"city": text_val})
         return {
-            "text": f"✅ Город: {text_val}\n\nШаг 4/5: Введите комментарий (описание проблемы). Можно пропустить, нажав кнопку ниже.",
+            "text": ticket_wizard.lupa_description_screen(city=text_val).text,
             "parse_mode": "HTML",
             "buttons": [{"id": "lupa_skip_comment", "label": "⏭ Пропустить комментарий"}, {"id": "cancel", "label": "❌ Отмена"}],
         }
 
-    if step == "description":
-        data["description"] = text_val
+    if session.step == "description":
+        data = session.data
         profile = get_user_profile(user_id, CHANNEL_ID) or {}
         subdivision = (data.get("subdivision") or profile.get("department") or "").strip()
         form_data = {
-            "description": data.get("description", ""),
+            "description": text_val,
             "problematic_service": data.get("problematic_service", ""),
             "request_type": data.get("request_type", ""),
             "subdivision": subdivision,
             "city": data.get("city", ""),
         }
-        _flow.pop(user_id, None)
+        _store.clear(user_id)
         return {"create_ticket": {"ticket_type_id": "lupa_search", "form_data": form_data}}
 
     return None

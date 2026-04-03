@@ -10,7 +10,8 @@ from aiogram.types import Update
 
 # Интервал в секундах между запросами от одного пользователя
 DEFAULT_COOLDOWN = 0.75
-_throttle: Dict[int, float] = {}
+
+_CLEANUP_INTERVAL = 300.0  # чистим словарь каждые 5 минут
 
 
 def _get_user_id(update: Update) -> Optional[int]:
@@ -30,6 +31,20 @@ class AntispamMiddleware(BaseMiddleware):
 
     def __init__(self, cooldown: float = DEFAULT_COOLDOWN):
         self.cooldown = cooldown
+        self._throttle: Dict[int, float] = {}
+        self._last_cleanup: float = time.monotonic()
+
+    def _maybe_cleanup(self, now: float) -> None:
+        """Периодически удаляет давно неактивных пользователей из словаря throttle.
+
+        Без очистки словарь растёт бесконечно по мере появления новых уникальных user_id,
+        что приводит к медленной утечке памяти за время работы бота.
+        """
+        if now - self._last_cleanup < _CLEANUP_INTERVAL:
+            return
+        cutoff = now - self.cooldown * 20
+        self._throttle = {uid: ts for uid, ts in self._throttle.items() if ts > cutoff}
+        self._last_cleanup = now
 
     async def __call__(
         self,
@@ -42,7 +57,9 @@ class AntispamMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         now = time.monotonic()
-        last = _throttle.get(user_id, 0.0)
+        self._maybe_cleanup(now)
+
+        last = self._throttle.get(user_id, 0.0)
         if now - last < self.cooldown:
             # Слишком частый запрос — не вызываем handler
             if event.callback_query:
@@ -53,5 +70,5 @@ class AntispamMiddleware(BaseMiddleware):
             # Для сообщений не отвечаем, чтобы не поощрять спам
             return None
 
-        _throttle[user_id] = now
+        self._throttle[user_id] = now
         return await handler(event, data)

@@ -48,23 +48,6 @@ class WmsTicketStates(StatesGroup):
     WAITING_FOR_ATTACHMENTS = State()
 
 
-class WmsSettingsStates(StatesGroup):
-    """Изменение настроек системы WMS: подразделение → тип услуги (топология/другие) → описание → вложения (обязательно) → завершить."""
-    WAITING_DEPARTMENT = State()
-    WAITING_SERVICE_TYPE = State()
-    WAITING_DESCRIPTION = State()
-    WAITING_ATTACHMENTS = State()
-
-
-class PsiUserStates(StatesGroup):
-    """Создать/изменить/удалить пользователя PSIwms: тема → ФИО+должность → подразделение → комментарий → вложения (опционально) → завершить."""
-    WAITING_TITLE = State()
-    WAITING_FULL_NAME = State()
-    WAITING_DEPARTMENT = State()
-    WAITING_COMMENT = State()
-    WAITING_ATTACHMENTS = State()
-
-
 class CabinetEditStates(StatesGroup):
     """Редактирование одного поля в личном кабинете."""
     WAITING_VALUE = State()
@@ -87,80 +70,83 @@ class TpSectionStates(StatesGroup):
     WAITING_EMPLOYEE_ID = State()
 
 
-class LupaTicketStates(StatesGroup):
-    """Заявка Lupa (как the_bot_lupa): подразделение (если нет в профиле) → сервис → тип запроса → город → комментарий."""
-    WAITING_FOR_DEPARTMENT = State()  # запрос подразделения из Jira, если в профиле пусто
-    SELECT_PROBLEMATIC_SERVICE = State()
-    SELECT_REQUEST_TYPE = State()
-    ENTER_CITY = State()
-    ENTER_CITY_MANUAL = State()  # ввод города текстом после «Ввести вручную»
-    WAITING_FOR_DESCRIPTION = State()  # комментарий (можно пропустить)
+class TicketWizardStates(StatesGroup):
+    """TicketWizard (transport-agnostic): этапы первого мигрируемого сценария wms_issue."""
+    WMS_ISSUE_DEPARTMENT = State()
+    WMS_ISSUE_PROCESS = State()
+    WMS_ISSUE_SUMMARY = State()
+    WMS_ISSUE_DESCRIPTION = State()
 
+    # Lupa (lupa_search)
+    LUPA_DEPARTMENT = State()
+    LUPA_SERVICE = State()
+    LUPA_REQUEST_TYPE = State()
+    LUPA_CITY = State()
+    LUPA_CITY_MANUAL = State()
+    LUPA_DESCRIPTION = State()
 
-class PcIssueStates(StatesGroup):
-    """Заявка «Проблема в работе ПК»: категория проблемы → описание (можно пропустить) → вложения (можно пропустить)."""
-    WAITING_FOR_KIND = State()
-    WAITING_FOR_DESCRIPTION = State()
-    WAITING_FOR_ATTACHMENTS = State()
+    # WMS settings (wms_settings)
+    WMS_SETTINGS_DEPARTMENT = State()
+    WMS_SETTINGS_SERVICE_TYPE = State()
+    WMS_SETTINGS_DESCRIPTION = State()
+    WMS_SETTINGS_ATTACHMENTS = State()
 
+    # PSI user (wms_psi_user)
+    PSI_TITLE = State()
+    PSI_FULL_NAME = State()
+    PSI_DEPARTMENT = State()
+    PSI_COMMENT = State()
+    PSI_ATTACHMENTS = State()
 
-class EmailOwaStates(StatesGroup):
-    """Заявка «Электронная почта (Owa\\Outlook)»: запрос → RMS/IP → рабочее место (опц.) → описание → вложения (опц.)."""
-    WAITING_FOR_REQUEST_KIND = State()
-    WAITING_FOR_RMS_OR_IP = State()
-    WAITING_FOR_WORKPLACE = State()
-    WAITING_FOR_DESCRIPTION = State()
-    WAITING_FOR_ATTACHMENTS = State()
+    # PC problem (pc_problem)
+    PC_KIND = State()
+    PC_DESCRIPTION = State()
+    PC_ATTACHMENTS = State()
 
+    # Orgtech (orgtech_problem)
+    ORGTECH_KIND = State()
+    ORGTECH_LOCATION = State()
+    ORGTECH_DESCRIPTION = State()
+    ORGTECH_ATTACHMENTS = State()
 
-class OrgtechIssueStates(StatesGroup):
-    """Заявка «Оргтехника»: тип → местоположение → описание (опц.) → вложения (опц.)."""
-    WAITING_FOR_KIND = State()
-    WAITING_FOR_LOCATION = State()
-    WAITING_FOR_DESCRIPTION = State()
-    WAITING_FOR_ATTACHMENTS = State()
+    # Peripheral (peripheral_equipment)
+    PERIPHERAL_KIND = State()
+    PERIPHERAL_IP = State()
+    PERIPHERAL_DESCRIPTION = State()
+    PERIPHERAL_ATTACHMENTS = State()
 
+    # Network (network_problem)
+    NETWORK_TYPE = State()
+    NETWORK_WIFI_OWNER = State()
+    NETWORK_PC_TYPE = State()
+    NETWORK_PROVIDER = State()
+    NETWORK_PROVIDER_OTHER = State()
+    NETWORK_RMS = State()
+    NETWORK_DESCRIPTION = State()
+    NETWORK_ATTACHMENTS = State()
 
-class PeripheralEquipmentStates(StatesGroup):
-    """Заявка «Периферийное оборудование»: вид → IP (обяз.) → описание (опц.) → вложения (опц.)."""
-    WAITING_FOR_KIND = State()
-    WAITING_FOR_IP = State()
-    WAITING_FOR_DESCRIPTION = State()
-    WAITING_FOR_ATTACHMENTS = State()
+    # Electronic queue
+    EQUEUE_SERVICE_TYPE = State()
+    EQUEUE_DESCRIPTION = State()
 
+    # Email OWA
+    EMAIL_OWA_REQUEST_KIND = State()
+    EMAIL_OWA_RMS_OR_IP = State()
+    EMAIL_OWA_WORKPLACE = State()
+    EMAIL_OWA_DESCRIPTION = State()
+    EMAIL_OWA_ATTACHMENTS = State()
 
-class NetworkIssueStates(StatesGroup):
-    """Заявка «Проблемы в работе сети» с ветвлением по типу сети."""
-    WAITING_FOR_NETWORK_TYPE = State()
-    WAITING_FOR_PROVIDER = State()
-    WAITING_FOR_PROVIDER_OTHER = State()
-    WAITING_FOR_WIFI_OWNER = State()
-    WAITING_FOR_PC_TYPE = State()
-    WAITING_FOR_RMS = State()
-    WAITING_FOR_DESCRIPTION = State()
-    WAITING_FOR_ATTACHMENTS = State()
+    # Email forwarding
+    EMAIL_FORWARDING_ON_OFF = State()
+    EMAIL_FORWARDING_FROM = State()
+    EMAIL_FORWARDING_TO = State()
+    EMAIL_FORWARDING_DATE = State()
 
-
-class ElectronicQueueStates(StatesGroup):
-    """Заявка «Электронная очередь»: тип услуги -> описание."""
-    WAITING_FOR_SERVICE_TYPE = State()
-    WAITING_FOR_DESCRIPTION = State()
-
-
-class EmailForwardingStates(StatesGroup):
-    """Переадресация: on/off -> from -> to -> date."""
-    WAITING_FOR_ON_OFF = State()
-    WAITING_FOR_EMAIL_FROM = State()
-    WAITING_FOR_EMAIL_TO = State()
-    WAITING_FOR_DATE = State()
-
-
-class EmailGroupsStates(StatesGroup):
-    """Группы рассылки: what_to_do -> ветвление по сценарию."""
-    WAITING_FOR_WHAT_TO_DO = State()
-    WAITING_FOR_GROUP_NAME = State()
-    WAITING_FOR_GROUP_OWNER = State()
-    WAITING_FOR_GROUP_MEMBERSHIP = State()
-    WAITING_FOR_GROUP_EMAIL = State()
-    WAITING_FOR_AD_LOGIN = State()
-    WAITING_FOR_DESCRIPTION = State()
+    # Email groups
+    EMAIL_GROUPS_WHAT_TO_DO = State()
+    EMAIL_GROUPS_GROUP_NAME = State()
+    EMAIL_GROUPS_OWNER = State()
+    EMAIL_GROUPS_MEMBERSHIP = State()
+    EMAIL_GROUPS_GROUP_EMAIL = State()
+    EMAIL_GROUPS_AD_LOGIN = State()
+    EMAIL_GROUPS_DESCRIPTION = State()

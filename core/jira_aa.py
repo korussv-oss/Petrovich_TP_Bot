@@ -6,6 +6,7 @@
 import asyncio
 import logging
 import json
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin
@@ -14,11 +15,39 @@ import aiohttp
 
 from config import CONFIG
 from validators import validate_issue_key, sanitize_jira_text
+from core.jira_retry import retry_jira
 
 logger = logging.getLogger(__name__)
 
 JIRA_AA = CONFIG.get("JIRA_AA", {})
 FIELDS = JIRA_AA.get("FIELDS", {})
+
+# -----------------------------------------------------------------------------
+# Lightweight in-memory caches (TTL) + in-flight dedup for Jira reads
+# -----------------------------------------------------------------------------
+
+# key -> (expires_at_mono, value)
+_JIRA_TTL_CACHE: dict[tuple, tuple[float, Any]] = {}
+# key -> asyncio.Task
+_JIRA_INFLIGHT: dict[tuple, asyncio.Task] = {}
+
+
+def _cache_get(key: tuple) -> Any | None:
+    now = time.monotonic()
+    entry = _JIRA_TTL_CACHE.get(key)
+    if not entry:
+        return None
+    exp, val = entry
+    if exp <= now:
+        _JIRA_TTL_CACHE.pop(key, None)
+        return None
+    return val
+
+
+def _cache_set(key: tuple, val: Any, ttl_seconds: float) -> None:
+    if ttl_seconds <= 0:
+        return
+    _JIRA_TTL_CACHE[key] = (time.monotonic() + float(ttl_seconds), val)
 
 
 def _safe_issue_key(issue_key: str) -> Optional[str]:
@@ -262,7 +291,8 @@ async def get_issue_status(issue_key: str) -> Optional[str]:
     return info.get("status") if info else None
 
 
-async def get_issue_info(issue_key: str) -> Optional[Dict[str, Any]]:
+@retry_jira(max_attempts=3, base_delay=1.0)
+async def _get_issue_info_http(issue_key: str) -> Optional[Dict[str, Any]]:
     """
     Возвращает краткую информацию о задаче: summary, status, description (первые 200 символов).
     Нужно для экрана «Мои заявки» → просмотр заявки (TG и MAX).
@@ -296,6 +326,44 @@ async def get_issue_info(issue_key: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+async def get_issue_info(
+    issue_key: str,
+    *,
+    timeout_total: float | None = None,
+    ttl_seconds: float = 20.0,
+) -> Optional[Dict[str, Any]]:
+    """
+    Cached + in-flight dedup wrapper around Jira issue info.
+
+    - ttl_seconds: короткий TTL для интерактивных экранов (уменьшает повторные запросы)
+    - timeout_total: если задан, ограничивает общее ожидание (включая retries) через asyncio.wait_for
+    """
+    key = ("get_issue_info", (issue_key or "").strip().upper())
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
+    task = _JIRA_INFLIGHT.get(key)
+    if task is None or task.done():
+        task = asyncio.create_task(_get_issue_info_http(issue_key))
+        _JIRA_INFLIGHT[key] = task
+
+    try:
+        if timeout_total is not None:
+            result = await asyncio.wait_for(task, timeout=float(timeout_total))
+        else:
+            result = await task
+    finally:
+        # cleanup finished tasks
+        if task.done():
+            _JIRA_INFLIGHT.pop(key, None)
+
+    if result is not None:
+        _cache_set(key, result, ttl_seconds)
+    return result
+
+
+@retry_jira(max_attempts=3, base_delay=1.0)
 async def get_issue_admin_details(issue_key: str) -> Optional[Dict[str, Any]]:
     """
     Расширенная информация о задаче для карточки СА:
@@ -341,6 +409,78 @@ async def get_issue_admin_details(issue_key: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.debug("get_issue_admin_details %s: %s", issue_key, e)
         return None
+
+
+async def get_issues_admin_details_batch(
+    issue_keys: List[str],
+    *,
+    batch_size: int = 50,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Batch-версия get_issue_admin_details: одним JQL-запросом получает детали
+    нескольких заявок (вместо N отдельных HTTP-запросов).
+
+    Возвращает dict: issue_key -> details (та же структура, что у get_issue_admin_details).
+    Заявки, которые Jira не вернула, отсутствуют в результате.
+    """
+    if not issue_keys:
+        return {}
+    jira = CONFIG.get("JIRA", {})
+    base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
+    token = (jira.get("TOKEN") or "").strip()
+    if not base_url or not token:
+        logger.error("JIRA LOGIN_URL или TOKEN не задан")
+        return {}
+
+    fields_param = ["summary", "status", "description", "assignee", "reporter", "issuetype", "project"]
+    headers = {"Accept": "application/json", "Content-Type": "application/json",
+               "Authorization": f"Bearer {token}"}
+    url = urljoin(base_url + "/", "rest/api/2/search")
+    result: Dict[str, Dict[str, Any]] = {}
+
+    valid_keys = [k for k in issue_keys if _safe_issue_key(k)]
+    for start in range(0, len(valid_keys), batch_size):
+        chunk = valid_keys[start: start + batch_size]
+        jql = "key in (" + ", ".join(chunk) + ")"
+        payload = {"jql": jql, "fields": fields_param, "maxResults": batch_size, "startAt": 0}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=payload, headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning("get_issues_admin_details_batch: HTTP %s for chunk %s..%s",
+                                       resp.status, start, start + len(chunk))
+                        continue
+                    data = await resp.json()
+                    for issue in data.get("issues") or []:
+                        key = (issue.get("key") or "").strip().upper()
+                        if not key:
+                            continue
+                        f = issue.get("fields") or {}
+                        status_obj = f.get("status") or {}
+                        assignee_obj = f.get("assignee") or {}
+                        reporter_obj = f.get("reporter") or {}
+                        issuetype_obj = f.get("issuetype") or {}
+                        project_obj = f.get("project") or {}
+                        desc = (f.get("description") or "").strip()
+                        if desc and len(desc) > 800:
+                            desc = desc[:800] + "..."
+                        result[key] = {
+                            "summary": (f.get("summary") or "").strip(),
+                            "status": (status_obj.get("name") or "").strip(),
+                            "description": desc,
+                            "assignee_display": (assignee_obj.get("displayName") or "").strip(),
+                            "assignee_username": (assignee_obj.get("name") or assignee_obj.get("key") or "").strip(),
+                            "reporter_display": (reporter_obj.get("displayName") or "").strip(),
+                            "reporter_username": (reporter_obj.get("name") or reporter_obj.get("key") or "").strip(),
+                            "issue_type": (issuetype_obj.get("name") or "").strip(),
+                            "project_key": (project_obj.get("key") or "").strip().upper(),
+                        }
+        except Exception as e:
+            logger.warning("get_issues_admin_details_batch chunk %s..%s: %s", start, start + len(chunk), e)
+    return result
 
 
 async def get_issue_transitions(issue_key: str) -> list:
@@ -544,6 +684,9 @@ async def get_issue_comments(
     issue_key: str,
     include_internal: bool = False,
     return_http_status: bool = False,
+    *,
+    timeout_total: float | None = None,
+    ttl_seconds: float = 10.0,
 ) -> Any:
     """
     Возвращает список комментариев задачи или None при сетевой/HTTP ошибке (не путать с пустым списком).
@@ -553,6 +696,42 @@ async def get_issue_comments(
     Важно: Jira REST отдает комментарии постранично. Раньше код без `startAt/maxResults` мог возвращать
     только первые комментарии, из-за чего уведомления “о новых комментариях” не срабатывали.
     """
+    cache_key = (
+        "get_issue_comments",
+        (issue_key or "").strip().upper(),
+        bool(include_internal),
+        bool(return_http_status),
+    )
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # in-flight dedup (без return_http_status в key было бы проще, но сохраняем совместимость типов)
+    task = _JIRA_INFLIGHT.get(cache_key)
+    if task is None or task.done():
+        task = asyncio.create_task(_get_issue_comments_uncached(issue_key, include_internal=include_internal, return_http_status=return_http_status))
+        _JIRA_INFLIGHT[cache_key] = task
+
+    try:
+        if timeout_total is not None:
+            result = await asyncio.wait_for(task, timeout=float(timeout_total))
+        else:
+            result = await task
+    finally:
+        if task.done():
+            _JIRA_INFLIGHT.pop(cache_key, None)
+
+    # Кэшируем даже None на короткое время, чтобы “дёрганье” кнопки не делало N одинаковых запросов.
+    _cache_set(cache_key, result, ttl_seconds)
+    return result
+
+
+async def _get_issue_comments_uncached(
+    issue_key: str,
+    *,
+    include_internal: bool = False,
+    return_http_status: bool = False,
+) -> Any:
     jira = CONFIG.get("JIRA", {})
     base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
     token = (jira.get("TOKEN") or "").strip()
@@ -633,7 +812,8 @@ async def get_issue_comments(
         filtered = [c for c in all_comments if not _is_internal_comment(c)]
         return (filtered, 200) if return_http_status else filtered
     except Exception as e:
-        logger.warning("get_issue_comments %s: %s", issue_key, e)
+        # str(TimeoutError()) is empty on some platforms, so log type too.
+        logger.warning("get_issue_comments %s: %s: %r", issue_key, type(e).__name__, e)
         return (None, None) if return_http_status else None
 
 

@@ -1,5 +1,6 @@
 """Логика роли «Системный администратор СТЦ»."""
 
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import is_stc_sa
@@ -41,6 +42,24 @@ def _creator_pairs(issue_key: str) -> List[Tuple[str, int]]:
     return out
 
 
+def get_issue_creator_phone(issue_key: str) -> str:
+    """
+    Телефон заявителя по реестру привязок.
+    Берём первый непустой phone из профиля пользователя, который создавал заявку через бота.
+    """
+    for b in get_bindings_by_issue(issue_key):
+        ch = (b.get("channel_id") or "telegram").strip().lower()
+        try:
+            uid = int(b.get("channel_user_id"))
+        except Exception:
+            continue
+        profile = get_user_profile(uid, ch) or {}
+        phone = (profile.get("phone") or "").strip()
+        if phone:
+            return phone
+    return ""
+
+
 async def can_stc_user_access_issue(channel_id: str, user_id: int, issue_key: str) -> bool:
     """Доступ СА СТЦ к заявке: роль + заявка из реестра + assignee == jira_username пользователя."""
     if not is_stc_sa(channel_id, user_id):
@@ -64,7 +83,7 @@ async def can_stc_user_access_issue(channel_id: str, user_id: int, issue_key: st
 async def get_stc_assignee_tasks(channel_id: str, user_id: int) -> List[Dict[str, Any]]:
     """
     Список заявок из реестра (созданы через бота), где assignee == jira_username текущего СА СТЦ.
-    Включаются все заявки из реестра, где пользователь текущий assignee.
+    Все детали запрашиваются параллельно (asyncio.gather + семафор), чтобы избежать N+1 запросов к Jira.
     """
     if not is_stc_sa(channel_id, user_id):
         return []
@@ -72,23 +91,37 @@ async def get_stc_assignee_tasks(channel_id: str, user_id: int) -> List[Dict[str
     my_jira = _norm(profile.get("jira_username") or "")
     if not my_jira:
         return []
+
+    all_keys = get_all_issue_keys()
+    if not all_keys:
+        return []
+
+    semaphore = asyncio.Semaphore(5)
+
+    async def _fetch(key: str):
+        async with semaphore:
+            return key, await get_issue_admin_details(key)
+
+    results = await asyncio.gather(*[_fetch(k) for k in all_keys], return_exceptions=True)
+
+    from core.support.api import get_ticket_type_label
     tasks: List[Dict[str, Any]] = []
-    for issue_key in get_all_issue_keys():
-        bindings = get_bindings_by_issue(issue_key)
-        if not bindings:
+    for result in results:
+        if isinstance(result, Exception):
             continue
-        info = await get_issue_admin_details(issue_key)
+        issue_key, info = result
         if not info:
             continue
         assignee = _norm(info.get("assignee_username") or "")
         if assignee != my_jira:
             continue
         status = _norm(info.get("status") or "")
-        # Поведение как в «Мои заявки»: скрываем финальные/закрытые статусы.
         if status in MY_TICKETS_EXCLUDED_STATUSES:
             continue
+        bindings = get_bindings_by_issue(issue_key)
+        if not bindings:
+            continue
         first = bindings[0]
-        from core.support.api import get_ticket_type_label
         tasks.append(
             {
                 "issue_key": issue_key,

@@ -1,6 +1,10 @@
-# План подключения Supabase вместо JSON-хранилища
+# План подключения Supabase вместо JSON-хранилища (через этап SQLite)
 
-Коллега рекомендует заменить файловое хранение (JSON) на Supabase (PostgreSQL + REST/Realtime API). Ниже — пошаговый план без изменения текущего поведения для пользователей.
+Коллега рекомендует заменить файловое хранение (JSON) на Supabase (PostgreSQL + REST/Realtime API).
+
+**Актуальный статус проекта:** сейчас реализовано локальное хранилище **SQLite** (вместо JSON). Supabase остаётся следующим этапом, если понадобится масштабирование (несколько процессов/серверов) и единый центральный источник данных.
+
+Ниже — план перехода на Supabase **без изменения поведения для пользователей** и с минимальными рисками (через переключатель в `.env`).
 
 ---
 
@@ -31,6 +35,29 @@
 | `data/departments_cache.json` | Кэш подразделений AA из Jira | `core/jira_departments.py` |
 
 Кэши (wms_departments, departments) можно оставить в JSON или тоже перенести в Supabase — по желанию.
+
+---
+
+## 2.1. Что уже сделано: SQLite вместо JSON
+
+Сейчас данные хранятся в файле SQLite:
+
+- `data/storage.sqlite3`
+
+Переключатель (в `.env`):
+
+```env
+USE_SQLITE_STORAGE=1
+# SQLITE_PATH=data/storage.sqlite3   # опционально: если нужен другой путь
+```
+
+Миграция данных из старых JSON выполняется один раз:
+
+```bash
+python scripts/migrate_json_to_sqlite.py
+```
+
+После этого бот может работать полностью на SQLite, а старые JSON можно оставить как резерв до завершения проверки.
 
 ---
 
@@ -97,6 +124,13 @@ SUPABASE_URL=https://xxxxx.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=eyJ...   # для серверного доступа (полные права)
 # либо для ограниченных прав:
 # SUPABASE_ANON_KEY=eyJ...
+```
+
+Также остаётся переключатель SQLite (на время перехода удобно иметь оба варианта):
+
+```env
+USE_SQLITE_STORAGE=1
+SQLITE_PATH=data/storage.sqlite3
 ```
 
 ### 4.1. Локальный Supabase (развёртывание на своей машине)
@@ -209,6 +243,66 @@ supabase>=2.0.0
 - иначе — вызывать текущие функции из `user_storage`, `issue_binding_registry`, `notifications`, `password_requests` (обёртки над JSON).
 
 Тогда `user_storage.py`, `issue_binding_registry.py`, логика в `notifications.py` и `password_requests.py` по очереди переключаются на вызов этого слоя; при этом сигнатуры публичных функций остаются теми же.
+
+---
+
+## 6.8. Переход SQLite → Supabase (как сделать позже, без переписывания бота)
+
+Идея: **не трогать бизнес-логику**, а заменить только “куда читаем/пишем данные”.
+
+### Шаг A. Поднять Supabase
+
+- **Dev (Windows):** поднять локально через Docker/CLI (раздел 4.1)
+- **Prod (Linux):** облачный Supabase или собственный Postgres/Supabase внутри компании
+
+### Шаг B. Создать таблицы в Supabase
+
+Выполнить DDL из раздела 3 (profiles, channel_links, issue_bindings, issue_notification_state, pending_password_requests).
+
+### Шаг C. Добавить Supabase backend параллельно SQLite
+
+Сделать модуль `core/storage/supabase_backend.py` с теми же операциями, что уже есть для SQLite:
+
+- профили пользователей
+- привязки MAX↔TG
+- реестр issue_bindings
+- issue_notification_state
+- pending_password_requests
+
+Важно: **контракт функций должен быть одинаковый**, чтобы переключение было только через `.env`.
+
+### Шаг D. Скрипт миграции SQLite → Supabase
+
+Написать `scripts/migrate_sqlite_to_supabase.py`:
+
+1. Читать данные из `data/storage.sqlite3`
+2. Вставить/обновить строки в Supabase (upsert)
+3. Проверить количества записей и несколько выборочных пользователей/привязок
+
+### Шаг E. Переключить хранилище флагом
+
+В `.env` на сервере:
+
+```env
+USE_SUPABASE=1
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...
+
+# На всякий случай оставить рядом (для отката)
+USE_SQLITE_STORAGE=0
+SQLITE_PATH=data/storage.sqlite3
+```
+
+### Шаг F. План отката
+
+Если что-то пошло не так — вернуть:
+
+```env
+USE_SUPABASE=0
+USE_SQLITE_STORAGE=1
+```
+
+И бот продолжит работать на локальной базе SQLite без потери работоспособности.
 
 ### Шаг 3. Реализация бэкенда Supabase
 

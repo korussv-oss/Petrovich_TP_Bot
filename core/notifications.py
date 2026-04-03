@@ -23,6 +23,10 @@ from core.jira_status_ru import jira_status_display_ru
 
 logger = logging.getLogger(__name__)
 
+# SQLite storage (optional)
+from core.storage import use_sqlite_storage
+from core.storage import sqlite_backend as _sqlite
+
 STATUS_RESOLVED = frozenset({"resolved", "готово", "исправлено", "done", "closed", "закрыто", "выполнена", "выполнено"})
 STATUS_REJECTED = frozenset({"отклонено", "rejected", "declined", "отклонена"})
 # Статусы, при смене на которые уведомление «Новый статус» не отправляется (ни в ТГ, ни в MAX)
@@ -34,39 +38,29 @@ STC_ASSIGN_NOTIFY_QUEUE_FILE = (
 )
 
 
-def _stc_notify_tz() -> ZoneInfo:
-    return ZoneInfo(os.getenv("STC_NOTIFY_TZ", "Europe/Moscow"))
-
-
-def _stc_notify_work_hours() -> Tuple[dtime, dtime]:
-    start_h = int(os.getenv("STC_NOTIFY_HOUR_START", "8"))
-    end_h = int(os.getenv("STC_NOTIFY_HOUR_END", "17"))
-    return (dtime(start_h, 0, 0), dtime(end_h, 0, 0))
-
-
-def _stc_business_hours_enabled() -> bool:
-    return os.getenv("STC_NOTIFY_BUSINESS_HOURS", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
+# Настройки рабочих часов СТЦ читаются один раз при загрузке модуля.
+# Это устраняет повторные вызовы os.getenv() при каждом тике фонового цикла.
+_STC_TZ: ZoneInfo = ZoneInfo(os.getenv("STC_NOTIFY_TZ", "Europe/Moscow"))
+_STC_HOUR_START: dtime = dtime(int(os.getenv("STC_NOTIFY_HOUR_START", "8")), 0, 0)
+_STC_HOUR_END: dtime = dtime(int(os.getenv("STC_NOTIFY_HOUR_END", "17")), 0, 0)
+_STC_BUSINESS_HOURS_ENABLED: bool = os.getenv("STC_NOTIFY_BUSINESS_HOURS", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 
 
 def _now_moscow() -> datetime:
-    return datetime.now(_stc_notify_tz())
+    return datetime.now(_STC_TZ)
 
 
 def is_stc_moscow_business_hours(now: Optional[datetime] = None) -> bool:
     """Будни, интервал [08:00, 17:00) по Москве (настраивается через STC_NOTIFY_HOUR_*)."""
-    if not _stc_business_hours_enabled():
+    if not _STC_BUSINESS_HOURS_ENABLED:
         return True
-    now = _now_moscow() if now is None else now.astimezone(_stc_notify_tz())
+    now = _now_moscow() if now is None else now.astimezone(_STC_TZ)
     if now.weekday() >= 5:
         return False
-    work_start, work_end = _stc_notify_work_hours()
     t = now.time()
-    return work_start <= t < work_end
+    return _STC_HOUR_START <= t < _STC_HOUR_END
 
 
 def next_stc_moscow_workday_delivery_time(from_dt: Optional[datetime] = None) -> datetime:
@@ -74,9 +68,9 @@ def next_stc_moscow_workday_delivery_time(from_dt: Optional[datetime] = None) ->
     Ближайший момент «08:00 в ближайший рабочий день» (МСК): сегодня в 8:00, если ещё не наступило,
     иначе следующий рабочий день в 8:00 (выходные пропускаются).
     """
-    tz = _stc_notify_tz()
+    tz = _STC_TZ
     now = _now_moscow() if from_dt is None else from_dt.astimezone(tz)
-    work_start, work_end = _stc_notify_work_hours()
+    work_start, work_end = _STC_HOUR_START, _STC_HOUR_END
     d = now.date()
     t = now.time()
 
@@ -134,9 +128,9 @@ def _enqueue_stc_assign_notification(issue_key: str, assignee_username: str, del
     if not key or not assignee_username:
         return
     if deliver_after.tzinfo is None:
-        deliver_after = deliver_after.replace(tzinfo=_stc_notify_tz())
+        deliver_after = deliver_after.replace(tzinfo=_STC_TZ)
     else:
-        deliver_after = deliver_after.astimezone(_stc_notify_tz())
+        deliver_after = deliver_after.astimezone(_STC_TZ)
     q = _load_stc_assign_queue()
     q[key] = {
         "assignee_username": assignee_username.strip().lower(),
@@ -178,7 +172,7 @@ def _format_stc_new_task_message(
 
 async def flush_stc_assign_notification_queue() -> None:
     """Отправить отложенные уведомления СА СТЦ, у которых наступило время доставки (МСК)."""
-    if not _stc_business_hours_enabled():
+    if not _STC_BUSINESS_HOURS_ENABLED:
         return
     q = _load_stc_assign_queue()
     if not q:
@@ -198,9 +192,9 @@ async def flush_stc_assign_notification_queue() -> None:
             changed = True
             continue
         if deliver_after.tzinfo is None:
-            deliver_after = deliver_after.replace(tzinfo=_stc_notify_tz())
+            deliver_after = deliver_after.replace(tzinfo=_STC_TZ)
         else:
-            deliver_after = deliver_after.astimezone(_stc_notify_tz())
+            deliver_after = deliver_after.astimezone(_STC_TZ)
         if now < deliver_after:
             continue
         queued_assignee = (entry.get("assignee_username") or "").strip().lower()
@@ -251,6 +245,9 @@ async def flush_stc_assign_notification_queue() -> None:
 
 
 def _load_state() -> Dict[str, Dict[str, Any]]:
+    if use_sqlite_storage():
+        # SQLite: читаем одним запросом (иначе N запросов на каждый тик фонового цикла).
+        return _sqlite.list_notification_states()
     if not STATE_FILE.exists():
         return {}
     try:
@@ -263,6 +260,14 @@ def _load_state() -> Dict[str, Dict[str, Any]]:
 
 
 def _save_state(data: Dict[str, Dict[str, Any]]) -> None:
+    if use_sqlite_storage():
+        # SQLite: bulk-upsert за один проход (меньше блокирует event-loop)
+        t0 = time.monotonic()
+        _sqlite.upsert_notification_states_bulk(data or {})
+        dt = time.monotonic() - t0
+        if dt > 0.2:
+            logger.warning("SQLite: upsert_notification_states_bulk занял %.3fs (keys=%s)", dt, len(data or {}))
+        return
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -438,6 +443,9 @@ async def check_registry_statuses_and_notify() -> None:
     """
     Проверяет статусы всех заявок из реестра привязок.
     При переходе в Resolved/Rejected/Done/Closed — уведомление в TG и MAX (все привязанные каналы).
+
+    Статусы запрашиваются параллельно через asyncio.gather + семафор (не более 5 запросов к Jira
+    одновременно), что устраняет накопленный asyncio.sleep(0.3) на каждый тикет.
     """
     from core.jira_aa import get_issue_status
     from core.password_requests import remove_pending
@@ -445,13 +453,25 @@ async def check_registry_statuses_and_notify() -> None:
     issue_keys = get_all_issue_keys()
     if not issue_keys:
         return
-    for issue_key in issue_keys:
+
+    _semaphore = asyncio.Semaphore(5)
+
+    async def _fetch_status(key: str):
+        async with _semaphore:
+            return key, await get_issue_status(key)
+
+    raw_results = await asyncio.gather(*[_fetch_status(k) for k in issue_keys], return_exceptions=True)
+
+    for result in raw_results:
+        if isinstance(result, Exception):
+            logger.warning("Ошибка проверки статуса: %s", result)
+            continue
+        issue_key, status = result
         try:
             recipients = get_user_ids_by_issue(issue_key)
             recipients = _expand_recipients_to_linked_channels(recipients)
             if not recipients:
                 continue
-            status = await get_issue_status(issue_key)
             if not status:
                 continue
             status_lower = status.lower().strip()
@@ -497,8 +517,7 @@ async def check_registry_statuses_and_notify() -> None:
                     except Exception as e:
                         logger.warning("Не удалось отправить уведомление о статусе %s -> %s/%s: %s", issue_key, channel_id, user_id, e)
         except Exception as e:
-            logger.warning("Ошибка проверки статуса %s: %s", issue_key, e)
-        await asyncio.sleep(0.3)
+            logger.warning("Ошибка обработки статуса %s: %s", issue_key, e)
 
 
 async def check_registry_comments_and_notify() -> None:
@@ -524,13 +543,29 @@ async def check_registry_comments_and_notify() -> None:
     issue_keys = get_all_issue_keys()
     if not issue_keys:
         return
-    for issue_key in issue_keys:
+    # Чтобы бот не "зависал" на большом реестре, проверяем ограниченное количество заявок за тик
+    # и ходим по ним по кругу (round-robin).
+    per_tick = max(5, int(os.getenv("COMMENTS_ISSUES_PER_TICK", "15")))
+    global _comments_rr_cursor
+    try:
+        _comments_rr_cursor
+    except NameError:
+        _comments_rr_cursor = 0
+    start = int(_comments_rr_cursor) % max(1, len(issue_keys))
+    window = issue_keys[start : start + per_tick]
+    if len(window) < min(per_tick, len(issue_keys)):
+        window = window + issue_keys[: max(0, per_tick - len(window))]
+    _comments_rr_cursor = (start + len(window)) % max(1, len(issue_keys))
+
+    include_internal = (os.getenv("COMMENTS_INCLUDE_INTERNAL") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    for issue_key in window:
         try:
             recipients = get_user_ids_by_issue(issue_key)
             recipients = _expand_recipients_to_linked_channels(recipients)
             if not recipients:
                 continue
-            comments_resp = await get_issue_comments(issue_key, return_http_status=True)
+            comments_resp = await get_issue_comments(issue_key, return_http_status=True, include_internal=include_internal)
             # comments_resp: (comments_or_none, http_status_or_none)
             comments, http_status = comments_resp if isinstance(comments_resp, tuple) and len(comments_resp) == 2 else (None, None)
             if comments is None:
@@ -584,12 +619,16 @@ async def check_registry_comments_and_notify() -> None:
                                 state2[k2].pop("jira_comment_error_streak", None)
                                 _save_state(state2)
                 continue
-                continue
             current_count = len(comments)
             last_count = _get_last_comment_count(issue_key)
             if last_count is None:
-                _set_last_comment_count(issue_key, current_count)
-                continue
+                # Первый опрос по заявке. Чтобы не терять «первый комментарий» на свежих заявках,
+                # отправляем уведомление, если привязка свежая и комментариев немного.
+                if current_count > 0 and _is_recent_issue_binding(issue_key) and current_count <= 5:
+                    last_count = 0
+                else:
+                    _set_last_comment_count(issue_key, current_count)
+                    continue
             # Если бот был выключен/перезапускался, а baseline по комментариям "пустой" (0),
             # то при старте может полететь "волна" уведомлений по старым тикетам.
             # Для несвежих заявок с уже большим числом комментариев — только baseline; при
@@ -635,60 +674,98 @@ async def check_registry_comments_and_notify() -> None:
                 continue
             new_comments = comments[-new_count:]
             already_notified = _get_notified_comment_ids(issue_key)
-            # Префиксы комментариев, написанных получателями через бота (TG/MAX): "[ФИО] текст"
+            # Премикас: комментарии, отправленные через бота, имеют тело формата "[ФИО] текст".
+            # Мы не должны уведомлять только автора (того получателя, чьё ФИО совпадает), но
+            # должны уведомлять остальных получателей.
             from user_storage import get_user_profile
-            bot_comment_prefixes: set = set()
+
+            recipient_prefixes: List[tuple[str | None, str, int]] = []
             for ch, uid in recipients:
                 profile = get_user_profile(uid, ch) or {}
                 full_name = (profile.get("full_name") or "").strip()
-                if full_name:
-                    bot_comment_prefixes.add(f"[{full_name}]")
-            # Не уведомляем о комментариях, которые получатели сами написали через бота;
-            # повторно не шлём по id (защита от сбоев baseline).
-            lines = []
-            new_ids_for_state: List[str] = []
+                prefix = f"[{full_name}]" if full_name else None
+                recipient_prefixes.append((ch, prefix, int(uid)))
+
+            comment_entries: List[Dict[str, Any]] = []
             for c in new_comments:
                 cid = c.get("id")
-                if cid is not None and str(cid).strip() in already_notified:
+                cid_str = str(cid).strip() if cid is not None else ""
+                if cid is not None and cid_str and cid_str in already_notified:
                     continue
+
                 plain = _comment_body_plain(c)
                 plain_stripped = (plain or "").strip()
-                if bot_comment_prefixes and plain_stripped:
-                    if any(plain_stripped.startswith(prefix) for prefix in bot_comment_prefixes):
-                        continue
+
+                # Выделяем авторский префикс из "[ФИО] ...", чтобы понять, кто является автором по формату бота.
+                prefix = None
+                if plain_stripped:
+                    # Без regex, чтобы не ловить ошибки экранирования/формата от Jira.
+                    if plain_stripped.startswith("["):
+                        end = plain_stripped.find("]")
+                        if end > 1:
+                            prefix = f"[{plain_stripped[1:end]}]"
+
                 author = (c.get("author") or {}).get("displayName", "—")
                 if plain:
-                    lines.append(f"👤 {author}:\n{plain}")
+                    line = f"👤 {author}:\n{plain}"
                 else:
-                    lines.append(f"👤 {author}: (без текста)")
-                if cid is not None and str(cid).strip():
-                    new_ids_for_state.append(str(cid).strip())
-            if not lines:
+                    line = f"👤 {author}: (без текста)"
+
+                comment_entries.append(
+                    {
+                        "cid": cid_str if cid_str else None,
+                        "prefix": prefix,
+                        "line": line,
+                    }
+                )
+
+            if not comment_entries:
                 _set_last_comment_count(issue_key, current_count)
                 continue
-            comment_block = "\n\n".join(lines)
-            title = (
-                f"💬 Новый комментарий в заявке {issue_key}:"
-                if len(lines) == 1
-                else f"💬 Новые комментарии в заявке {issue_key}:"
-            )
-            text = f"{title}\n\n{comment_block}"
+
             reply_markup = [
                 [{"text": "✏️ Написать комментарий", "callback_data": f"add_comment:{issue_key}"}],
             ]
+
             delivered_any = False
-            for channel_id, user_id in recipients:
+            delivered_ids: set[str] = set()
+
+            # Отправляем один и тот же набор комментариев, но отфильтровываем автора на уровне получателя.
+            for channel_id, prefix, user_id in recipient_prefixes:
+                lines_to_send = [e["line"] for e in comment_entries if not (prefix and e.get("prefix") == prefix)]
+                if not lines_to_send:
+                    continue
+
+                comment_block = "\n\n".join(lines_to_send)
+                title = (
+                    f"💬 Новый комментарий в заявке {issue_key}:"
+                    if len(lines_to_send) == 1
+                    else f"💬 Новые комментарии в заявке {issue_key}:"
+                )
+                text = f"{title}\n\n{comment_block}"
+
                 try:
                     await delivery_module.deliver(channel_id, user_id, text, reply_markup=reply_markup)
                     delivered_any = True
+                    for e in comment_entries:
+                        if not (prefix and e.get("prefix") == prefix):
+                            if e.get("cid"):
+                                delivered_ids.add(str(e["cid"]))
                 except Exception as e:
-                    logger.warning("Не удалось отправить уведомление о комментарии %s -> %s/%s: %s", issue_key, channel_id, user_id, e)
-            if delivered_any:
-                _add_notified_comment_ids(issue_key, new_ids_for_state)
+                    logger.warning(
+                        "Не удалось отправить уведомление о комментарии %s -> %s/%s: %s",
+                        issue_key,
+                        channel_id,
+                        user_id,
+                        e,
+                    )
+
+            if delivered_any and delivered_ids:
+                _add_notified_comment_ids(issue_key, list(delivered_ids))
             _set_last_comment_count(issue_key, current_count)
         except Exception as e:
             logger.warning("Ошибка проверки комментариев %s: %s", issue_key, e)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0)
 
 
 async def check_assignee_tasks_and_notify() -> None:
@@ -697,7 +774,7 @@ async def check_assignee_tasks_and_notify() -> None:
     отправляем уведомление новому исполнителю.
     Вне будней 08:00–17:00 (МСК) уведомления ставятся в очередь и уходят в 08:00 ближайшего рабочего дня.
     """
-    from core.jira_aa import get_issue_admin_details
+    from core.jira_aa import get_issues_admin_details_batch
     from core.stc_tasks import get_stc_recipients_by_jira_username
     from core.support.api import get_jira_browse_url
 
@@ -706,9 +783,11 @@ async def check_assignee_tasks_and_notify() -> None:
     issue_keys = get_all_issue_keys()
     if not issue_keys:
         return
+    # Batch-запрос: все заявки за один HTTP-вызов вместо N
+    details_batch = await get_issues_admin_details_batch(issue_keys)
     for issue_key in issue_keys:
         try:
-            info = await get_issue_admin_details(issue_key)
+            info = details_batch.get(issue_key)
             if not info:
                 continue
             assignee_username = (info.get("assignee_username") or "").strip().lower()
@@ -716,24 +795,61 @@ async def check_assignee_tasks_and_notify() -> None:
                 continue
             recipients = get_stc_recipients_by_jira_username(assignee_username)
             last_assignee = (_get_last_assignee(issue_key) or "").strip().lower()
-            if not last_assignee:
-                # Для новых заявок шлём уведомление сразу; для исторических — только baseline.
-                _set_last_assignee(issue_key, assignee_username)
-                if not recipients or not _is_recent_issue_binding(issue_key):
-                    continue
-            if last_assignee == assignee_username:
-                continue
-            if last_assignee:
-                _set_last_assignee(issue_key, assignee_username)
             if not recipients:
                 continue
+            # should_send управляет именно рассылкой «Новая задача…».
+            # Привязку для СА СТЦ мы добавляем всегда (INSERT OR IGNORE), чтобы
+            # комментарии/статусы дальше доходили до них из issue_bindings.
+            should_send = False
+            if not last_assignee:
+                _set_last_assignee(issue_key, assignee_username)
+                # Для новых заявок шлём уведомление сразу; для исторических — только baseline.
+                should_send = _is_recent_issue_binding(issue_key)
+            elif last_assignee != assignee_username:
+                _set_last_assignee(issue_key, assignee_username)
+                should_send = True
+
             recipients = _expand_recipients_to_linked_channels(recipients)
             if not recipients:
                 continue
+            # Важно: уведомления о комментариях/статусах берутся из реестра привязок (issue_bindings).
+            # Роль «СА СТЦ» сначала узнаёт задачу через уведомление об assignee, но сама по себе
+            # не попадает в issue_bindings. Поэтому добавляем привязку для получателей СА СТЦ,
+            # чтобы следующие события (комментарии/статусы) доходили до них.
+            try:
+                from core.support.issue_binding_registry import add_binding
+
+                existing_bindings = get_bindings_by_issue(issue_key) or []
+                project_key = (
+                    (existing_bindings[0].get("project_key") or "").strip()
+                    or (info.get("project_key") or "").strip()
+                )
+                ticket_type_id = (existing_bindings[0].get("ticket_type_id") or "").strip()
+
+                async def _ensure_binding(channel_id: str, user_id: int) -> None:
+                    if use_sqlite_storage():
+                        await asyncio.to_thread(
+                            add_binding,
+                            channel_id,
+                            int(user_id),
+                            issue_key,
+                            project_key,
+                            ticket_type_id,
+                        )
+                    else:
+                        add_binding(channel_id, int(user_id), issue_key, project_key, ticket_type_id)
+
+                await asyncio.gather(*[_ensure_binding(ch, uid) for ch, uid in recipients])
+            except Exception as e:
+                logger.warning("Не удалось добавить привязки для %s: %s", issue_key, e)
+
+            if not should_send:
+                continue
+
             browse_url = get_jira_browse_url(issue_key)
             text = _format_stc_new_task_message(issue_key, info, browse_url)
             reply_markup = _stc_new_task_reply_markup(issue_key)
-            if _stc_business_hours_enabled() and not is_stc_moscow_business_hours():
+            if _STC_BUSINESS_HOURS_ENABLED and not is_stc_moscow_business_hours():
                 _enqueue_stc_assign_notification(
                     issue_key,
                     assignee_username,
@@ -753,7 +869,7 @@ async def check_assignee_tasks_and_notify() -> None:
                     )
         except Exception as e:
             logger.warning("Ошибка уведомления assignee %s: %s", issue_key, e)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0)
 
 
 async def run_registry_status_loop(interval_seconds: int = 90) -> None:

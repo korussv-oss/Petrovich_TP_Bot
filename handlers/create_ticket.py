@@ -12,21 +12,21 @@ from user_storage import is_user_registered, get_user_profile, save_user_profile
 
 from core.support.api import support_api
 from core.support.models import Menu, Error
+from core.support import ticket_wizard
+from core.support.ticket_wizard import (
+    save_wizard_session,
+    load_wizard_session,
+    screen_for_state,
+    WizardEvent,
+    WizardScreen,
+    WizardSession,
+    wizard_step,
+)
 from adapters.telegram.render import render_menu_to_kwargs
 from states import (
+    TicketWizardStates,
     WmsTicketStates,
-    WmsSettingsStates,
-    PsiUserStates,
-    LupaTicketStates,
     TpSectionStates,
-    PcIssueStates,
-    EmailOwaStates,
-    OrgtechIssueStates,
-    PeripheralEquipmentStates,
-    NetworkIssueStates,
-    ElectronicQueueStates,
-    EmailForwardingStates,
-    EmailGroupsStates,
 )
 from keyboards import (
     get_main_menu_keyboard,
@@ -66,9 +66,378 @@ from core.electronic_queue import (
 from core.email_forwarding import EMAIL_FORWARDING_ON_OFF, EMAIL_FORWARDING_ON_OFF_BY_ID
 from core.email_groups import EMAIL_GROUPS_WHAT_TO_DO, EMAIL_GROUPS_WHAT_TO_DO_BY_ID
 
+import os
+import tempfile
+
 logger = logging.getLogger(__name__)
 router = Router()
 CHANNEL_ID = "telegram"
+
+# ===========================================================================
+# Thin-adapter helpers (Phase 16)
+# ===========================================================================
+
+def _make_inline_kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    """Строит InlineKeyboardMarkup из списка (callback_data, text) пар."""
+    buttons = [[InlineKeyboardButton(text=label, callback_data=cd) for cd, label in row] for row in rows]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _build_wizard_keyboard(screen: WizardScreen, data: dict) -> InlineKeyboardMarkup:
+    """
+    По screen.kind возвращает правильную клавиатуру для TG-рендера.
+    Вызывается из _apply_wizard_screen().
+    """
+    from keyboards import (
+        get_wms_department_keyboard,
+        get_wms_process_keyboard,
+        get_wms_service_type_keyboard,
+        get_lupa_service_keyboard,
+        get_lupa_request_type_keyboard,
+        get_lupa_city_keyboard,
+        get_lupa_skip_comment_keyboard,
+        get_pc_problem_kind_keyboard,
+        get_orgtech_kind_keyboard,
+        get_peripheral_kind_keyboard,
+        get_cancel_keyboard,
+    )
+
+    kind = screen.kind
+    depts: list = list(screen.departments or data.get("departments") or [])
+    page: int = int(data.get("dept_page") or 0)
+
+    # --- WMS ---
+    if kind in ("department_wms", "wms_issue_department"):
+        return get_wms_department_keyboard(depts, page)
+    if kind == "process_wms":
+        return get_wms_process_keyboard()
+    if kind == "wms_settings_department":
+        return get_wms_department_keyboard(depts, page)
+    if kind == "wms_settings_service_type":
+        return get_wms_service_type_keyboard()
+    if kind == "wms_settings_attachments":
+        return _make_inline_kb(
+            [("finish_wms_settings", "✅ Завершить создание задачи")],
+            [("cancel", "❌ Отмена")],
+        )
+    if kind == "wms_issue_attachments":
+        return _make_inline_kb(
+            [("wms_finish_ticket", "✅ Создать заявку")],
+            [("cancel", "❌ Отмена")],
+        )
+
+    # --- PSI ---
+    if kind == "psi_department":
+        return get_wms_department_keyboard(depts, page)
+    if kind == "psi_attachments":
+        return _make_inline_kb(
+            [("finish_psi_user", "✅ Завершить"), ("skip_psi_attachment", "⏭ Пропустить вложения")],
+            [("cancel", "❌ Отмена")],
+        )
+
+    # --- Lupa ---
+    if kind == "department_lupa":
+        from keyboards import get_lupa_department_keyboard
+        return get_lupa_department_keyboard(depts, page)
+    if kind == "lupa_service":
+        return get_lupa_service_keyboard()
+    if kind == "lupa_request_type":
+        return get_lupa_request_type_keyboard()
+    if kind == "lupa_city":
+        return get_lupa_city_keyboard()
+    if kind in ("lupa_description", "lupa_city_manual"):
+        return get_lupa_skip_comment_keyboard()
+
+    # --- PC ---
+    if kind == "pc_kind":
+        return get_pc_problem_kind_keyboard()
+    if kind == "pc_description":
+        return _make_inline_kb(
+            [("pc_skip_description", "⏭ Пропустить описание")],
+            [("cancel", "❌ Отмена")],
+        )
+    if kind == "pc_attachments":
+        return _make_inline_kb(
+            [("pc_finish_ticket", "✅ Создать заявку"), ("pc_skip_attachments", "⏭ Пропустить вложения")],
+            [("cancel", "❌ Отмена")],
+        )
+
+    # --- Orgtech ---
+    if kind == "orgtech_kind":
+        return get_orgtech_kind_keyboard()
+    if kind == "orgtech_description":
+        return _make_inline_kb(
+            [("orgtech_skip_description", "⏭ Пропустить описание")],
+            [("cancel", "❌ Отмена")],
+        )
+    if kind == "orgtech_attachments":
+        return _make_inline_kb(
+            [("orgtech_finish_ticket", "✅ Создать заявку"), ("orgtech_skip_attachments", "⏭ Пропустить вложения")],
+            [("cancel", "❌ Отмена")],
+        )
+
+    # --- Peripheral ---
+    if kind == "peripheral_kind":
+        return get_peripheral_kind_keyboard()
+    if kind == "peripheral_description":
+        return _make_inline_kb(
+            [("peripheral_skip_description", "⏭ Пропустить описание")],
+            [("cancel", "❌ Отмена")],
+        )
+    if kind == "peripheral_attachments":
+        return _make_inline_kb(
+            [("peripheral_finish_ticket", "✅ Создать заявку"), ("peripheral_skip_attachments", "⏭ Пропустить вложения")],
+            [("cancel", "❌ Отмена")],
+        )
+
+    # --- Network ---
+    if kind == "network_type":
+        return _network_select_keyboard(NETWORK_TYPES, "network_type_")
+    if kind == "network_wifi_owner":
+        return _network_select_keyboard(NETWORK_WIFI_OWNERS, "network_wifi_owner_")
+    if kind == "network_pc_type":
+        return _network_select_keyboard(NETWORK_PC_TYPES, "network_pc_type_")
+    if kind == "network_provider":
+        return _network_select_keyboard(NETWORK_PROVIDERS, "network_provider_")
+    if kind in ("network_rms", "network_description"):
+        skip_id = {"network_rms": "network_skip_rms", "network_description": "network_skip_description"}[kind]
+        return _make_inline_kb([(skip_id, "⏭ Пропустить"), ("cancel", "❌ Отмена")])
+    if kind == "network_provider_other":
+        return get_cancel_keyboard()
+    if kind == "network_attachments":
+        return _make_inline_kb(
+            [("network_finish_ticket", "✅ Создать заявку"), ("network_skip_attachments", "⏭ Пропустить вложения")],
+            [("cancel", "❌ Отмена")],
+        )
+
+    # --- Email OWA ---
+    if kind == "email_owa_request_kind":
+        from core.email_owa import EMAIL_OWA_REQUEST_KINDS
+        buttons = [[InlineKeyboardButton(text=label, callback_data=cd)] for cd, label in EMAIL_OWA_REQUEST_KINDS]
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+    if kind == "email_owa_workplace":
+        return _make_inline_kb(
+            [("email_owa_skip_workplace", "⏭ Пропустить")],
+            [("cancel", "❌ Отмена")],
+        )
+    if kind == "email_owa_attachments":
+        return _make_inline_kb(
+            [("email_owa_finish_ticket", "✅ Создать заявку"), ("email_owa_skip_attachments", "⏭ Пропустить вложения")],
+            [("cancel", "❌ Отмена")],
+        )
+
+    # --- Electronic Queue ---
+    if kind == "equeue_service":
+        buttons = [[InlineKeyboardButton(text=v, callback_data=k)] for k, v in ELECTRONIC_QUEUE_SERVICE_TYPES]
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    return get_cancel_keyboard()
+
+
+async def _download_tg_files(bot, file_ids: list) -> list[str]:
+    """Скачивает файлы из Telegram во временную директорию. Возвращает список локальных путей."""
+    paths: list[str] = []
+    for fid in file_ids[:10]:
+        try:
+            f = await bot.get_file(fid)
+            safe = (f.file_path or fid).replace("/", "_").replace("\\", "_")
+            path = os.path.join(tempfile.gettempdir(), f"wiz_attach_{safe}")
+            await bot.download_file(f.file_path, path)
+            if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
+                paths.append(path)
+        except Exception as exc:
+            logger.warning("_download_tg_files: %s → %s", str(fid)[:30], exc)
+    return paths
+
+
+async def _apply_wizard_screen(
+    update: "CallbackQuery | Message",
+    state: FSMContext,
+    new_session: WizardSession,
+    screen: WizardScreen,
+    user_id: int,
+) -> None:
+    """
+    Применяет результат wizard_step() к TG-апдейту.
+
+    Если screen.create_ticket_payload — создаёт тикет, загружает вложения,
+    очищает FSM и рендерит подтверждение.
+    Иначе — обновляет FSM-состояние + данные и рендерит screen.
+    """
+    if screen.create_ticket_payload is not None:
+        payload = screen.create_ticket_payload
+        ttype = payload.get("ticket_type_id", "")
+        form_data = payload.get("form_data") or {}
+        file_ids: list = list(payload.get("attachment_tokens") or [])
+        bot = update.bot if hasattr(update, "bot") else update.message.bot
+
+        attachment_paths: list[str] = []
+        if file_ids:
+            attachment_paths = await _download_tg_files(bot, file_ids)
+
+        try:
+            success, key_or_msg, full_msg = await support_api.create_ticket(
+                CHANNEL_ID,
+                user_id,
+                ttype,
+                form_data,
+                attachment_paths=attachment_paths or None,
+            )
+            display = full_msg or key_or_msg or ("Заявка создана" if success else "Ошибка")
+
+            if success and ttype == "wms_issue" and key_or_msg and attachment_paths:
+                try:
+                    from core.jira_wms import add_attachments_to_issue
+                    added, _ = await add_attachments_to_issue(key_or_msg, attachment_paths)
+                    if added:
+                        display += f"\n\n📎 Приложено файлов: {added}."
+                except Exception as exc:
+                    logger.warning("_apply_wizard_screen: wms attachments: %s", exc)
+        finally:
+            for p in attachment_paths:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+        await state.clear()
+        text = f"✅ {display}" if success else f"❌ {display}"
+        if isinstance(update, CallbackQuery):
+            await update.message.edit_text(text, parse_mode="HTML",
+                                           reply_markup=get_main_menu_keyboard(user_id))
+        else:
+            await update.answer(text, parse_mode="HTML",
+                                reply_markup=get_main_menu_keyboard(user_id))
+        return
+
+    if screen.kind == "error":
+        if isinstance(update, CallbackQuery):
+            await update.answer(screen.text, show_alert=True)
+        else:
+            await update.answer(screen.text, parse_mode="HTML", reply_markup=get_cancel_keyboard())
+        return
+
+    try:
+        await state.set_state(TicketWizardStates[new_session.step])
+    except (KeyError, ValueError):
+        logger.warning("_apply_wizard_screen: unknown step=%s", new_session.step)
+    await state.update_data(**save_wizard_session(new_session))
+
+    fsm_data = await state.get_data()
+    keyboard = _build_wizard_keyboard(screen, {**new_session.data, **fsm_data})
+
+    if isinstance(update, CallbackQuery):
+        await update.message.edit_text(screen.text, parse_mode="HTML", reply_markup=keyboard)
+    else:
+        await update.answer(screen.text, parse_mode="HTML", reply_markup=keyboard)
+
+
+# ===========================================================================
+# Универсальные тонкие обёртки для всех TicketWizardStates (Phase 16)
+# ===========================================================================
+# Зарегистрированы ПЕРВЫМИ — перехватывают события до legacy-хандлеров.
+# Если session отсутствует (legacy-flow без wizard_session), пропускаем.
+
+async def _wizard_no_session(update: "CallbackQuery | Message", state: FSMContext) -> None:
+    """Сессия wizard не найдена — сбрасываем FSM и просим начать заново."""
+    await state.clear()
+    txt = "⚠️ Сессия устарела. Пожалуйста, начните создание заявки заново."
+    if isinstance(update, CallbackQuery):
+        await update.message.edit_text(txt, reply_markup=get_main_menu_keyboard(update.from_user.id))
+        await update.answer()
+    else:
+        await update.answer(txt, reply_markup=get_main_menu_keyboard(update.from_user.id))
+
+
+@router.callback_query(TicketWizardStates.any())
+async def wizard_callback_universal(callback: CallbackQuery, state: FSMContext):
+    """Тонкая обёртка: любой callback в wizard-состоянии → wizard_step()."""
+    data = await state.get_data()
+    session = load_wizard_session(data)
+    if session is None:
+        await _wizard_no_session(callback, state)
+        return
+
+    cid = callback.data or ""
+    if cid == "cancel":
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ Отменено.", reply_markup=get_main_menu_keyboard(callback.from_user.id)
+        )
+        await callback.answer()
+        return
+
+    profile = get_user_profile(callback.from_user.id, CHANNEL_ID) or {}
+    event = WizardEvent(kind="callback", callback_id=cid)
+    try:
+        new_session, screen = await wizard_step(session, event, profile=profile)
+    except Exception as exc:
+        logger.error("wizard_callback_universal: wizard_step failed: %s", exc, exc_info=True)
+        await callback.answer("Произошла ошибка. Попробуйте начать заново.", show_alert=True)
+        return
+
+    await _apply_wizard_screen(callback, state, new_session, screen, callback.from_user.id)
+    await callback.answer()
+
+
+@router.message(TicketWizardStates.any(), F.text)
+async def wizard_message_universal(message: Message, state: FSMContext):
+    """Тонкая обёртка: любое текстовое сообщение в wizard-состоянии → wizard_step()."""
+    data = await state.get_data()
+    session = load_wizard_session(data)
+    if session is None:
+        await _wizard_no_session(message, state)
+        return
+
+    txt = (message.text or "").strip()
+    if txt.lower() in ("/cancel", "отмена"):
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+
+    profile = get_user_profile(message.from_user.id, CHANNEL_ID) or {}
+    event = WizardEvent(kind="text", text=txt)
+    try:
+        new_session, screen = await wizard_step(session, event, profile=profile)
+    except Exception as exc:
+        logger.error("wizard_message_universal: wizard_step failed: %s", exc, exc_info=True)
+        await message.answer("Произошла ошибка. Попробуйте начать заново.")
+        return
+
+    await _apply_wizard_screen(message, state, new_session, screen, message.from_user.id)
+
+
+@router.message(TicketWizardStates.any(), F.photo | F.document | F.video)
+async def wizard_attachment_universal(message: Message, state: FSMContext):
+    """Тонкая обёртка: вложения в wizard-состоянии → wizard_step(kind='attachment')."""
+    data = await state.get_data()
+    session = load_wizard_session(data)
+    if session is None:
+        await _wizard_no_session(message, state)
+        return
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document:
+        file_id = message.document.file_id
+    elif message.video:
+        file_id = message.video.file_id
+    else:
+        return
+
+    profile = get_user_profile(message.from_user.id, CHANNEL_ID) or {}
+    event = WizardEvent(kind="attachment", attachments=[file_id])
+    try:
+        new_session, screen = await wizard_step(session, event, profile=profile)
+    except Exception as exc:
+        logger.error("wizard_attachment_universal: wizard_step failed: %s", exc, exc_info=True)
+        await message.answer("Произошла ошибка при обработке вложения.")
+        return
+
+    await _apply_wizard_screen(message, state, new_session, screen, message.from_user.id)
+
 
 # --- «Создать заявку в ТП»: выбор раздела ---
 
@@ -195,7 +564,7 @@ def _email_groups_cancel_keyboard() -> InlineKeyboardMarkup:
 
 async def _email_groups_start(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await state.set_state(EmailGroupsStates.WAITING_FOR_WHAT_TO_DO)
+    await state.set_state(TicketWizardStates.EMAIL_GROUPS_WHAT_TO_DO)
     await callback.message.edit_text(
         "👥 <b>Группы рассылки</b>\n\nКакой тип работ вас интересует?",
         parse_mode="HTML",
@@ -210,7 +579,7 @@ async def email_groups_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(EmailGroupsStates.WAITING_FOR_WHAT_TO_DO, F.data.startswith("email_groups_do:"))
+@router.callback_query(TicketWizardStates.EMAIL_GROUPS_WHAT_TO_DO, F.data.startswith("email_groups_do:"))
 async def email_groups_select_what_to_do(callback: CallbackQuery, state: FSMContext):
     oid = (callback.data.split(":", 1)[1] if callback.data else "").strip()
     label = EMAIL_GROUPS_WHAT_TO_DO_BY_ID.get(oid)
@@ -224,14 +593,14 @@ async def email_groups_select_what_to_do(callback: CallbackQuery, state: FSMCont
     # 13014 add member -> group email -> AD login
     # 13015 remove member -> group email -> AD login
     if oid in ("13012", "13013"):
-        await state.set_state(EmailGroupsStates.WAITING_FOR_GROUP_NAME)
+        await state.set_state(TicketWizardStates.EMAIL_GROUPS_GROUP_NAME)
         await callback.message.edit_text(
             f"👥 <b>Группы рассылки</b>\n\n✅ Тип работ: {label}\n\nВведите <b>Название группы рассылки</b>:",
             parse_mode="HTML",
             reply_markup=_email_groups_cancel_keyboard(),
         )
     else:
-        await state.set_state(EmailGroupsStates.WAITING_FOR_GROUP_EMAIL)
+        await state.set_state(TicketWizardStates.EMAIL_GROUPS_GROUP_EMAIL)
         await callback.message.edit_text(
             f"👥 <b>Группы рассылки</b>\n\n✅ Тип работ: {label}\n\nВведите <b>Адрес группы рассылки</b> (email):",
             parse_mode="HTML",
@@ -240,7 +609,7 @@ async def email_groups_select_what_to_do(callback: CallbackQuery, state: FSMCont
     await callback.answer()
 
 
-@router.message(EmailGroupsStates.WAITING_FOR_GROUP_NAME, F.text)
+@router.message(TicketWizardStates.EMAIL_GROUPS_GROUP_NAME, F.text)
 async def email_groups_group_name(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
@@ -254,15 +623,15 @@ async def email_groups_group_name(message: Message, state: FSMContext):
     data = await state.get_data()
     what_id = (data.get("email_groups_what_to_do_id") or "").strip()
     if what_id == "13012":
-        await state.set_state(EmailGroupsStates.WAITING_FOR_GROUP_OWNER)
+        await state.set_state(TicketWizardStates.EMAIL_GROUPS_OWNER)
         await message.answer("Введите <b>Владельца группы рассылки</b> (email, например i.vanov@petrovich.ru):", parse_mode="HTML", reply_markup=_email_groups_cancel_keyboard())
         return
     # 13013
-    await state.set_state(EmailGroupsStates.WAITING_FOR_DESCRIPTION)
+    await state.set_state(TicketWizardStates.EMAIL_GROUPS_DESCRIPTION)
     await message.answer("Введите <b>Причину изменения</b>:", parse_mode="HTML", reply_markup=_email_groups_cancel_keyboard())
 
 
-@router.message(EmailGroupsStates.WAITING_FOR_GROUP_OWNER, F.text)
+@router.message(TicketWizardStates.EMAIL_GROUPS_OWNER, F.text)
 async def email_groups_group_owner(message: Message, state: FSMContext):
     owner = (message.text or "").strip()
     if owner.lower() == "/cancel":
@@ -273,7 +642,7 @@ async def email_groups_group_owner(message: Message, state: FSMContext):
         await message.answer("❌ Похоже, это не email. Введите адрес в формате name@domain.tld.")
         return
     await state.update_data(email_groups_group_owner=owner)
-    await state.set_state(EmailGroupsStates.WAITING_FOR_GROUP_MEMBERSHIP)
+    await state.set_state(TicketWizardStates.EMAIL_GROUPS_MEMBERSHIP)
     await message.answer(
         "Введите <b>Кто будет входить в группу рассылки</b>.\n"
         "Можно перечислить несколько email через запятую/перенос строки:",
@@ -282,7 +651,7 @@ async def email_groups_group_owner(message: Message, state: FSMContext):
     )
 
 
-@router.message(EmailGroupsStates.WAITING_FOR_GROUP_MEMBERSHIP, F.text)
+@router.message(TicketWizardStates.EMAIL_GROUPS_MEMBERSHIP, F.text)
 async def email_groups_group_membership(message: Message, state: FSMContext):
     members = (message.text or "").strip()
     if members.lower() == "/cancel":
@@ -293,11 +662,11 @@ async def email_groups_group_membership(message: Message, state: FSMContext):
         await message.answer("❌ Поле не может быть пустым. Укажите хотя бы одного участника (email).")
         return
     await state.update_data(email_groups_group_membership=members)
-    await state.set_state(EmailGroupsStates.WAITING_FOR_DESCRIPTION)
+    await state.set_state(TicketWizardStates.EMAIL_GROUPS_DESCRIPTION)
     await message.answer("Введите <b>Причину изменения</b>:", parse_mode="HTML", reply_markup=_email_groups_cancel_keyboard())
 
 
-@router.message(EmailGroupsStates.WAITING_FOR_GROUP_EMAIL, F.text)
+@router.message(TicketWizardStates.EMAIL_GROUPS_GROUP_EMAIL, F.text)
 async def email_groups_group_email(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
@@ -314,7 +683,7 @@ async def email_groups_group_email(message: Message, state: FSMContext):
         await message.answer("❌ Похоже, это не email. Введите адрес группы рассылки (например, group@petrovich.ru).")
         return
     await state.update_data(email_groups_group_email=email)
-    await state.set_state(EmailGroupsStates.WAITING_FOR_AD_LOGIN)
+    await state.set_state(TicketWizardStates.EMAIL_GROUPS_AD_LOGIN)
     await message.answer("Введите <b>Имя учетной записи сотрудника</b> (AD Login) в формате <b>i.vanov</b>:", parse_mode="HTML", reply_markup=_email_groups_cancel_keyboard())
 
 
@@ -332,7 +701,7 @@ def _looks_like_ad_login(value: str) -> bool:
     return all(c in allowed for c in vv)
 
 
-@router.message(EmailGroupsStates.WAITING_FOR_AD_LOGIN, F.text)
+@router.message(TicketWizardStates.EMAIL_GROUPS_AD_LOGIN, F.text)
 async def email_groups_ad_login(message: Message, state: FSMContext):
     login = (message.text or "").strip()
     if login.lower() == "/cancel":
@@ -346,7 +715,7 @@ async def email_groups_ad_login(message: Message, state: FSMContext):
     await _email_groups_finish(message, state)
 
 
-@router.message(EmailGroupsStates.WAITING_FOR_DESCRIPTION, F.text)
+@router.message(TicketWizardStates.EMAIL_GROUPS_DESCRIPTION, F.text)
 async def email_groups_description(message: Message, state: FSMContext):
     desc = (message.text or "").strip()
     if desc.lower() == "/cancel":
@@ -427,7 +796,7 @@ def _email_forwarding_cancel_keyboard() -> InlineKeyboardMarkup:
 
 async def _email_forwarding_start(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await state.set_state(EmailForwardingStates.WAITING_FOR_ON_OFF)
+    await state.set_state(TicketWizardStates.EMAIL_FORWARDING_ON_OFF)
     await callback.message.edit_text(
         "↪️ <b>Настройка переадресации</b>\n\nВыберите действие:",
         parse_mode="HTML",
@@ -442,14 +811,14 @@ async def email_forwarding_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(EmailForwardingStates.WAITING_FOR_ON_OFF, F.data.startswith("email_fwd_onoff:"))
+@router.callback_query(TicketWizardStates.EMAIL_FORWARDING_ON_OFF, F.data.startswith("email_fwd_onoff:"))
 async def email_forwarding_select_on_off(callback: CallbackQuery, state: FSMContext):
     oid = (callback.data.split(":", 1)[1] if callback.data else "").strip()
     if oid not in EMAIL_FORWARDING_ON_OFF_BY_ID:
         await callback.answer("Неверный выбор.", show_alert=True)
         return
     await state.update_data(email_fwd_on_off=oid)
-    await state.set_state(EmailForwardingStates.WAITING_FOR_EMAIL_FROM)
+    await state.set_state(TicketWizardStates.EMAIL_FORWARDING_FROM)
     await callback.message.edit_text(
         "Введите email, <b>с которого</b> нужно установить переадресацию (например, name@petrovich.ru):",
         parse_mode="HTML",
@@ -468,7 +837,7 @@ def _looks_like_email(value: str) -> bool:
     return True
 
 
-@router.message(EmailForwardingStates.WAITING_FOR_EMAIL_FROM, F.text)
+@router.message(TicketWizardStates.EMAIL_FORWARDING_FROM, F.text)
 async def email_forwarding_email_from(message: Message, state: FSMContext):
     email_from = (message.text or "").strip()
     if email_from.lower() == "/cancel":
@@ -479,11 +848,11 @@ async def email_forwarding_email_from(message: Message, state: FSMContext):
         await message.answer("❌ Похоже, это не email. Введите адрес в формате name@domain.tld.")
         return
     await state.update_data(email_fwd_email_from=email_from)
-    await state.set_state(EmailForwardingStates.WAITING_FOR_EMAIL_TO)
+    await state.set_state(TicketWizardStates.EMAIL_FORWARDING_TO)
     await message.answer("Введите email, <b>на который</b> нужно установить переадресацию:", parse_mode="HTML", reply_markup=_email_forwarding_cancel_keyboard())
 
 
-@router.message(EmailForwardingStates.WAITING_FOR_EMAIL_TO, F.text)
+@router.message(TicketWizardStates.EMAIL_FORWARDING_TO, F.text)
 async def email_forwarding_email_to(message: Message, state: FSMContext):
     email_to = (message.text or "").strip()
     if email_to.lower() == "/cancel":
@@ -494,7 +863,7 @@ async def email_forwarding_email_to(message: Message, state: FSMContext):
         await message.answer("❌ Похоже, это не email. Введите адрес в формате name@domain.tld.")
         return
     await state.update_data(email_fwd_email_to=email_to)
-    await state.set_state(EmailForwardingStates.WAITING_FOR_DATE)
+    await state.set_state(TicketWizardStates.EMAIL_FORWARDING_DATE)
     await message.answer(
         "Введите дату включения/выключения переадресации.\n\nФормат: <b>YYYY-MM-DD</b> (например, 2026-03-16) или <b>DD.MM.YYYY</b>.",
         parse_mode="HTML",
@@ -514,7 +883,7 @@ def _parse_date_to_yyyy_mm_dd(value: str) -> str | None:
     return None
 
 
-@router.message(EmailForwardingStates.WAITING_FOR_DATE, F.text)
+@router.message(TicketWizardStates.EMAIL_FORWARDING_DATE, F.text)
 async def email_forwarding_date(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
     if raw.lower() == "/cancel":
@@ -575,7 +944,7 @@ async def tp_email_owa_outlook_start(callback: CallbackQuery, state: FSMContext)
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
     await state.clear()
-    await state.set_state(EmailOwaStates.WAITING_FOR_REQUEST_KIND)
+    await state.set_state(TicketWizardStates.EMAIL_OWA_REQUEST_KIND)
     await callback.message.edit_text(
         "📨 <b>Электронная почта (Owa\\Outlook)</b>\n\nВыберите ваш запрос:",
         parse_mode="HTML",
@@ -584,31 +953,32 @@ async def tp_email_owa_outlook_start(callback: CallbackQuery, state: FSMContext)
     await callback.answer()
 
 
-@router.callback_query(EmailOwaStates.WAITING_FOR_REQUEST_KIND, F.data.in_(set(EMAIL_OWA_KIND_BY_ID.keys())))
+@router.callback_query(TicketWizardStates.EMAIL_OWA_REQUEST_KIND, F.data.in_(set(EMAIL_OWA_KIND_BY_ID.keys())))
 async def tp_email_owa_select_kind(callback: CallbackQuery, state: FSMContext):
     kind_key = (callback.data or "").strip()
     kind_label = EMAIL_OWA_KIND_BY_ID.get(kind_key)
     if not kind_label:
         await callback.answer("Неверный выбор.", show_alert=True)
         return
-    await state.update_data(request_kind=kind_label)
-    await state.set_state(EmailOwaStates.WAITING_FOR_RMS_OR_IP)
+    await state.update_data(
+        request_kind=kind_label,
+        **save_wizard_session(ticket_wizard.WizardSession("email_owa", "EMAIL_OWA_RMS_OR_IP")),
+    )
+    await state.set_state(TicketWizardStates.EMAIL_OWA_RMS_OR_IP)
     await callback.message.edit_text(
-        "📨 <b>Электронная почта (Owa\\Outlook)</b>\n\n"
-        f"✅ Запрос: {kind_label}\n\n"
-        "Укажите RMS или IP:",
+        ticket_wizard.email_owa_rms_or_ip_screen(request_kind=kind_label).text,
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(EmailOwaStates.WAITING_FOR_REQUEST_KIND, F.text)
+@router.message(TicketWizardStates.EMAIL_OWA_REQUEST_KIND, F.text)
 async def tp_email_owa_kind_text(message: Message):
     await message.reply("Выберите тип запроса кнопкой ниже.", reply_markup=_email_owa_request_kind_keyboard())
 
 
-@router.message(EmailOwaStates.WAITING_FOR_RMS_OR_IP, F.text)
+@router.message(TicketWizardStates.EMAIL_OWA_RMS_OR_IP, F.text)
 async def tp_email_owa_rms(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
@@ -618,38 +988,47 @@ async def tp_email_owa_rms(message: Message, state: FSMContext):
     if not text:
         await message.reply("Укажите RMS или IP.", reply_markup=get_cancel_keyboard())
         return
-    await state.update_data(rms_or_ip=text)
-    await state.set_state(EmailOwaStates.WAITING_FOR_WORKPLACE)
+    await state.update_data(
+        rms_or_ip=text,
+        **save_wizard_session(ticket_wizard.WizardSession("email_owa", "EMAIL_OWA_WORKPLACE")),
+    )
+    await state.set_state(TicketWizardStates.EMAIL_OWA_WORKPLACE)
     await message.reply(
-        "Укажите номер или местоположение рабочего места (опционально) или нажмите «Пропустить».",
+        ticket_wizard.email_owa_workplace_screen().text,
         reply_markup=_email_owa_workplace_keyboard(),
     )
 
 
-@router.callback_query(EmailOwaStates.WAITING_FOR_WORKPLACE, F.data == "email_owa_skip_workplace")
+@router.callback_query(TicketWizardStates.EMAIL_OWA_WORKPLACE, F.data == "email_owa_skip_workplace")
 async def tp_email_owa_skip_workplace(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(workplace="")
-    await state.set_state(EmailOwaStates.WAITING_FOR_DESCRIPTION)
+    await state.update_data(
+        workplace="",
+        **save_wizard_session(ticket_wizard.WizardSession("email_owa", "EMAIL_OWA_DESCRIPTION")),
+    )
+    await state.set_state(TicketWizardStates.EMAIL_OWA_DESCRIPTION)
     await callback.message.edit_text(
-        "Введите подробное описание проблемы:",
+        ticket_wizard.email_owa_description_screen().text,
         reply_markup=get_cancel_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(EmailOwaStates.WAITING_FOR_WORKPLACE, F.text)
+@router.message(TicketWizardStates.EMAIL_OWA_WORKPLACE, F.text)
 async def tp_email_owa_workplace(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
         await state.clear()
         await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
         return
-    await state.update_data(workplace=text)
-    await state.set_state(EmailOwaStates.WAITING_FOR_DESCRIPTION)
-    await message.reply("Введите подробное описание проблемы:", reply_markup=get_cancel_keyboard())
+    await state.update_data(
+        workplace=text,
+        **save_wizard_session(ticket_wizard.WizardSession("email_owa", "EMAIL_OWA_DESCRIPTION")),
+    )
+    await state.set_state(TicketWizardStates.EMAIL_OWA_DESCRIPTION)
+    await message.reply(ticket_wizard.email_owa_description_screen().text, reply_markup=get_cancel_keyboard())
 
 
-@router.message(EmailOwaStates.WAITING_FOR_DESCRIPTION, F.text)
+@router.message(TicketWizardStates.EMAIL_OWA_DESCRIPTION, F.text)
 async def tp_email_owa_description(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
@@ -659,15 +1038,19 @@ async def tp_email_owa_description(message: Message, state: FSMContext):
     if not text:
         await message.reply("Описание не может быть пустым.", reply_markup=get_cancel_keyboard())
         return
-    await state.update_data(description=text, email_owa_attachment_file_ids=[])
-    await state.set_state(EmailOwaStates.WAITING_FOR_ATTACHMENTS)
+    await state.update_data(
+        description=text,
+        email_owa_attachment_file_ids=[],
+        **save_wizard_session(ticket_wizard.WizardSession("email_owa", "EMAIL_OWA_ATTACHMENTS")),
+    )
+    await state.set_state(TicketWizardStates.EMAIL_OWA_ATTACHMENTS)
     await message.reply(
-        "📎 Приложите фото/видео/документы (опционально) или нажмите «Создать заявку».",
+        ticket_wizard.email_owa_attachments_screen(added_count=0).text,
         reply_markup=_email_owa_attachments_keyboard(),
     )
 
 
-@router.message(EmailOwaStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+@router.message(TicketWizardStates.EMAIL_OWA_ATTACHMENTS, F.photo | F.document | F.video)
 async def tp_email_owa_attachment_add(message: Message, state: FSMContext):
     data = await state.get_data()
     file_ids = list(data.get("email_owa_attachment_file_ids") or [])
@@ -775,12 +1158,12 @@ async def _finish_email_owa_common(callback: CallbackQuery, state: FSMContext, f
                 pass
 
 
-@router.callback_query(EmailOwaStates.WAITING_FOR_ATTACHMENTS, F.data == "email_owa_skip_attachments")
+@router.callback_query(TicketWizardStates.EMAIL_OWA_ATTACHMENTS, F.data == "email_owa_skip_attachments")
 async def tp_email_owa_skip_attachments(callback: CallbackQuery, state: FSMContext):
     await _finish_email_owa_common(callback, state, [])
 
 
-@router.callback_query(EmailOwaStates.WAITING_FOR_ATTACHMENTS, F.data == "email_owa_finish_ticket")
+@router.callback_query(TicketWizardStates.EMAIL_OWA_ATTACHMENTS, F.data == "email_owa_finish_ticket")
 async def tp_email_owa_finish(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     file_ids = data.get("email_owa_attachment_file_ids") or []
@@ -794,28 +1177,33 @@ async def pc_issue_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
     await state.clear()
-    await state.set_state(PcIssueStates.WAITING_FOR_KIND)
+    session = WizardSession("pc_problem", "PC_KIND")
+    await state.set_state(TicketWizardStates.PC_KIND)
+    await state.update_data(**save_wizard_session(session))
     await callback.message.edit_text(
-        "🖥️ <b>Проблема в работе ПК</b>\n\nС чем наблюдаются проблемы?",
+        ticket_wizard.pc_kind_screen().text,
         parse_mode="HTML",
         reply_markup=get_pc_problem_kind_keyboard(),
     )
     await callback.answer()
 
 
-@router.callback_query(PcIssueStates.WAITING_FOR_KIND, F.data.startswith("pc_kind_"))
+@router.callback_query(TicketWizardStates.PC_KIND, F.data.startswith("pc_kind_"))
 async def pc_issue_select_kind(callback: CallbackQuery, state: FSMContext):
     kind_id = callback.data.replace("pc_kind_", "", 1).strip()
     kind_label = PC_PROBLEM_KIND_BY_ID.get(kind_id)
     if not kind_label:
         await callback.answer("Неверный выбор.", show_alert=True)
         return
-    await state.update_data(pc_problem_kind_id=kind_id, pc_problem_kind_label=kind_label)
-    await state.set_state(PcIssueStates.WAITING_FOR_DESCRIPTION)
+    await state.update_data(
+        pc_problem_kind_id=kind_id,
+        pc_problem_kind_label=kind_label,
+        kind_label=kind_label,
+        **save_wizard_session(ticket_wizard.WizardSession("pc_issue", "PC_DESCRIPTION")),
+    )
+    await state.set_state(TicketWizardStates.PC_DESCRIPTION)
     await callback.message.edit_text(
-        "🖥️ <b>Проблема в работе ПК</b>\n\n"
-        f"✅ Категория: {kind_label}\n\n"
-        "Опишите проблему (поле Description) или нажмите «Пропустить».",
+        ticket_wizard.pc_description_screen(kind_label=kind_label).text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⏭ Пропустить", callback_data="pc_skip_description")],
@@ -825,7 +1213,7 @@ async def pc_issue_select_kind(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.message(PcIssueStates.WAITING_FOR_KIND, F.text)
+@router.message(TicketWizardStates.PC_KIND, F.text)
 async def pc_issue_kind_text(message: Message):
     await message.reply("Выберите категорию кнопкой ниже.", reply_markup=get_pc_problem_kind_keyboard())
 
@@ -864,7 +1252,7 @@ async def tp_section_wms(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.callback_query(TpSectionStates.WAITING_WMS_DEPARTMENT, F.data.startswith("wms_dept_page_"))
+@router.callback_query(TicketWizardStates.WMS_ISSUE_DEPARTMENT, F.data.startswith("wms_dept_page_"))
 async def tp_wms_department_page(callback: CallbackQuery, state: FSMContext):
     try:
         page = int(callback.data.replace("wms_dept_page_", ""))
@@ -877,7 +1265,7 @@ async def tp_wms_department_page(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(TpSectionStates.WAITING_WMS_DEPARTMENT, F.data.regexp(r"^wms_dept_\d+$"))
+@router.callback_query(TicketWizardStates.WMS_ISSUE_DEPARTMENT, F.data.regexp(r"^wms_dept_\d+$"))
 async def tp_wms_department_select(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     depts = data.get("tp_wms_departments_list") or []
@@ -894,10 +1282,12 @@ async def tp_wms_department_select(callback: CallbackQuery, state: FSMContext):
     profile["department_wms"] = value
     save_user_profile(callback.from_user.id, profile)
     await state.clear()
-    await state.set_state(WmsTicketStates.WAITING_FOR_PROCESS)
-    await state.update_data(ticket_type_id="wms_issue")
+    await state.set_state(TicketWizardStates.WMS_ISSUE_PROCESS)
+    await state.update_data(ticket_type_id="wms_issue", **save_wizard_session(
+        ticket_wizard.WizardSession("wms_issue", "WMS_ISSUE_PROCESS")
+    ))
     await callback.message.edit_text(
-        "🚨 <b>Проблема в работе WMS</b>\n\nВыберите <b>сбойный процесс</b>:",
+        ticket_wizard.wms_issue_process_screen().text,
         parse_mode="HTML",
         reply_markup=get_wms_process_keyboard(),
     )
@@ -911,9 +1301,12 @@ async def _lupa_start_or_ask_department(callback_or_message, state: FSMContext, 
     department = (profile.get("department") or "").strip()
     if department:
         await state.clear()
-        await state.set_state(LupaTicketStates.SELECT_PROBLEMATIC_SERVICE)
-        await state.update_data(ticket_type_id="lupa_search")
-        text = "🔍 <b>Создание заявки о поиске</b>\n\nШаг 1/5: Выберите проблемный сервис:"
+        await state.set_state(TicketWizardStates.LUPA_SERVICE)
+        await state.update_data(
+            ticket_type_id="lupa_search",
+            **save_wizard_session(ticket_wizard.WizardSession("lupa_search", "LUPA_SERVICE")),
+        )
+        text = ticket_wizard.lupa_service_screen().text
         if is_callback:
             await callback_or_message.message.edit_text(text, parse_mode="HTML", reply_markup=get_lupa_service_keyboard())
             await callback_or_message.answer()
@@ -924,7 +1317,7 @@ async def _lupa_start_or_ask_department(callback_or_message, state: FSMContext, 
     from keyboards import get_department_keyboard
     depts = await get_departments_async()
     await state.clear()
-    await state.set_state(LupaTicketStates.WAITING_FOR_DEPARTMENT)
+    await state.set_state(TicketWizardStates.LUPA_DEPARTMENT)
     await state.update_data(ticket_type_id="lupa_search", tp_lupa_departments_list=depts)
     if not depts:
         if is_callback:
@@ -981,12 +1374,12 @@ EMPLOYEE_ID_HINT = (
 
 # --- Lupa: выбор по кнопкам (как the_bot_lupa) ---
 
-@router.callback_query(LupaTicketStates.SELECT_PROBLEMATIC_SERVICE, F.data.in_(list(LUPA_SERVICE_VALUES)))
+@router.callback_query(TicketWizardStates.LUPA_SERVICE, F.data.in_(list(LUPA_SERVICE_VALUES)))
 async def lupa_select_service(callback: CallbackQuery, state: FSMContext):
     """Шаг 1 → 2: сохранение сервиса, показ типа запроса."""
     service = LUPA_SERVICE_VALUES.get(callback.data)
     await state.update_data(problematic_service=service)
-    await state.set_state(LupaTicketStates.SELECT_REQUEST_TYPE)
+    await state.set_state(TicketWizardStates.LUPA_REQUEST_TYPE)
     await callback.message.edit_text(
         f"🔍 <b>Создание заявки о поиске</b>\n\n✅ Сервис: {service}\n\nШаг 2/5: Выберите тип запроса:",
         parse_mode="HTML",
@@ -995,7 +1388,7 @@ async def lupa_select_service(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(LupaTicketStates.SELECT_REQUEST_TYPE, F.data.in_(list(LUPA_REQUEST_TYPE_VALUES)))
+@router.callback_query(TicketWizardStates.LUPA_REQUEST_TYPE, F.data.in_(list(LUPA_REQUEST_TYPE_VALUES)))
 async def lupa_select_request_type(callback: CallbackQuery, state: FSMContext):
     """Шаг 2 → 3: сохранение типа запроса, подразделение из профиля, показ городов."""
     request_type = LUPA_REQUEST_TYPE_VALUES.get(callback.data)
@@ -1005,7 +1398,7 @@ async def lupa_select_request_type(callback: CallbackQuery, state: FSMContext):
     await state.update_data(subdivision=subdivision)
     from config import CONFIG
     cities = CONFIG.get("JIRA_LUPA", {}).get("CITIES", [])[:4]
-    await state.set_state(LupaTicketStates.ENTER_CITY)
+    await state.set_state(TicketWizardStates.LUPA_CITY)
     await callback.message.edit_text(
         "🔍 <b>Создание заявки о поиске</b>\n\n"
         f"✅ Тип запроса: {request_type}\n"
@@ -1017,11 +1410,11 @@ async def lupa_select_request_type(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(LupaTicketStates.ENTER_CITY, F.data.startswith("lupa_city_"))
+@router.callback_query(TicketWizardStates.LUPA_CITY, F.data.startswith("lupa_city_"))
 async def lupa_city_callback(callback: CallbackQuery, state: FSMContext):
     """Шаг 3: выбор города кнопкой или «Ввести вручную»."""
     if callback.data == "lupa_city_manual":
-        await state.set_state(LupaTicketStates.ENTER_CITY_MANUAL)
+        await state.set_state(TicketWizardStates.LUPA_CITY_MANUAL)
         await callback.message.edit_text(
             "🔍 <b>Создание заявки о поиске</b>\n\nШаг 3/5: Введите название города:",
             parse_mode="HTML",
@@ -1031,7 +1424,7 @@ async def lupa_city_callback(callback: CallbackQuery, state: FSMContext):
         return
     city = callback.data.replace("lupa_city_", "", 1).replace("_", " ")
     await state.update_data(city=city)
-    await state.set_state(LupaTicketStates.WAITING_FOR_DESCRIPTION)
+    await state.set_state(TicketWizardStates.LUPA_DESCRIPTION)
     await callback.message.edit_text(
         f"🔍 <b>Создание заявки о поиске</b>\n\n✅ Город: {city}\n\n"
         "Шаг 4/5: Введите комментарий (описание проблемы):\n\nМожно пропустить, нажав кнопку ниже.",
@@ -1041,7 +1434,7 @@ async def lupa_city_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.message(LupaTicketStates.ENTER_CITY_MANUAL, F.text)
+@router.message(TicketWizardStates.LUPA_CITY_MANUAL, F.text)
 async def lupa_city_manual(message: Message, state: FSMContext):
     """Ввод города вручную."""
     if (message.text or "").strip().lower() == "/cancel":
@@ -1053,7 +1446,7 @@ async def lupa_city_manual(message: Message, state: FSMContext):
         await message.reply("Введите название города или /cancel.", reply_markup=get_cancel_keyboard())
         return
     await state.update_data(city=city)
-    await state.set_state(LupaTicketStates.WAITING_FOR_DESCRIPTION)
+    await state.set_state(TicketWizardStates.LUPA_DESCRIPTION)
     await message.reply(
         f"✅ Город: {city}\n\n"
         "Шаг 4/5: Введите комментарий (описание проблемы):\n\nМожно пропустить, нажав кнопку ниже.",
@@ -1062,7 +1455,7 @@ async def lupa_city_manual(message: Message, state: FSMContext):
     )
 
 
-@router.callback_query(LupaTicketStates.WAITING_FOR_DESCRIPTION, F.data == "lupa_skip_comment")
+@router.callback_query(TicketWizardStates.LUPA_DESCRIPTION, F.data == "lupa_skip_comment")
 async def lupa_skip_comment(callback: CallbackQuery, state: FSMContext):
     """Пропуск комментария → создание заявки."""
     await state.update_data(description="")
@@ -1114,7 +1507,7 @@ async def tp_employee_id_enter(message: Message, state: FSMContext):
     await _lupa_start_or_ask_department(message, state, is_callback=False)
 
 
-@router.callback_query(LupaTicketStates.WAITING_FOR_DEPARTMENT, F.data.startswith("department_page_"))
+@router.callback_query(TicketWizardStates.LUPA_DEPARTMENT, F.data.startswith("department_page_"))
 async def lupa_department_page(callback: CallbackQuery, state: FSMContext):
     """Пагинация списка подразделений для Lupa."""
     try:
@@ -1129,7 +1522,7 @@ async def lupa_department_page(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(LupaTicketStates.WAITING_FOR_DEPARTMENT, F.data.startswith("department_"))
+@router.callback_query(TicketWizardStates.LUPA_DEPARTMENT, F.data.startswith("department_"))
 async def lupa_department_select(callback: CallbackQuery, state: FSMContext):
     """Выбор подразделения для Lupa: сохраняем в профиль и переходим к выбору сервиса."""
     if "department_page_" in callback.data:
@@ -1149,7 +1542,7 @@ async def lupa_department_select(callback: CallbackQuery, state: FSMContext):
     profile = get_user_profile(callback.from_user.id) or {}
     profile["department"] = value
     save_user_profile(callback.from_user.id, profile)
-    await state.set_state(LupaTicketStates.SELECT_PROBLEMATIC_SERVICE)
+    await state.set_state(TicketWizardStates.LUPA_SERVICE)
     await state.update_data(ticket_type_id="lupa_search")
     await callback.message.edit_text(
         "🔍 <b>Создание заявки о поиске</b>\n\nШаг 1/5: Выберите проблемный сервис:",
@@ -1267,22 +1660,24 @@ async def wms_show_subtype_menu(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(lambda c: c.data == "wms_type_issue", WmsTicketStates.WAITING_WMS_SUBTYPE)
 async def wms_type_issue(callback: CallbackQuery, state: FSMContext):
-    """Проблема в работе WMS (как the_bot_wms): подразделение → процесс → тема → описание (пропустить) → вложения."""
+    """Проблема в работе WMS: подразделение → процесс → тема → описание → вложения."""
     profile = get_user_profile(callback.from_user.id) or {}
     dept_wms = (profile.get("department_wms") or "").strip()
-    await state.update_data(ticket_type_id="wms_issue")
     if dept_wms:
-        await state.set_state(WmsTicketStates.WAITING_FOR_PROCESS)
+        session = WizardSession("wms_issue", "WMS_ISSUE_PROCESS", {"department": dept_wms, "department_wms": dept_wms})
+        await state.set_state(TicketWizardStates.WMS_ISSUE_PROCESS)
+        await state.update_data(**save_wizard_session(session))
         await callback.message.edit_text(
-            "🚨 <b>Проблема в работе WMS</b>\n\nВыберите <b>сбойный процесс</b>:",
+            ticket_wizard.wms_issue_process_screen().text,
             parse_mode="HTML",
             reply_markup=get_wms_process_keyboard(),
         )
     else:
         from core.jira_wms_departments import get_wms_departments_async
-        depts = await get_wms_departments_async()
-        await state.set_state(TpSectionStates.WAITING_WMS_DEPARTMENT)
-        await state.update_data(tp_wms_departments_list=depts)
+        depts = await get_wms_departments_async() or []
+        session = WizardSession("wms_issue", "WMS_ISSUE_DEPARTMENT", {"departments": depts, "dept_page": 0})
+        await state.set_state(TicketWizardStates.WMS_ISSUE_DEPARTMENT)
+        await state.update_data(**save_wizard_session(session), departments=depts, dept_page=0)
         if not depts:
             await callback.message.edit_text(
                 "Список подразделений WMS недоступен. Попробуйте позже или обратитесь в поддержку.",
@@ -1292,7 +1687,7 @@ async def wms_type_issue(callback: CallbackQuery, state: FSMContext):
             )
         else:
             await callback.message.edit_text(
-                "🚨 <b>Проблема в работе WMS</b>\n\nВыберите ваше подразделение (оно будет сохранено в профиль):",
+                ticket_wizard.wms_issue_start_screen(has_department_wms=False, departments=depts).text,
                 parse_mode="HTML",
                 reply_markup=get_wms_department_keyboard(depts),
             )
@@ -1301,23 +1696,25 @@ async def wms_type_issue(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(lambda c: c.data == "wms_type_settings", WmsTicketStates.WAITING_WMS_SUBTYPE)
 async def wms_type_settings(callback: CallbackQuery, state: FSMContext):
-    """Изменение настроек системы WMS: подразделение → тип услуги → описание → вложения (обязательно) → завершить."""
+    """Изменение настроек системы WMS: подразделение → тип услуги → описание → вложения → завершить."""
     await callback.answer()
     profile = get_user_profile(callback.from_user.id) or {}
     dept_wms = (profile.get("department_wms") or "").strip()
-    await state.update_data(ticket_type_id="wms_settings")
     if dept_wms:
-        await state.set_state(WmsSettingsStates.WAITING_SERVICE_TYPE)
+        session = WizardSession("wms_settings", "WMS_SETTINGS_SERVICE_TYPE", {"department": dept_wms})
+        await state.set_state(TicketWizardStates.WMS_SETTINGS_SERVICE_TYPE)
+        await state.update_data(**save_wizard_session(session))
         await callback.message.edit_text(
-            "⚙️ <b>Изменение настроек системы WMS</b>\n\nВыберите тип услуги:",
+            ticket_wizard.wms_settings_service_type_screen().text,
             parse_mode="HTML",
             reply_markup=get_wms_service_type_keyboard(),
         )
     else:
         from core.jira_wms_departments import get_wms_departments_async
-        depts = await get_wms_departments_async()
-        await state.set_state(WmsSettingsStates.WAITING_DEPARTMENT)
-        await state.update_data(tp_wms_departments_list=depts)
+        depts = await get_wms_departments_async() or []
+        session = WizardSession("wms_settings", "WMS_SETTINGS_DEPARTMENT", {"departments": depts, "dept_page": 0})
+        await state.set_state(TicketWizardStates.WMS_SETTINGS_DEPARTMENT)
+        await state.update_data(**save_wizard_session(session), departments=depts, dept_page=0)
         if not depts:
             await callback.message.edit_text(
                 "Список подразделений WMS недоступен. Попробуйте позже или обратитесь в поддержку.",
@@ -1327,13 +1724,13 @@ async def wms_type_settings(callback: CallbackQuery, state: FSMContext):
             )
         else:
             await callback.message.edit_text(
-                "⚙️ <b>Изменение настроек системы WMS</b>\n\nВыберите ваше подразделение:",
+                ticket_wizard.wms_settings_department_screen(depts).text,
                 parse_mode="HTML",
                 reply_markup=get_wms_department_keyboard(depts),
             )
 
 
-@router.callback_query(WmsSettingsStates.WAITING_DEPARTMENT, F.data.startswith("wms_dept_page_"))
+@router.callback_query(TicketWizardStates.WMS_SETTINGS_DEPARTMENT, F.data.startswith("wms_dept_page_"))
 async def wms_settings_department_page(callback: CallbackQuery, state: FSMContext):
     try:
         page = int(callback.data.replace("wms_dept_page_", ""))
@@ -1346,7 +1743,7 @@ async def wms_settings_department_page(callback: CallbackQuery, state: FSMContex
     await callback.answer()
 
 
-@router.callback_query(WmsSettingsStates.WAITING_DEPARTMENT, F.data.regexp(r"^wms_dept_\d+$"))
+@router.callback_query(TicketWizardStates.WMS_SETTINGS_DEPARTMENT, F.data.regexp(r"^wms_dept_\d+$"))
 async def wms_settings_department_select(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     depts = data.get("tp_wms_departments_list") or []
@@ -1362,17 +1759,20 @@ async def wms_settings_department_select(callback: CallbackQuery, state: FSMCont
     profile = get_user_profile(callback.from_user.id) or {}
     profile["department_wms"] = value
     save_user_profile(callback.from_user.id, profile)
-    await state.update_data(department=value)
-    await state.set_state(WmsSettingsStates.WAITING_SERVICE_TYPE)
+    await state.update_data(
+        department=value,
+        **save_wizard_session(ticket_wizard.WizardSession("wms_settings", "WMS_SETTINGS_SERVICE_TYPE")),
+    )
+    await state.set_state(TicketWizardStates.WMS_SETTINGS_SERVICE_TYPE)
     await callback.message.edit_text(
-        "⚙️ <b>Изменение настроек системы WMS</b>\n\nВыберите тип услуги:",
+        ticket_wizard.wms_settings_service_type_screen().text,
         parse_mode="HTML",
         reply_markup=get_wms_service_type_keyboard(),
     )
     await callback.answer()
 
 
-@router.callback_query(WmsSettingsStates.WAITING_SERVICE_TYPE, F.data.in_({"wms_service_topology", "wms_service_other"}))
+@router.callback_query(TicketWizardStates.WMS_SETTINGS_SERVICE_TYPE, F.data.in_({"wms_service_topology", "wms_service_other"}))
 async def wms_settings_service_type(callback: CallbackQuery, state: FSMContext):
     """Тип услуги: Изменение топологии / Другие настройки."""
     from core.wms_constants import WMS_SERVICE_TYPES
@@ -1382,16 +1782,19 @@ async def wms_settings_service_type(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Неверный выбор.", show_alert=True)
         return
     await callback.answer()
-    await state.update_data(service_type=service_type)
-    await state.set_state(WmsSettingsStates.WAITING_DESCRIPTION)
+    await state.update_data(
+        service_type=service_type,
+        **save_wizard_session(ticket_wizard.WizardSession("wms_settings", "WMS_SETTINGS_DESCRIPTION")),
+    )
+    await state.set_state(TicketWizardStates.WMS_SETTINGS_DESCRIPTION)
     await callback.message.edit_text(
-        "⚙️ <b>Изменение настроек системы WMS</b>\n\n📝 Введите описание изменений (или «-» для пропуска):",
+        ticket_wizard.wms_settings_description_screen().text,
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
     )
 
 
-@router.callback_query(WmsSettingsStates.WAITING_SERVICE_TYPE, F.data == "wms_show_subtype_menu")
+@router.callback_query(TicketWizardStates.WMS_SETTINGS_SERVICE_TYPE, F.data == "wms_show_subtype_menu")
 async def wms_settings_back_to_subtype(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     entry = data.get("wms_entry_point", "section")
@@ -1406,7 +1809,7 @@ async def wms_settings_back_to_subtype(callback: CallbackQuery, state: FSMContex
     await callback.answer()
 
 
-@router.message(WmsSettingsStates.WAITING_DESCRIPTION, F.text)
+@router.message(TicketWizardStates.WMS_SETTINGS_DESCRIPTION, F.text)
 async def wms_settings_description(message: Message, state: FSMContext):
     if (message.text or "").strip().lower() == "/cancel":
         await state.clear()
@@ -1415,16 +1818,20 @@ async def wms_settings_description(message: Message, state: FSMContext):
     desc = (message.text or "").strip()
     if desc == "—":
         desc = ""
-    await state.update_data(description=desc, wms_settings_attachment_file_ids=[])
-    await state.set_state(WmsSettingsStates.WAITING_ATTACHMENTS)
+    await state.update_data(
+        description=desc,
+        wms_settings_attachment_file_ids=[],
+        **save_wizard_session(ticket_wizard.WizardSession("wms_settings", "WMS_SETTINGS_ATTACHMENTS")),
+    )
+    await state.set_state(TicketWizardStates.WMS_SETTINGS_ATTACHMENTS)
     await message.reply(
-        "⚙️ <b>Изменение настроек системы WMS</b>\n\n📎 Загрузите вложения (обязательно). Добавлено: 0. Затем нажмите «✅ Завершить создание задачи».",
+        ticket_wizard.wms_settings_attachments_screen(added_count=0).text,
         parse_mode="HTML",
         reply_markup=_wms_settings_attachments_keyboard(),
     )
 
 
-@router.message(WmsSettingsStates.WAITING_ATTACHMENTS, F.photo | F.document | F.video)
+@router.message(TicketWizardStates.WMS_SETTINGS_ATTACHMENTS, F.photo | F.document | F.video)
 async def wms_settings_attachment_add(message: Message, state: FSMContext):
     data = await state.get_data()
     file_ids = list(data.get("wms_settings_attachment_file_ids") or [])
@@ -1454,7 +1861,7 @@ async def wms_settings_attachment_add(message: Message, state: FSMContext):
         await message.reply(f"📎 Добавлено {len(file_ids)} из 10. Приложите файлы и нажмите «✅ Завершить создание задачи».", reply_markup=_wms_settings_attachments_keyboard())
 
 
-@router.callback_query(WmsSettingsStates.WAITING_ATTACHMENTS, F.data == "finish_wms_settings")
+@router.callback_query(TicketWizardStates.WMS_SETTINGS_ATTACHMENTS, F.data == "finish_wms_settings")
 async def finish_wms_settings(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     file_ids = data.get("wms_settings_attachment_file_ids") or []
@@ -1523,16 +1930,19 @@ async def finish_wms_settings(callback: CallbackQuery, state: FSMContext):
 async def wms_type_psi_user(callback: CallbackQuery, state: FSMContext):
     """Создать/изменить/удалить пользователя PSIwms: тема → ФИО+должность → подразделение → комментарий → вложения (опционально)."""
     await callback.answer()
-    await state.update_data(ticket_type_id="wms_psi_user")
-    await state.set_state(PsiUserStates.WAITING_TITLE)
+    await state.update_data(
+        ticket_type_id="wms_psi_user",
+        **save_wizard_session(ticket_wizard.WizardSession("wms_psi_user", "PSI_TITLE")),
+    )
+    await state.set_state(TicketWizardStates.PSI_TITLE)
     await callback.message.edit_text(
-        "👤 <b>Создать/изменить/удалить пользователя PSIwms</b>\n\nВведите тему задачи (не менее 3 символов):",
+        ticket_wizard.psi_title_screen().text,
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
     )
 
 
-@router.message(PsiUserStates.WAITING_TITLE, F.text)
+@router.message(TicketWizardStates.PSI_TITLE, F.text)
 async def psi_user_title(message: Message, state: FSMContext):
     if (message.text or "").strip().lower() == "/cancel":
         await state.clear()
@@ -1542,16 +1952,19 @@ async def psi_user_title(message: Message, state: FSMContext):
     if len(title) < 3:
         await message.reply("Тема должна быть не менее 3 символов. Введите тему задачи:", reply_markup=get_cancel_keyboard())
         return
-    await state.update_data(summary=title)
-    await state.set_state(PsiUserStates.WAITING_FULL_NAME)
+    await state.update_data(
+        summary=title,
+        **save_wizard_session(ticket_wizard.WizardSession("wms_psi_user", "PSI_FULL_NAME")),
+    )
+    await state.set_state(TicketWizardStates.PSI_FULL_NAME)
     await message.reply(
-        "👤 Введите ФИО полностью и должность пользователя, кому нужно внести корректировки или создать учетную запись",
+        ticket_wizard.psi_full_name_screen().text,
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
     )
 
 
-@router.message(PsiUserStates.WAITING_FULL_NAME, F.text)
+@router.message(TicketWizardStates.PSI_FULL_NAME, F.text)
 async def psi_user_full_name(message: Message, state: FSMContext):
     if (message.text or "").strip().lower() == "/cancel":
         await state.clear()
@@ -1561,17 +1974,20 @@ async def psi_user_full_name(message: Message, state: FSMContext):
     profile = get_user_profile(message.from_user.id) or {}
     dept_wms = (profile.get("department_wms") or "").strip()
     if dept_wms:
-        await state.update_data(department=dept_wms)
-        await state.set_state(PsiUserStates.WAITING_COMMENT)
+        await state.update_data(
+            department=dept_wms,
+            **save_wizard_session(ticket_wizard.WizardSession("wms_psi_user", "PSI_COMMENT")),
+        )
+        await state.set_state(TicketWizardStates.PSI_COMMENT)
         await message.reply(
-            "👤 Что нужно сделать?",
+            ticket_wizard.psi_comment_screen().text,
             parse_mode="HTML",
             reply_markup=get_cancel_keyboard(),
         )
     else:
         from core.jira_wms_departments import get_wms_departments_async
         depts = await get_wms_departments_async()
-        await state.set_state(PsiUserStates.WAITING_DEPARTMENT)
+        await state.set_state(TicketWizardStates.PSI_DEPARTMENT)
         await state.update_data(psi_departments_list=depts)
         if not depts:
             await message.reply("Список подразделений недоступен. Введите подразделение текстом или /cancel.", reply_markup=get_cancel_keyboard())
@@ -1583,7 +1999,7 @@ async def psi_user_full_name(message: Message, state: FSMContext):
             )
 
 
-@router.callback_query(PsiUserStates.WAITING_DEPARTMENT, F.data.startswith("wms_dept_page_"))
+@router.callback_query(TicketWizardStates.PSI_DEPARTMENT, F.data.startswith("wms_dept_page_"))
 async def psi_user_department_page(callback: CallbackQuery, state: FSMContext):
     try:
         page = int(callback.data.replace("wms_dept_page_", ""))
@@ -1596,7 +2012,7 @@ async def psi_user_department_page(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(PsiUserStates.WAITING_DEPARTMENT, F.data.regexp(r"^wms_dept_\d+$"))
+@router.callback_query(TicketWizardStates.PSI_DEPARTMENT, F.data.regexp(r"^wms_dept_\d+$"))
 async def psi_user_department_select(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     depts = data.get("psi_departments_list") or []
@@ -1612,17 +2028,20 @@ async def psi_user_department_select(callback: CallbackQuery, state: FSMContext)
     profile = get_user_profile(callback.from_user.id) or {}
     profile["department_wms"] = value
     save_user_profile(callback.from_user.id, profile)
-    await state.update_data(department=value)
-    await state.set_state(PsiUserStates.WAITING_COMMENT)
+    await state.update_data(
+        department=value,
+        **save_wizard_session(ticket_wizard.WizardSession("wms_psi_user", "PSI_COMMENT")),
+    )
+    await state.set_state(TicketWizardStates.PSI_COMMENT)
     await callback.message.edit_text(
-        "👤 <b>Создать/изменить/удалить пользователя PSIwms</b>\n\nЧто нужно сделать?",
+        ticket_wizard.psi_comment_screen().text,
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(PsiUserStates.WAITING_COMMENT, F.text)
+@router.message(TicketWizardStates.PSI_COMMENT, F.text)
 async def psi_user_comment(message: Message, state: FSMContext):
     if (message.text or "").strip().lower() == "/cancel":
         await state.clear()
@@ -1631,16 +2050,20 @@ async def psi_user_comment(message: Message, state: FSMContext):
     comment = (message.text or "").strip()
     if comment == "—":
         comment = ""
-    await state.update_data(comment=comment, psi_attachment_file_ids=[])
-    await state.set_state(PsiUserStates.WAITING_ATTACHMENTS)
+    await state.update_data(
+        comment=comment,
+        psi_attachment_file_ids=[],
+        **save_wizard_session(ticket_wizard.WizardSession("wms_psi_user", "PSI_ATTACHMENTS")),
+    )
+    await state.set_state(TicketWizardStates.PSI_ATTACHMENTS)
     await message.reply(
-        "👤 <b>Создать/изменить/удалить пользователя PSIwms</b>\n\n📎 Вложения (опционально). Добавлено: 0. Нажмите «✅ Завершить создание задачи» или «⏭ Пропустить вложения».",
+        ticket_wizard.psi_attachments_screen(added_count=0).text,
         parse_mode="HTML",
         reply_markup=_psi_user_attachments_keyboard(),
     )
 
 
-@router.message(PsiUserStates.WAITING_ATTACHMENTS, F.photo | F.document | F.video)
+@router.message(TicketWizardStates.PSI_ATTACHMENTS, F.photo | F.document | F.video)
 async def psi_user_attachment_add(message: Message, state: FSMContext):
     data = await state.get_data()
     file_ids = list(data.get("psi_attachment_file_ids") or [])
@@ -1726,7 +2149,7 @@ async def _finish_psi_user_common(callback: CallbackQuery, state: FSMContext, fi
     )
 
 
-@router.callback_query(PsiUserStates.WAITING_ATTACHMENTS, F.data == "finish_psi_user")
+@router.callback_query(TicketWizardStates.PSI_ATTACHMENTS, F.data == "finish_psi_user")
 async def finish_psi_user(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     data = await state.get_data()
@@ -1734,13 +2157,13 @@ async def finish_psi_user(callback: CallbackQuery, state: FSMContext):
     await _finish_psi_user_common(callback, state, file_ids)
 
 
-@router.callback_query(PsiUserStates.WAITING_ATTACHMENTS, F.data == "skip_psi_attachment")
+@router.callback_query(TicketWizardStates.PSI_ATTACHMENTS, F.data == "skip_psi_attachment")
 async def skip_psi_attachment(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await _finish_psi_user_common(callback, state, [])
 
 
-@router.callback_query(WmsTicketStates.WAITING_FOR_PROCESS, F.data.startswith("wms_process_"))
+@router.callback_query(TicketWizardStates.WMS_ISSUE_PROCESS, F.data.startswith("wms_process_"))
 async def wms_process_callback(callback: CallbackQuery, state: FSMContext):
     """Шаг 2: выбор сбойного процесса (как the_bot_wms)."""
     from core.wms_constants import WMS_PROCESSES
@@ -1750,16 +2173,18 @@ async def wms_process_callback(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Неверный выбор.", show_alert=True)
         return
     await callback.answer()
-    await state.update_data(process=process_value)
-    await state.set_state(WmsTicketStates.WAITING_FOR_SUMMARY)
+    await state.update_data(process=process_value, **save_wizard_session(
+        ticket_wizard.WizardSession("wms_issue", "WMS_ISSUE_SUMMARY")
+    ))
+    await state.set_state(TicketWizardStates.WMS_ISSUE_SUMMARY)
     await callback.message.edit_text(
-        "🚨 <b>Проблема в работе WMS</b>\n\nВведите <b>тему</b> проблемы (кратко):",
+        ticket_wizard.wms_issue_summary_screen().text,
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
     )
 
 
-@router.message(WmsTicketStates.WAITING_FOR_PROCESS, F.text)
+@router.message(TicketWizardStates.WMS_ISSUE_PROCESS, F.text)
 async def wms_process_message(message: Message, state: FSMContext):
     """Процесс выбирается только кнопкой."""
     if (message.text or "").strip().lower() == "/cancel":
@@ -1773,32 +2198,35 @@ async def wms_process_message(message: Message, state: FSMContext):
     )
 
 
-@router.message(WmsTicketStates.WAITING_FOR_SUMMARY, F.text)
+@router.message(TicketWizardStates.WMS_ISSUE_SUMMARY, F.text)
 async def wms_summary(message: Message, state: FSMContext):
     """Шаг 3: тема заявки."""
     if (message.text or "").strip().lower() == "/cancel":
         await state.clear()
         await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
         return
-    await state.update_data(summary=(message.text or "").strip())
-    await state.set_state(WmsTicketStates.WAITING_FOR_DESCRIPTION)
+    await state.update_data(
+        summary=(message.text or "").strip(),
+        **save_wizard_session(ticket_wizard.WizardSession("wms_issue", "WMS_ISSUE_DESCRIPTION")),
+    )
+    await state.set_state(TicketWizardStates.WMS_ISSUE_DESCRIPTION)
     skip_btn = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏭ Пропустить", callback_data="wms_skip_description")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
     ])
     await message.reply(
-        "Введите <b>подробное описание</b> проблемы или нажмите «Пропустить»:",
+        ticket_wizard.wms_issue_description_screen().text,
         parse_mode="HTML",
         reply_markup=skip_btn,
     )
 
 
-@router.callback_query(WmsTicketStates.WAITING_FOR_DESCRIPTION, F.data == "wms_skip_description")
+@router.callback_query(TicketWizardStates.WMS_ISSUE_DESCRIPTION, F.data == "wms_skip_description")
 async def wms_skip_description(callback: CallbackQuery, state: FSMContext):
     """Пропуск описания → шаг вложений."""
     await callback.answer()
     await state.update_data(description="", wms_attachment_file_ids=[])
-    await state.set_state(WmsTicketStates.WAITING_FOR_ATTACHMENTS)
+    await state.set_state(TicketWizardStates.WMS_ISSUE_DESCRIPTION)
     text = (
         "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый).\n\n"
         "Добавлено: 0 из 10.\n\nИли нажмите «Завершить создание тикета»."
@@ -1841,7 +2269,7 @@ def _pc_issue_attachments_keyboard():
 
 
 async def _pc_issue_enter_attachments(callback_or_message, state: FSMContext, is_callback: bool):
-    await state.set_state(PcIssueStates.WAITING_FOR_ATTACHMENTS)
+    await state.set_state(TicketWizardStates.PC_ATTACHMENTS)
     await state.update_data(pc_attachment_file_ids=[])
     text = (
         "🖥️ <b>Проблема в работе ПК</b>\n\n"
@@ -1855,13 +2283,13 @@ async def _pc_issue_enter_attachments(callback_or_message, state: FSMContext, is
         await callback_or_message.reply(text, parse_mode="HTML", reply_markup=_pc_issue_attachments_keyboard())
 
 
-@router.callback_query(PcIssueStates.WAITING_FOR_DESCRIPTION, F.data == "pc_skip_description")
+@router.callback_query(TicketWizardStates.PC_DESCRIPTION, F.data == "pc_skip_description")
 async def pc_skip_description(callback: CallbackQuery, state: FSMContext):
     await state.update_data(description="")
     await _pc_issue_enter_attachments(callback, state, is_callback=True)
 
 
-@router.message(PcIssueStates.WAITING_FOR_DESCRIPTION, F.text)
+@router.message(TicketWizardStates.PC_DESCRIPTION, F.text)
 async def pc_description(message: Message, state: FSMContext):
     if (message.text or "").strip().lower() == "/cancel":
         await state.clear()
@@ -1871,7 +2299,7 @@ async def pc_description(message: Message, state: FSMContext):
     await _pc_issue_enter_attachments(message, state, is_callback=False)
 
 
-@router.message(PcIssueStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+@router.message(TicketWizardStates.PC_ATTACHMENTS, F.photo | F.document | F.video)
 async def pc_attachment_add(message: Message, state: FSMContext):
     data = await state.get_data()
     file_ids = list(data.get("pc_attachment_file_ids") or [])
@@ -1978,12 +2406,12 @@ async def _finish_pc_issue_common(callback: CallbackQuery, state: FSMContext, fi
                 pass
 
 
-@router.callback_query(PcIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "pc_skip_attachments")
+@router.callback_query(TicketWizardStates.PC_ATTACHMENTS, F.data == "pc_skip_attachments")
 async def pc_skip_attachments(callback: CallbackQuery, state: FSMContext):
     await _finish_pc_issue_common(callback, state, [])
 
 
-@router.callback_query(PcIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "pc_finish_ticket")
+@router.callback_query(TicketWizardStates.PC_ATTACHMENTS, F.data == "pc_finish_ticket")
 async def pc_finish_ticket(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     file_ids = data.get("pc_attachment_file_ids") or []
@@ -2011,40 +2439,43 @@ async def orgtech_issue_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
     await state.clear()
-    await state.set_state(OrgtechIssueStates.WAITING_FOR_KIND)
+    await state.set_state(TicketWizardStates.ORGTECH_KIND)
+    await state.update_data(**save_wizard_session(ticket_wizard.WizardSession("orgtech_problem", "ORGTECH_KIND")))
     await callback.message.edit_text(
-        "🖨️ <b>Оргтехника</b>\n\nУкажите тип оргтехники:",
+        ticket_wizard.orgtech_kind_screen().text,
         parse_mode="HTML",
         reply_markup=get_orgtech_kind_keyboard(),
     )
     await callback.answer()
 
 
-@router.callback_query(OrgtechIssueStates.WAITING_FOR_KIND, F.data.startswith("orgtech_kind_"))
+@router.callback_query(TicketWizardStates.ORGTECH_KIND, F.data.startswith("orgtech_kind_"))
 async def orgtech_select_kind(callback: CallbackQuery, state: FSMContext):
     kind_id = callback.data.replace("orgtech_kind_", "", 1).strip()
     kind_label = ORGTECH_KIND_BY_ID.get(kind_id)
     if not kind_label:
         await callback.answer("Неверный выбор.", show_alert=True)
         return
-    await state.update_data(orgtech_kind=kind_label)
-    await state.set_state(OrgtechIssueStates.WAITING_FOR_LOCATION)
+    await state.update_data(
+        orgtech_kind=kind_label,
+        kind_label=kind_label,
+        **save_wizard_session(ticket_wizard.WizardSession("orgtech_problem", "ORGTECH_LOCATION")),
+    )
+    await state.set_state(TicketWizardStates.ORGTECH_LOCATION)
     await callback.message.edit_text(
-        "🖨️ <b>Оргтехника</b>\n\n"
-        f"✅ Тип: {kind_label}\n\n"
-        "Укажите местоположение (обязательно):",
+        ticket_wizard.orgtech_location_screen(kind_label=kind_label).text,
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(OrgtechIssueStates.WAITING_FOR_KIND, F.text)
+@router.message(TicketWizardStates.ORGTECH_KIND, F.text)
 async def orgtech_kind_text(message: Message):
     await message.reply("Выберите тип оргтехники кнопкой ниже.", reply_markup=get_orgtech_kind_keyboard())
 
 
-@router.message(OrgtechIssueStates.WAITING_FOR_LOCATION, F.text)
+@router.message(TicketWizardStates.ORGTECH_LOCATION, F.text)
 async def orgtech_location(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
@@ -2054,43 +2485,52 @@ async def orgtech_location(message: Message, state: FSMContext):
     if not text:
         await message.reply("Укажите местоположение.", reply_markup=get_cancel_keyboard())
         return
-    await state.update_data(location=text)
-    await state.set_state(OrgtechIssueStates.WAITING_FOR_DESCRIPTION)
+    await state.update_data(
+        location=text,
+        **save_wizard_session(ticket_wizard.WizardSession("orgtech_problem", "ORGTECH_DESCRIPTION")),
+    )
+    await state.set_state(TicketWizardStates.ORGTECH_DESCRIPTION)
     await message.reply(
-        "Опишите проблему (поле Description) или нажмите «Пропустить».",
+        ticket_wizard.orgtech_description_screen().text,
         reply_markup=_orgtech_desc_keyboard(),
     )
 
 
-@router.callback_query(OrgtechIssueStates.WAITING_FOR_DESCRIPTION, F.data == "orgtech_skip_description")
+@router.callback_query(TicketWizardStates.ORGTECH_DESCRIPTION, F.data == "orgtech_skip_description")
 async def orgtech_skip_description(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(description="", orgtech_attachment_file_ids=[])
-    await state.set_state(OrgtechIssueStates.WAITING_FOR_ATTACHMENTS)
+    await state.update_data(
+        description="",
+        orgtech_attachment_file_ids=[],
+        **save_wizard_session(ticket_wizard.WizardSession("orgtech_problem", "ORGTECH_ATTACHMENTS")),
+    )
+    await state.set_state(TicketWizardStates.ORGTECH_ATTACHMENTS)
     await callback.message.edit_text(
-        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
-        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        ticket_wizard.orgtech_attachments_screen(added_count=0).text,
         reply_markup=_orgtech_attachments_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(OrgtechIssueStates.WAITING_FOR_DESCRIPTION, F.text)
+@router.message(TicketWizardStates.ORGTECH_DESCRIPTION, F.text)
 async def orgtech_description(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
         await state.clear()
         await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
         return
-    await state.update_data(description=text, orgtech_attachment_file_ids=[])
-    await state.set_state(OrgtechIssueStates.WAITING_FOR_ATTACHMENTS)
+    await state.update_data(
+        description=text,
+        orgtech_attachment_file_ids=[],
+        **save_wizard_session(ticket_wizard.WizardSession("orgtech_problem", "ORGTECH_ATTACHMENTS")),
+    )
+    await state.set_state(TicketWizardStates.ORGTECH_ATTACHMENTS)
     await message.reply(
-        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
-        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        ticket_wizard.orgtech_attachments_screen(added_count=0).text,
         reply_markup=_orgtech_attachments_keyboard(),
     )
 
 
-@router.message(OrgtechIssueStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+@router.message(TicketWizardStates.ORGTECH_ATTACHMENTS, F.photo | F.document | F.video)
 async def orgtech_attachment_add(message: Message, state: FSMContext):
     data = await state.get_data()
     file_ids = list(data.get("orgtech_attachment_file_ids") or [])
@@ -2193,12 +2633,12 @@ async def _finish_orgtech_common(callback: CallbackQuery, state: FSMContext, fil
                 pass
 
 
-@router.callback_query(OrgtechIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "orgtech_skip_attachments")
+@router.callback_query(TicketWizardStates.ORGTECH_ATTACHMENTS, F.data == "orgtech_skip_attachments")
 async def orgtech_skip_attachments(callback: CallbackQuery, state: FSMContext):
     await _finish_orgtech_common(callback, state, [])
 
 
-@router.callback_query(OrgtechIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "orgtech_finish_ticket")
+@router.callback_query(TicketWizardStates.ORGTECH_ATTACHMENTS, F.data == "orgtech_finish_ticket")
 async def orgtech_finish_ticket(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     file_ids = data.get("orgtech_attachment_file_ids") or []
@@ -2226,40 +2666,43 @@ async def peripheral_issue_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
     await state.clear()
-    await state.set_state(PeripheralEquipmentStates.WAITING_FOR_KIND)
+    await state.set_state(TicketWizardStates.PERIPHERAL_KIND)
+    await state.update_data(**save_wizard_session(ticket_wizard.WizardSession("peripheral_equipment", "PERIPHERAL_KIND")))
     await callback.message.edit_text(
-        "🧩 <b>Периферийное оборудование</b>\n\nВыберите вид оборудования:",
+        ticket_wizard.peripheral_kind_screen().text,
         parse_mode="HTML",
         reply_markup=get_peripheral_kind_keyboard(),
     )
     await callback.answer()
 
 
-@router.callback_query(PeripheralEquipmentStates.WAITING_FOR_KIND, F.data.startswith("peripheral_kind_"))
+@router.callback_query(TicketWizardStates.PERIPHERAL_KIND, F.data.startswith("peripheral_kind_"))
 async def peripheral_select_kind(callback: CallbackQuery, state: FSMContext):
     kind_id = callback.data.replace("peripheral_kind_", "", 1).strip()
     kind_label = PERIPHERAL_KIND_BY_ID.get(kind_id)
     if not kind_label:
         await callback.answer("Неверный выбор.", show_alert=True)
         return
-    await state.update_data(peripheral_kind=kind_label)
-    await state.set_state(PeripheralEquipmentStates.WAITING_FOR_IP)
+    await state.update_data(
+        peripheral_kind=kind_label,
+        kind_label=kind_label,
+        **save_wizard_session(ticket_wizard.WizardSession("peripheral_equipment", "PERIPHERAL_IP")),
+    )
+    await state.set_state(TicketWizardStates.PERIPHERAL_IP)
     await callback.message.edit_text(
-        "🧩 <b>Периферийное оборудование</b>\n\n"
-        f"✅ Вид оборудования: {kind_label}\n\n"
-        "Укажите IP адрес (если нет, напишите «нет»):",
+        ticket_wizard.peripheral_ip_screen(kind_label=kind_label).text,
         parse_mode="HTML",
         reply_markup=get_cancel_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(PeripheralEquipmentStates.WAITING_FOR_KIND, F.text)
+@router.message(TicketWizardStates.PERIPHERAL_KIND, F.text)
 async def peripheral_kind_text(message: Message):
     await message.reply("Выберите вид оборудования кнопкой ниже.", reply_markup=get_peripheral_kind_keyboard())
 
 
-@router.message(PeripheralEquipmentStates.WAITING_FOR_IP, F.text)
+@router.message(TicketWizardStates.PERIPHERAL_IP, F.text)
 async def peripheral_ip(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
@@ -2269,40 +2712,49 @@ async def peripheral_ip(message: Message, state: FSMContext):
     if not text:
         await message.reply("Укажите IP адрес или «нет».", reply_markup=get_cancel_keyboard())
         return
-    await state.update_data(ip_address=text)
-    await state.set_state(PeripheralEquipmentStates.WAITING_FOR_DESCRIPTION)
-    await message.reply("Опишите проблему (Description) или нажмите «Пропустить».", reply_markup=_peripheral_desc_keyboard())
+    await state.update_data(
+        ip_address=text,
+        **save_wizard_session(ticket_wizard.WizardSession("peripheral_equipment", "PERIPHERAL_DESCRIPTION")),
+    )
+    await state.set_state(TicketWizardStates.PERIPHERAL_DESCRIPTION)
+    await message.reply(ticket_wizard.peripheral_description_screen().text, reply_markup=_peripheral_desc_keyboard())
 
 
-@router.callback_query(PeripheralEquipmentStates.WAITING_FOR_DESCRIPTION, F.data == "peripheral_skip_description")
+@router.callback_query(TicketWizardStates.PERIPHERAL_DESCRIPTION, F.data == "peripheral_skip_description")
 async def peripheral_skip_description(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(description="", peripheral_attachment_file_ids=[])
-    await state.set_state(PeripheralEquipmentStates.WAITING_FOR_ATTACHMENTS)
+    await state.update_data(
+        description="",
+        peripheral_attachment_file_ids=[],
+        **save_wizard_session(ticket_wizard.WizardSession("peripheral_equipment", "PERIPHERAL_ATTACHMENTS")),
+    )
+    await state.set_state(TicketWizardStates.PERIPHERAL_ATTACHMENTS)
     await callback.message.edit_text(
-        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
-        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        ticket_wizard.peripheral_attachments_screen(added_count=0).text,
         reply_markup=_peripheral_attachments_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(PeripheralEquipmentStates.WAITING_FOR_DESCRIPTION, F.text)
+@router.message(TicketWizardStates.PERIPHERAL_DESCRIPTION, F.text)
 async def peripheral_description(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
         await state.clear()
         await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
         return
-    await state.update_data(description=text, peripheral_attachment_file_ids=[])
-    await state.set_state(PeripheralEquipmentStates.WAITING_FOR_ATTACHMENTS)
+    await state.update_data(
+        description=text,
+        peripheral_attachment_file_ids=[],
+        **save_wizard_session(ticket_wizard.WizardSession("peripheral_equipment", "PERIPHERAL_ATTACHMENTS")),
+    )
+    await state.set_state(TicketWizardStates.PERIPHERAL_ATTACHMENTS)
     await message.reply(
-        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
-        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        ticket_wizard.peripheral_attachments_screen(added_count=0).text,
         reply_markup=_peripheral_attachments_keyboard(),
     )
 
 
-@router.message(PeripheralEquipmentStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+@router.message(TicketWizardStates.PERIPHERAL_ATTACHMENTS, F.photo | F.document | F.video)
 async def peripheral_attachment_add(message: Message, state: FSMContext):
     data = await state.get_data()
     file_ids = list(data.get("peripheral_attachment_file_ids") or [])
@@ -2405,12 +2857,12 @@ async def _finish_peripheral_common(callback: CallbackQuery, state: FSMContext, 
                 pass
 
 
-@router.callback_query(PeripheralEquipmentStates.WAITING_FOR_ATTACHMENTS, F.data == "peripheral_skip_attachments")
+@router.callback_query(TicketWizardStates.PERIPHERAL_ATTACHMENTS, F.data == "peripheral_skip_attachments")
 async def peripheral_skip_attachments(callback: CallbackQuery, state: FSMContext):
     await _finish_peripheral_common(callback, state, [])
 
 
-@router.callback_query(PeripheralEquipmentStates.WAITING_FOR_ATTACHMENTS, F.data == "peripheral_finish_ticket")
+@router.callback_query(TicketWizardStates.PERIPHERAL_ATTACHMENTS, F.data == "peripheral_finish_ticket")
 async def peripheral_finish_ticket(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     file_ids = data.get("peripheral_attachment_file_ids") or []
@@ -2451,16 +2903,17 @@ async def network_issue_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
     await state.clear()
-    await state.set_state(NetworkIssueStates.WAITING_FOR_NETWORK_TYPE)
+    await state.set_state(TicketWizardStates.NETWORK_TYPE)
+    await state.update_data(**save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_TYPE")))
     await callback.message.edit_text(
-        "🌐 <b>Проблемы в работе сети</b>\n\nВыберите тип проблемной сети:",
+        ticket_wizard.network_type_screen().text,
         parse_mode="HTML",
         reply_markup=_network_select_keyboard(NETWORK_TYPES, "network_type_"),
     )
     await callback.answer()
 
 
-@router.callback_query(NetworkIssueStates.WAITING_FOR_NETWORK_TYPE, F.data.startswith("network_type_"))
+@router.callback_query(TicketWizardStates.NETWORK_TYPE, F.data.startswith("network_type_"))
 async def network_select_type(callback: CallbackQuery, state: FSMContext):
     type_id = callback.data.replace("network_type_", "", 1).strip()
     type_label = NETWORK_TYPE_BY_ID.get(type_id)
@@ -2469,57 +2922,57 @@ async def network_select_type(callback: CallbackQuery, state: FSMContext):
         return
     await state.update_data(network_type=type_label, provider="", provider_other="", wifi_problem_owner="", pc_type="")
     if type_label == "Wi-Fi (беспроводная)":
-        await state.set_state(NetworkIssueStates.WAITING_FOR_WIFI_OWNER)
+        await state.update_data(**save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_WIFI_OWNER")))
+        await state.set_state(TicketWizardStates.NETWORK_WIFI_OWNER)
         await callback.message.edit_text(
-            "🌐 <b>Проблемы в работе сети</b>\n\n"
-            f"✅ Тип сети: {type_label}\n\n"
-            "Укажите, у кого проблемы:",
+            ticket_wizard.network_wifi_owner_screen(network_type=type_label).text,
             parse_mode="HTML",
             reply_markup=_network_select_keyboard(NETWORK_WIFI_OWNERS, "network_wifi_owner_"),
         )
     elif type_label == "VPN":
-        await state.set_state(NetworkIssueStates.WAITING_FOR_PC_TYPE)
+        await state.update_data(**save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_PC_TYPE")))
+        await state.set_state(TicketWizardStates.NETWORK_PC_TYPE)
         await callback.message.edit_text(
-            "🌐 <b>Проблемы в работе сети</b>\n\n"
-            f"✅ Тип сети: {type_label}\n\n"
-            "Выберите тип ПК:",
+            ticket_wizard.network_pc_type_screen(network_type=type_label).text,
             parse_mode="HTML",
             reply_markup=_network_select_keyboard(NETWORK_PC_TYPES, "network_pc_type_"),
         )
     else:
-        await state.set_state(NetworkIssueStates.WAITING_FOR_PROVIDER)
+        await state.update_data(**save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_PROVIDER")))
+        await state.set_state(TicketWizardStates.NETWORK_PROVIDER)
         await callback.message.edit_text(
-            "🌐 <b>Проблемы в работе сети</b>\n\n"
-            f"✅ Тип сети: {type_label}\n\n"
-            "Выберите провайдера:",
+            ticket_wizard.network_provider_screen(network_type=type_label).text,
             parse_mode="HTML",
             reply_markup=_network_select_keyboard(NETWORK_PROVIDERS, "network_provider_"),
         )
     await callback.answer()
 
 
-@router.message(NetworkIssueStates.WAITING_FOR_NETWORK_TYPE, F.text)
+@router.message(TicketWizardStates.NETWORK_TYPE, F.text)
 async def network_type_text(message: Message):
     await message.reply("Выберите тип сети кнопкой ниже.", reply_markup=_network_select_keyboard(NETWORK_TYPES, "network_type_"))
 
 
-@router.callback_query(NetworkIssueStates.WAITING_FOR_WIFI_OWNER, F.data.startswith("network_wifi_owner_"))
+@router.callback_query(TicketWizardStates.NETWORK_WIFI_OWNER, F.data.startswith("network_wifi_owner_"))
 async def network_select_wifi_owner(callback: CallbackQuery, state: FSMContext):
     owner_id = callback.data.replace("network_wifi_owner_", "", 1).strip()
     owner_label = NETWORK_WIFI_OWNER_BY_ID.get(owner_id)
     if not owner_label:
         await callback.answer("Неверный выбор.", show_alert=True)
         return
-    await state.update_data(wifi_problem_owner=owner_label)
-    await state.set_state(NetworkIssueStates.WAITING_FOR_RMS)
+    await state.update_data(
+        wifi_problem_owner=owner_label,
+        **save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_RMS")),
+    )
+    await state.set_state(TicketWizardStates.NETWORK_RMS)
     await callback.message.edit_text(
-        "Укажите RMS Internet ID (опционально) или нажмите «Пропустить».",
+        ticket_wizard.network_rms_screen().text,
         reply_markup=_network_rms_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(NetworkIssueStates.WAITING_FOR_WIFI_OWNER, F.text)
+@router.message(TicketWizardStates.NETWORK_WIFI_OWNER, F.text)
 async def network_wifi_owner_text(message: Message):
     await message.reply(
         "Выберите вариант кнопкой ниже.",
@@ -2527,23 +2980,27 @@ async def network_wifi_owner_text(message: Message):
     )
 
 
-@router.callback_query(NetworkIssueStates.WAITING_FOR_PC_TYPE, F.data.startswith("network_pc_type_"))
+@router.callback_query(TicketWizardStates.NETWORK_PC_TYPE, F.data.startswith("network_pc_type_"))
 async def network_select_pc_type(callback: CallbackQuery, state: FSMContext):
     pc_id = callback.data.replace("network_pc_type_", "", 1).strip()
     pc_label = NETWORK_PC_TYPE_BY_ID.get(pc_id)
     if not pc_label:
         await callback.answer("Неверный выбор.", show_alert=True)
         return
-    await state.update_data(pc_type=pc_label)
-    await state.set_state(NetworkIssueStates.WAITING_FOR_PROVIDER)
+    data = await state.get_data()
+    await state.update_data(
+        pc_type=pc_label,
+        **save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_PROVIDER")),
+    )
+    await state.set_state(TicketWizardStates.NETWORK_PROVIDER)
     await callback.message.edit_text(
-        "Выберите провайдера:",
+        ticket_wizard.network_provider_screen(network_type=data.get("network_type", "")).text,
         reply_markup=_network_select_keyboard(NETWORK_PROVIDERS, "network_provider_"),
     )
     await callback.answer()
 
 
-@router.message(NetworkIssueStates.WAITING_FOR_PC_TYPE, F.text)
+@router.message(TicketWizardStates.NETWORK_PC_TYPE, F.text)
 async def network_pc_type_text(message: Message):
     await message.reply(
         "Выберите тип ПК кнопкой ниже.",
@@ -2551,7 +3008,7 @@ async def network_pc_type_text(message: Message):
     )
 
 
-@router.callback_query(NetworkIssueStates.WAITING_FOR_PROVIDER, F.data.startswith("network_provider_"))
+@router.callback_query(TicketWizardStates.NETWORK_PROVIDER, F.data.startswith("network_provider_"))
 async def network_select_provider(callback: CallbackQuery, state: FSMContext):
     provider_id = callback.data.replace("network_provider_", "", 1).strip()
     provider_label = NETWORK_PROVIDER_BY_ID.get(provider_id)
@@ -2560,22 +3017,26 @@ async def network_select_provider(callback: CallbackQuery, state: FSMContext):
         return
     await state.update_data(provider=provider_label)
     if provider_label == "Другой":
-        await state.set_state(NetworkIssueStates.WAITING_FOR_PROVIDER_OTHER)
+        await state.update_data(**save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_PROVIDER_OTHER")))
+        await state.set_state(TicketWizardStates.NETWORK_PROVIDER_OTHER)
         await callback.message.edit_text(
-            "Укажите название поставщика услуг (поле Other):",
+            ticket_wizard.network_provider_other_screen().text,
             reply_markup=get_cancel_keyboard(),
         )
     else:
-        await state.update_data(provider_other="")
-        await state.set_state(NetworkIssueStates.WAITING_FOR_RMS)
+        await state.update_data(
+            provider_other="",
+            **save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_RMS")),
+        )
+        await state.set_state(TicketWizardStates.NETWORK_RMS)
         await callback.message.edit_text(
-            "Укажите RMS Internet ID (опционально) или нажмите «Пропустить».",
+            ticket_wizard.network_rms_screen().text,
             reply_markup=_network_rms_keyboard(),
         )
     await callback.answer()
 
 
-@router.message(NetworkIssueStates.WAITING_FOR_PROVIDER, F.text)
+@router.message(TicketWizardStates.NETWORK_PROVIDER, F.text)
 async def network_provider_text(message: Message):
     await message.reply(
         "Выберите провайдера кнопкой ниже.",
@@ -2583,7 +3044,7 @@ async def network_provider_text(message: Message):
     )
 
 
-@router.message(NetworkIssueStates.WAITING_FOR_PROVIDER_OTHER, F.text)
+@router.message(TicketWizardStates.NETWORK_PROVIDER_OTHER, F.text)
 async def network_provider_other(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
@@ -2593,63 +3054,78 @@ async def network_provider_other(message: Message, state: FSMContext):
     if not text:
         await message.reply("Укажите поставщика услуг.", reply_markup=get_cancel_keyboard())
         return
-    await state.update_data(provider_other=text)
-    await state.set_state(NetworkIssueStates.WAITING_FOR_RMS)
-    await message.reply("Укажите RMS Internet ID (опционально) или нажмите «Пропустить».", reply_markup=_network_rms_keyboard())
+    await state.update_data(
+        provider_other=text,
+        **save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_RMS")),
+    )
+    await state.set_state(TicketWizardStates.NETWORK_RMS)
+    await message.reply(ticket_wizard.network_rms_screen().text, reply_markup=_network_rms_keyboard())
 
 
-@router.callback_query(NetworkIssueStates.WAITING_FOR_RMS, F.data == "network_skip_rms")
+@router.callback_query(TicketWizardStates.NETWORK_RMS, F.data == "network_skip_rms")
 async def network_skip_rms(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(rms_internet_id="нет")
-    await state.set_state(NetworkIssueStates.WAITING_FOR_DESCRIPTION)
+    await state.update_data(
+        rms_internet_id="нет",
+        **save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_DESCRIPTION")),
+    )
+    await state.set_state(TicketWizardStates.NETWORK_DESCRIPTION)
     await callback.message.edit_text(
-        "Опишите проблему (Description) или нажмите «Пропустить».",
+        ticket_wizard.network_description_screen().text,
         reply_markup=_network_description_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(NetworkIssueStates.WAITING_FOR_RMS, F.text)
+@router.message(TicketWizardStates.NETWORK_RMS, F.text)
 async def network_rms(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
         await state.clear()
         await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
         return
-    await state.update_data(rms_internet_id=text or "нет")
-    await state.set_state(NetworkIssueStates.WAITING_FOR_DESCRIPTION)
-    await message.reply("Опишите проблему (Description) или нажмите «Пропустить».", reply_markup=_network_description_keyboard())
+    await state.update_data(
+        rms_internet_id=text or "нет",
+        **save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_DESCRIPTION")),
+    )
+    await state.set_state(TicketWizardStates.NETWORK_DESCRIPTION)
+    await message.reply(ticket_wizard.network_description_screen().text, reply_markup=_network_description_keyboard())
 
 
-@router.callback_query(NetworkIssueStates.WAITING_FOR_DESCRIPTION, F.data == "network_skip_description")
+@router.callback_query(TicketWizardStates.NETWORK_DESCRIPTION, F.data == "network_skip_description")
 async def network_skip_description(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(description="", network_attachment_file_ids=[])
-    await state.set_state(NetworkIssueStates.WAITING_FOR_ATTACHMENTS)
+    await state.update_data(
+        description="",
+        network_attachment_file_ids=[],
+        **save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_ATTACHMENTS")),
+    )
+    await state.set_state(TicketWizardStates.NETWORK_ATTACHMENTS)
     await callback.message.edit_text(
-        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
-        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        ticket_wizard.network_attachments_screen(added_count=0).text,
         reply_markup=_network_attachments_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(NetworkIssueStates.WAITING_FOR_DESCRIPTION, F.text)
+@router.message(TicketWizardStates.NETWORK_DESCRIPTION, F.text)
 async def network_description(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
         await state.clear()
         await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
         return
-    await state.update_data(description=text, network_attachment_file_ids=[])
-    await state.set_state(NetworkIssueStates.WAITING_FOR_ATTACHMENTS)
+    await state.update_data(
+        description=text,
+        network_attachment_file_ids=[],
+        **save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_ATTACHMENTS")),
+    )
+    await state.set_state(TicketWizardStates.NETWORK_ATTACHMENTS)
     await message.reply(
-        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый), "
-        "или нажмите «Создать заявку» / «Пропустить вложения».",
+        ticket_wizard.network_attachments_screen(added_count=0).text,
         reply_markup=_network_attachments_keyboard(),
     )
 
 
-@router.message(NetworkIssueStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+@router.message(TicketWizardStates.NETWORK_ATTACHMENTS, F.photo | F.document | F.video)
 async def network_attachment_add(message: Message, state: FSMContext):
     data = await state.get_data()
     file_ids = list(data.get("network_attachment_file_ids") or [])
@@ -2775,12 +3251,12 @@ async def _finish_network_common(callback: CallbackQuery, state: FSMContext, fil
                 pass
 
 
-@router.callback_query(NetworkIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "network_skip_attachments")
+@router.callback_query(TicketWizardStates.NETWORK_ATTACHMENTS, F.data == "network_skip_attachments")
 async def network_skip_attachments(callback: CallbackQuery, state: FSMContext):
     await _finish_network_common(callback, state, [])
 
 
-@router.callback_query(NetworkIssueStates.WAITING_FOR_ATTACHMENTS, F.data == "network_finish_ticket")
+@router.callback_query(TicketWizardStates.NETWORK_ATTACHMENTS, F.data == "network_finish_ticket")
 async def network_finish_ticket(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     file_ids = data.get("network_attachment_file_ids") or []
@@ -2799,7 +3275,7 @@ async def electronic_queue_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
     await state.clear()
-    await state.set_state(ElectronicQueueStates.WAITING_FOR_SERVICE_TYPE)
+    await state.set_state(TicketWizardStates.EQUEUE_SERVICE_TYPE)
     await callback.message.edit_text(
         "🎫 <b>Электронная очередь</b>\n\nВыберите тип услуги:",
         parse_mode="HTML",
@@ -2808,7 +3284,7 @@ async def electronic_queue_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(ElectronicQueueStates.WAITING_FOR_SERVICE_TYPE, F.data.startswith("eq_type_"))
+@router.callback_query(TicketWizardStates.EQUEUE_SERVICE_TYPE, F.data.startswith("eq_type_"))
 async def electronic_queue_select_type(callback: CallbackQuery, state: FSMContext):
     type_id = callback.data.replace("eq_type_", "", 1).strip()
     type_label = ELECTRONIC_QUEUE_SERVICE_TYPE_BY_ID.get(type_id)
@@ -2816,7 +3292,7 @@ async def electronic_queue_select_type(callback: CallbackQuery, state: FSMContex
         await callback.answer("Неверный выбор.", show_alert=True)
         return
     await state.update_data(service_type=type_label)
-    await state.set_state(ElectronicQueueStates.WAITING_FOR_DESCRIPTION)
+    await state.set_state(TicketWizardStates.EQUEUE_DESCRIPTION)
     await callback.message.edit_text(
         "🎫 <b>Электронная очередь</b>\n\n"
         f"✅ Тип услуги: {type_label}\n\n"
@@ -2827,12 +3303,12 @@ async def electronic_queue_select_type(callback: CallbackQuery, state: FSMContex
     await callback.answer()
 
 
-@router.message(ElectronicQueueStates.WAITING_FOR_SERVICE_TYPE, F.text)
+@router.message(TicketWizardStates.EQUEUE_SERVICE_TYPE, F.text)
 async def electronic_queue_type_text(message: Message):
     await message.reply("Выберите тип услуги кнопкой ниже.", reply_markup=_electronic_queue_type_keyboard())
 
 
-@router.message(ElectronicQueueStates.WAITING_FOR_DESCRIPTION, F.text)
+@router.message(TicketWizardStates.EQUEUE_DESCRIPTION, F.text)
 async def electronic_queue_description(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "/cancel":
@@ -2874,7 +3350,7 @@ async def electronic_queue_description(message: Message, state: FSMContext):
     )
 
 
-@router.message(WmsTicketStates.WAITING_FOR_DESCRIPTION, F.text)
+@router.message(TicketWizardStates.WMS_ISSUE_DESCRIPTION, F.text)
 async def wms_description(message: Message, state: FSMContext):
     """Шаг 4: описание (или пропустить)."""
     if (message.text or "").strip().lower() == "/cancel":
@@ -2882,7 +3358,7 @@ async def wms_description(message: Message, state: FSMContext):
         await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
         return
     await state.update_data(description=(message.text or "").strip())
-    await state.set_state(WmsTicketStates.WAITING_FOR_ATTACHMENTS)
+    await state.set_state(TicketWizardStates.WMS_ISSUE_DESCRIPTION)
     await state.update_data(wms_attachment_file_ids=[])
     await message.reply(
         "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый). Или нажмите «Завершить создание тикета».",
@@ -2891,7 +3367,7 @@ async def wms_description(message: Message, state: FSMContext):
     )
 
 
-@router.message(WmsTicketStates.WAITING_FOR_ATTACHMENTS, F.photo | F.document | F.video)
+@router.message(TicketWizardStates.WMS_ISSUE_DESCRIPTION, F.photo | F.document | F.video)
 async def wms_attachment_add(message: Message, state: FSMContext):
     """Добавление вложения (до 10, до 10 МБ)."""
     data = await state.get_data()
@@ -2922,7 +3398,7 @@ async def wms_attachment_add(message: Message, state: FSMContext):
         await message.reply(f"📎 Добавлено {len(file_ids)} из 10. Можно приложить ещё или нажмите «Завершить создание тикета».", reply_markup=_wms_attachments_keyboard())
 
 
-@router.callback_query(WmsTicketStates.WAITING_FOR_ATTACHMENTS, F.data == "wms_finish_ticket")
+@router.callback_query(TicketWizardStates.WMS_ISSUE_DESCRIPTION, F.data == "wms_finish_ticket")
 async def wms_finish_ticket(callback: CallbackQuery, state: FSMContext):
     """Завершение: создание тикета и загрузка вложений в Jira."""
     await callback.answer()
@@ -2990,7 +3466,7 @@ async def wms_finish_ticket(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(WmsTicketStates.WAITING_FOR_DEPARTMENT, F.text)
+@router.message(TicketWizardStates.WMS_ISSUE_DEPARTMENT, F.text)
 async def wms_department(message: Message, state: FSMContext):
     if (message.text or "").strip().lower() == "/cancel":
         await state.clear()
@@ -3020,17 +3496,33 @@ async def ticket_lupa_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
         return
     await state.clear()
-    await state.set_state(LupaTicketStates.WAITING_FOR_DESCRIPTION)
-    await state.update_data(ticket_type_id="lupa_search")
-    await callback.message.edit_text(
-        "🔍 <b>Поиск / сайт (Lupa)</b>\n\nОпишите проблему с поиском на petrovich.ru:",
-        parse_mode="HTML",
-        reply_markup=get_cancel_keyboard(),
-    )
+    profile = get_user_profile(callback.from_user.id, CHANNEL_ID) or {}
+    dept = (profile.get("department") or "").strip()
+    if dept:
+        session = WizardSession("lupa_search", "LUPA_SERVICE", {"subdivision": dept})
+        await state.set_state(TicketWizardStates.LUPA_SERVICE)
+        await state.update_data(**save_wizard_session(session))
+        await callback.message.edit_text(
+            ticket_wizard.lupa_service_screen().text,
+            parse_mode="HTML",
+            reply_markup=get_lupa_service_keyboard(),
+        )
+    else:
+        from core.jira_wms_departments import get_wms_departments_async
+        depts = await get_wms_departments_async() or []
+        session = WizardSession("lupa_search", "LUPA_DEPARTMENT", {"departments": depts, "dept_page": 0})
+        await state.set_state(TicketWizardStates.LUPA_DEPARTMENT)
+        await state.update_data(**save_wizard_session(session), departments=depts, dept_page=0)
+        screen = ticket_wizard.lupa_department_screen(depts)
+        from keyboards import get_lupa_department_keyboard
+        await callback.message.edit_text(
+            screen.text, parse_mode="HTML",
+            reply_markup=get_lupa_department_keyboard(depts, 0),
+        )
     await callback.answer()
 
 
-@router.message(LupaTicketStates.WAITING_FOR_DESCRIPTION, F.text)
+@router.message(TicketWizardStates.LUPA_DESCRIPTION, F.text)
 async def lupa_description(message: Message, state: FSMContext):
     """Шаг 4/5: ввод комментария (описание) → создание заявки."""
     if (message.text or "").strip().lower() == "/cancel":

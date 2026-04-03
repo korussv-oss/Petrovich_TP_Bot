@@ -1,6 +1,6 @@
 """
-Точка входа MAX-адаптера: long polling через MaxBotAPI (botapi.max.ru).
-При наличии MAX_BOT_TOKEN и установленном пакете maxbotapi — запуск бота в одном процессе с Telegram.
+Точка входа MAX-адаптера: long polling через maxapi (platform-api.max.ru).
+При наличии MAX_BOT_TOKEN — запуск бота в одном процессе с Telegram.
 """
 import asyncio
 import logging
@@ -17,8 +17,6 @@ logger = logging.getLogger(__name__)
 
 # Состояние polling-offset по update_id, чтобы после рестарта MAX не переобрабатывал “старые” команды.
 _MAX_POLL_STATE_FILE = Path(__file__).resolve().parents[2] / "data" / "max_poll_state.json"
-_MAX_UPDATE_DEDUP_FILE = Path(__file__).resolve().parents[2] / "data" / "max_update_dedup.json"
-_MAX_UPDATE_DEDUP_SAVE_EVERY_UPDATES = int(os.getenv("MAX_UPDATE_DEDUP_SAVE_EVERY_UPDATES", "25"))
 
 
 def _load_max_poll_state() -> dict:
@@ -65,41 +63,26 @@ def _set_max_last_update_id(token: str, last_update_id: int) -> None:
     _save_max_poll_state(state)
 
 
-def _load_max_update_dedup_map() -> dict:
+def _ensure_max_session(bot, *, total_timeout_seconds: int = 30) -> None:
     """
-    Задача: не переобрабатывать “старые” апдейты после рестарта (особенно когда update_id отсутствует/не работает offset).
-    Храним отпечатки апдейтов с TTL.
+    В maxapi aiohttp-сессия создаётся лениво (при первом bot.request()).
+    Но этот адаптер делает прямые HTTP-вызовы через bot.session, поэтому гарантируем,
+    что session существует.
     """
-    ttl_seconds = int(os.getenv("MAX_UPDATE_DEDUP_TTL_SECONDS", "300"))
-    now = time.monotonic()
-    try:
-        if not _MAX_UPDATE_DEDUP_FILE.exists():
-            return {}
-        with open(_MAX_UPDATE_DEDUP_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {}
-        # значения могут быть как float (monotonic), так и string/None — аккуратно фильтруем
-        out: dict = {}
-        for k, v in data.items():
-            try:
-                ts = float(v)
-            except Exception:
-                continue
-            if now - ts <= ttl_seconds:
-                out[str(k)] = ts
-        return out
-    except Exception:
-        return {}
-
-
-def _save_max_update_dedup_map(dedup_map: dict) -> None:
-    try:
-        _MAX_UPDATE_DEDUP_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(_MAX_UPDATE_DEDUP_FILE, "w", encoding="utf-8") as f:
-            json.dump(dedup_map, f, ensure_ascii=False, indent=2)
-    except Exception:
+    if getattr(bot, "session", None) is not None and not getattr(bot.session, "closed", False):
         return
+    import aiohttp
+    timeout = getattr(getattr(bot, "default_connection", None), "timeout", None)
+    if timeout is None:
+        timeout = aiohttp.ClientTimeout(total=total_timeout_seconds)
+    bot.session = aiohttp.ClientSession(
+        base_url=getattr(bot, "api_url", "https://platform-api.max.ru"),
+        timeout=timeout,
+        headers=getattr(bot, "headers", None),
+        **getattr(getattr(bot, "default_connection", None), "kwargs", {}),
+    )
+
+
 
 
 def _extract_message_mid_from_raw(raw: dict) -> str:
@@ -117,32 +100,8 @@ def _extract_message_mid_from_raw(raw: dict) -> str:
     return str(mid).strip()
 
 
-def _fingerprint_max_update(
-    *,
-    r_chat,
-    r_user,
-    sender_uid,
-    source,
-    msg_mid: str,
-    update_id: object = None,
-) -> str:
-    update_id_part = str(update_id).strip() if update_id is not None else ""
-    if isinstance(source, tuple) and len(source) == 2:
-        src_kind, src_val = source
-        src_val_s = str(src_val).strip()
-        src_val_s = src_val_s[:80]
-        src_part = f"{src_kind}:{src_val_s}"
-    else:
-        src_part = str(source).strip()[:80] if source is not None else ""
-    return f"{update_id_part}|{r_chat or ''}|{r_user or ''}|{sender_uid or ''}|{src_part}|{msg_mid or ''}"
 
-# Импорт под другим именем: PyPI-пакет MaxBotAPI, модуль maxbotapi
-try:
-    import maxbotapi
-    HAS_MAX_SDK = True
-except ImportError:
-    maxbotapi = None
-    HAS_MAX_SDK = False
+import maxapi
 
 
 def _get_max_token() -> str:
@@ -208,10 +167,10 @@ async def _upload_image_max(bot, image_path: str) -> str | None:
         mime_type = "image/gif"
     elif image_path.lower().endswith(".webp"):
         mime_type = "image/webp"
+    _ensure_max_session(bot)
     # MAX Bot API: авторизация через заголовок Authorization, не через query
-    token_val = getattr(bot, "token", "")
-    auth_headers = {"Authorization": token_val, "Content-Type": "application/json"}
-    base = (getattr(bot, "BASE_URL", None) or "https://botapi.max.ru").rstrip("/")
+    auth_headers = {"Authorization": bot.headers.get("Authorization", ""), "Content-Type": "application/json"}
+    base = (getattr(bot, "api_url", None) or "https://platform-api.max.ru").rstrip("/")
     url = f"{base}/uploads"
     resp = None
     for body, qparams in (
@@ -349,9 +308,9 @@ async def _upload_file_max(bot, file_path: str, mime_type: str = None) -> str | 
     mime = mime_type or "application/octet-stream"
     if not mime_type and file_path.lower().endswith(".xlsx"):
         mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    token_val = getattr(bot, "token", "")
-    auth_headers = {"Authorization": token_val, "Content-Type": "application/json"}
-    base = (getattr(bot, "BASE_URL", None) or "https://botapi.max.ru").rstrip("/")
+    _ensure_max_session(bot)
+    auth_headers = {"Authorization": bot.headers.get("Authorization", ""), "Content-Type": "application/json"}
+    base = (getattr(bot, "api_url", None) or "https://platform-api.max.ru").rstrip("/")
     url = f"{base}/uploads"
     resp = None
     # MAX API может требовать type в query или в payload
@@ -459,6 +418,7 @@ async def _download_attachment_max(bot, att: dict) -> tuple[bytes, str] | None:
     default_ext = ext_by_type.get(att.get("type") or "", ".bin")
     for attempt in range(3):
         try:
+            _ensure_max_session(bot)
             async with bot.session.get(url) as resp:
                 if resp.status != 200:
                     logger.warning("MAX: GET вложение по url вернул %s (попытка %s)", resp.status, attempt + 1)
@@ -487,9 +447,10 @@ async def _post_messages_and_log_error(
     return_error_code: bool = False,
 ) -> dict | tuple[dict | None, str | None] | None:
     """POST /messages. query_params добавляются к access_token. При 400 логируем тело ответа."""
-    url = f"{bot.BASE_URL}/messages"
-    params = {"access_token": bot.token}
-    headers = {"Authorization": bot.token, "Content-Type": "application/json"}
+    _ensure_max_session(bot)
+    url = f"{bot.api_url}/messages"
+    params = {}
+    headers = {"Content-Type": "application/json"}
     if query_params:
         params.update(query_params)
     try:
@@ -620,39 +581,74 @@ async def _send_message_max(
             )
             return mid
 
-    # 3) Fallback: MaxBotAPI (chat_id в body, без кнопок) — возвращает Message с message_id
-    cid = recipient_chat_id or (str(recipient_user_id) if recipient_user_id is not None else None)
-    if cid:
-        try:
-            msg_body = maxbotapi.NewMessageBody(chat_id=cid, text=text, inline_keyboard=None)
-            sent = await bot.send_message(msg_body)
-            preview = (text or "").replace("\n", " ").strip()
-            if len(preview) > 120:
-                preview = preview[:120] + "..."
-            logger.info(
-                "MAX: отправлено сообщение (NewMessageBody, source=%s, text=%r)",
-                log_source or "-",
-                preview,
-            )
-            return getattr(sent, "message_id", None) if sent else None
-        except Exception as e:
-            logger.debug("MAX send_message (NewMessageBody): %s", e)
-
     logger.warning("MAX send_message не удался. Проверьте лог выше (MAX API 400/403: ...).")
     return None
 
 
-async def _get_updates_raw(bot, timeout: int = 25, limit: int = 10, offset: int | None = None) -> list:
+async def _get_updates_raw(bot, timeout: int = 25, limit: int = 10, marker: int | None = None) -> tuple[list, int | None]:
     """
-    Получить сырой список апдейтов (dict), без парсинга через Update.from_dict.
-    API MAX может возвращать структуру без update_id — библиотека тогда падает с KeyError.
+    Получить сырой список апдейтов через maxapi.Bot.get_updates().
+    Возвращает (updates, next_marker) — marker используется для следующего запроса.
     """
-    params = {"timeout": timeout, "limit": limit}
-    # В MAX Bot API (как в Telegram) offset позволяет не получать уже обработанные апдейты повторно.
+    data = await bot.get_updates(limit=limit, timeout=timeout, marker=marker)
+    updates = data.get("updates") or []
+    next_marker = data.get("marker")
+    return updates, next_marker
+
+
+async def _get_updates_raw_botapi(
+    bot,
+    *,
+    token: str,
+    timeout: int = 5,
+    limit: int = 20,
+    offset: int | None = None,
+) -> tuple[list, int | None]:
+    """
+    Получить сырой список апдейтов через BotAPI https://botapi.max.ru/updates.
+    Возвращает (updates, next_offset) где next_offset рассчитан по max(update_id)+1, если update_id присутствует.
+    """
+    url = "https://botapi.max.ru/updates"
+    params: dict = {"timeout": int(timeout), "limit": int(limit)}
     if offset is not None:
         params["offset"] = int(offset)
-    data = await bot._make_request("GET", "/updates", params=params)
-    return data.get("updates") or []
+    headers = {"Authorization": token, "Accept": "application/json"}
+
+    # Используем существующую aiohttp session maxapi, но абсолютный URL разрешён.
+    session = getattr(bot, "session", None)
+    if session is None or getattr(session, "closed", False):
+        import aiohttp
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout + 15))
+        temp_session = True
+    else:
+        temp_session = False
+
+    try:
+        async with session.get(url, params=params, headers=headers) as resp:
+            data = await resp.json(content_type=None)
+    finally:
+        if temp_session:
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+    updates = (data or {}).get("updates") or []
+    max_uid: int | None = None
+    if isinstance(updates, list):
+        for u in updates:
+            if not isinstance(u, dict):
+                continue
+            uid = u.get("update_id") or u.get("updateId") or u.get("id")
+            try:
+                if uid is None:
+                    continue
+                iv = int(uid)
+                max_uid = iv if max_uid is None else max(max_uid, iv)
+            except Exception:
+                continue
+    next_offset = (max_uid + 1) if max_uid is not None else offset
+    return updates if isinstance(updates, list) else [], next_offset
 
 
 def _extract_file_attachments_from_max_message(msg: dict) -> list[dict]:
@@ -924,16 +920,23 @@ async def _handle_open_issue_max(user_id: int, callback_id: str) -> dict | None:
     """
     from user_storage import is_user_registered
     from core.support.api import support_api
+    import asyncio
+    from core.storage import use_sqlite_storage
     from core.jira_aa import get_issue_info, get_issue_comments
     CHANNEL_ID = "max"
     back_btn = [{"id": "back_to_main", "label": "🔙 В главное меню"}]
     if not is_user_registered(user_id, CHANNEL_ID):
         return {"text": "Сначала пройдите регистрацию или привяжите аккаунт.", "parse_mode": "HTML", "buttons": back_btn}
     issue_key = (callback_id or "").split(":", 1)[-1].strip()
-    if not issue_key or not support_api.user_owns_issue(CHANNEL_ID, user_id, issue_key):
+    if use_sqlite_storage():
+        owns = await asyncio.to_thread(support_api.user_owns_issue, CHANNEL_ID, user_id, issue_key)
+    else:
+        owns = support_api.user_owns_issue(CHANNEL_ID, user_id, issue_key)
+    if not issue_key or not owns:
         return {"text": "Заявка не найдена.", "parse_mode": "HTML", "buttons": back_btn}
-    info = await get_issue_info(issue_key)
-    comments = await get_issue_comments(issue_key)
+    # Пункт 3 плана: более жёсткие таймауты для интерактивного UI (общее ожидание, включая retries).
+    info = await get_issue_info(issue_key, timeout_total=3.0)
+    comments = await get_issue_comments(issue_key, timeout_total=3.0)
     summary = (info or {}).get("summary") or "—"
     status = jira_status_display_ru((info or {}).get("status"))
     def _fmt(comments_list, max_len=200):
@@ -1274,6 +1277,12 @@ _pending_registration_max: dict[int, dict] = {}
 # user_id (MAX) -> {chat_id, user_id, mid} последнего сообщения бота (удаляем перед новым ответом, как в on_dute)
 _last_bot_message_max: dict[int, dict] = {}
 
+# user_id (MAX) -> monotonic request id для экрана «Мои заявки» (чтобы не отправлять устаревший результат)
+_my_tickets_req_id_max: dict[int, int] = {}
+
+# user_id (MAX) -> monotonic request id для экрана «Открыть заявку» (open_issue)
+_open_issue_req_id_max: dict[int, int] = {}
+
 # Антиспам MAX: последнее время события по user_id
 _throttle_max: dict[int, float] = {}
 
@@ -1327,6 +1336,61 @@ def _message_id_from_send_response(result: dict | None) -> str | None:
     return None
 
 
+async def _send_response_max(
+    *,
+    bot,
+    user_id: int,
+    r_chat: str | None,
+    r_user: int | None,
+    response: dict,
+    source,
+) -> None:
+    """
+    Унифицированная отправка ответа в MAX (удаляет предыдущее сообщение бота, отправляет новое, сохраняет mid).
+    Нужна, чтобы можно было отправлять «долгие» ответы (например, «Мои заявки») в фоне.
+    """
+    if not response or not response.get("text"):
+        return
+    # Пункт 5 плана: сначала отправляем новое сообщение, потом удаляем старое,
+    # чтобы уменьшить «визуальную паузу» (пользователь всегда видит хоть что-то).
+    last = _last_bot_message_max.get(user_id)
+    buttons = response.get("buttons") or []
+    attachments_max = response.get("_attachments_max")
+    if attachments_max is None:
+        attachments_max = _buttons_to_attachments_max(buttons)
+    parse_mode = response.get("parse_mode") or "HTML"
+    new_mid = await _send_message_max(
+        bot,
+        r_chat,
+        r_user,
+        response["text"],
+        attachments_max,
+        parse_mode,
+        _source_to_log_tag(source),
+    )
+    if new_mid:
+        # Удаляем предыдущее сообщение только после успешной отправки нового.
+        if last and last.get("mid"):
+            # Не блокируем UI удалением (иногда DELETE может занимать секунды).
+            async def _bg_delete():
+                try:
+                    await _delete_message_max(
+                        bot,
+                        last.get("chat_id"),
+                        last.get("user_id"),
+                        last["mid"],
+                    )
+                except Exception:
+                    return
+
+            asyncio.create_task(_bg_delete())
+        _last_bot_message_max[user_id] = {
+            "chat_id": r_chat,
+            "user_id": r_user,
+            "mid": new_mid,
+        }
+
+
 async def _delete_message_max(
     bot,
     chat_id: str | None,
@@ -1339,11 +1403,12 @@ async def _delete_message_max(
     """
     if not message_id:
         return False
-    base = (getattr(bot, "BASE_URL", None) or "").rstrip("/")
+    _ensure_max_session(bot)
+    base = (getattr(bot, "api_url", None) or "").rstrip("/")
     if not base or base == "":
-        logger.debug("MAX delete_message: BASE_URL не задан")
+        logger.debug("MAX delete_message: api_url не задан")
         return False
-    auth_headers = {"Authorization": bot.token, "Content-Type": "application/json"}
+    auth_headers = {"Content-Type": "application/json"}
 
     # Вариант 1: DELETE /messages?chat_id=...&mid=... (или user_id)
     url_params = f"{base}/messages"
@@ -1387,28 +1452,19 @@ async def _delete_message_max(
 
 async def run_max_bot() -> None:
     """
-    Long polling MAX. Если установлен maxapi — запуск через него (/showracemenu с InputMedia).
-    Иначе — сырой get_updates через MaxBotAPI.
+    Long polling MAX через maxapi (platform-api.max.ru).
     """
     token = _get_max_token().strip()
     if not token:
         logger.info("MAX: MAX_BOT_TOKEN не задан, бот в MAX не запускается")
         return
     max_cooldown = float(os.getenv("ANTISPAM_COOLDOWN", "1.5"))
+    max_updates_timeout = int(os.getenv("MAX_UPDATES_TIMEOUT_SECONDS", "5"))
+    max_updates_timeout = max(1, min(30, max_updates_timeout))
+    max_updates_limit = int(os.getenv("MAX_UPDATES_LIMIT", "20"))
+    max_updates_limit = max(1, min(100, max_updates_limit))
+    max_poll_transport = (os.getenv("MAX_POLL_TRANSPORT") or "botapi").strip().lower()
 
-    # Сначала MaxBotAPI — полные кнопки и все сценарии (WMS, Lupa, callback).
-    if not HAS_MAX_SDK:
-        try:
-            import maxapi as _maxapi
-            from adapters.max.run_maxapi import run_max_bot_maxapi
-            await run_max_bot_maxapi()
-            return
-        except ImportError:
-            pass
-        logger.warning(
-            "MAX: установите MaxBotAPI (pip install MaxBotAPI) или maxapi (pip install maxapi)"
-        )
-        return
 
     from adapters.max.handlers import handle_start, handle_callback, handle_main_menu
     from adapters.max import (
@@ -1427,39 +1483,32 @@ async def run_max_bot() -> None:
     from user_storage import bind_account_by_phone
 
     global _current_max_bot
-    bot = maxbotapi.Bot(token)
+    bot = maxapi.Bot(token, auto_requests=False, auto_check_subscriptions=False)
     _current_max_bot = bot
     try:
-        logger.info("MAX: бот запущен (long polling)")
-        # offset для /updates: защищает от повторной доставки тех же апдейтов
-        persisted_last_update_id = _get_max_last_update_id(token)
-        next_offset: int | None = (persisted_last_update_id + 1) if persisted_last_update_id is not None else None
+        logger.info("MAX: бот запущен (maxapi, long polling)")
+        # marker для /updates: защищает от повторной доставки тех же апдейтов
+        persisted_marker = _get_max_last_update_id(token)
+        next_marker: int | None = persisted_marker
         # Дедуп на случай, если апдейт пришёл без update_id (встречается у некоторых реализаций MAX API)
-        import time
         recent_noid: dict[str, float] = {}
-        # Persistent дедуп — чтобы после рестарта не прогонять старые start/callback/message обновления.
-        max_update_dedup_map: dict = _load_max_update_dedup_map()
-        max_update_dedup_dirty = False
-        ttl_seconds = int(os.getenv("MAX_UPDATE_DEDUP_TTL_SECONDS", "300"))
-        dedup_initial_window_seconds = float(os.getenv("MAX_UPDATE_DEDUP_INITIAL_WINDOW_SECONDS", "60"))
-        max_process_start_mono = time.monotonic()
-        dedup_check_counter = 0
-        require_fresh_command_after_restart = os.getenv(
-            "MAX_REQUIRE_FRESH_COMMAND_AFTER_RESTART", "1"
-        ).strip().lower() not in ("0", "false", "no", "off")
-        max_unlocked_by_fresh_command = not require_fresh_command_after_restart
-        fresh_command_wait_seconds = float(
-            os.getenv("MAX_FRESH_COMMAND_WAIT_SECONDS", "30")
-        )
-        if require_fresh_command_after_restart:
-            logger.info(
-                "MAX: до первой новой команды после рестарта входящие события пропускаются "
-                "(авто-разблокировка через %.0fs)",
-                fresh_command_wait_seconds,
-            )
         while True:
             try:
-                raw_updates = await _get_updates_raw(bot, timeout=25, limit=10, offset=next_offset)
+                if max_poll_transport == "maxapi":
+                    raw_updates, returned_marker = await _get_updates_raw(
+                        bot,
+                        timeout=max_updates_timeout,
+                        limit=max_updates_limit,
+                        marker=next_marker,
+                    )
+                else:
+                    raw_updates, returned_marker = await _get_updates_raw_botapi(
+                        bot,
+                        token=token,
+                        timeout=max_updates_timeout,
+                        limit=max_updates_limit,
+                        offset=next_marker,
+                    )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1470,23 +1519,26 @@ async def run_max_bot() -> None:
                 await asyncio.sleep(5)
                 continue
 
-            # продвигаем offset по максимуму update_id в пачке
-            max_update_id: int | None = None
-            for u in raw_updates:
-                if not isinstance(u, dict):
-                    continue
-                uid = u.get("update_id") or u.get("updateId") or u.get("id")
-                if isinstance(uid, int):
-                    max_update_id = uid if max_update_id is None else max(max_update_id, uid)
-                elif isinstance(uid, str) and uid.isdigit():
-                    iv = int(uid)
-                    max_update_id = iv if max_update_id is None else max(max_update_id, iv)
-            if max_update_id is not None:
-                next_offset = max_update_id + 1
-                # Пишем persist baseline после получения пачки,
-                # чтобы после рестарта не переобрабатывать “старые” команды.
-                _set_max_last_update_id(token, max_update_id)
 
+            # продвигаем marker: предпочитаем значение из ответа сервера,
+            # fallback — вычисляем из update_id в пачке (для серверов без marker в ответе)
+            if returned_marker is not None:
+                next_marker = returned_marker
+                _set_max_last_update_id(token, returned_marker)
+            else:
+                max_update_id: int | None = None
+                for u in raw_updates:
+                    if not isinstance(u, dict):
+                        continue
+                    uid = u.get("update_id") or u.get("updateId") or u.get("id")
+                    if isinstance(uid, int):
+                        max_update_id = uid if max_update_id is None else max(max_update_id, uid)
+                    elif isinstance(uid, str) and uid.isdigit():
+                        iv = int(uid)
+                        max_update_id = iv if max_update_id is None else max(max_update_id, iv)
+                if max_update_id is not None:
+                    next_marker = max_update_id + 1
+                    _set_max_last_update_id(token, max_update_id)
             for raw in raw_updates:
                 if not isinstance(raw, dict):
                     continue
@@ -1525,64 +1577,9 @@ async def run_max_bot() -> None:
                             )
                         continue
 
-                    # Persistent дедуп по отпечатку апдейта (с TTL).
-                    # Включаем только в первые N секунд после старта, чтобы “волна” ушла,
-                    # но пользовательские клики позже не глушились дедупом.
-                    update_id = raw.get("update_id") or raw.get("updateId") or raw.get("id")
-                    msg_mid = _extract_message_mid_from_raw(raw)
-                    fp = _fingerprint_max_update(
-                        r_chat=r_chat,
-                        r_user=r_user,
-                        sender_uid=user_id,
-                        source=source,
-                        msg_mid=msg_mid,
-                        update_id=update_id,
-                    )
-                    now_mono = time.monotonic()
-                    if now_mono - max_process_start_mono <= dedup_initial_window_seconds:
-                        last_seen = max_update_dedup_map.get(fp)
-                        if last_seen is not None and (now_mono - float(last_seen)) <= ttl_seconds:
-                            continue
-                        max_update_dedup_map[fp] = now_mono
-                        max_update_dedup_dirty = True
-                        dedup_check_counter += 1
-                        if (
-                            max_update_dedup_dirty
-                            and dedup_check_counter % _MAX_UPDATE_DEDUP_SAVE_EVERY_UPDATES == 0
-                        ):
-                            _save_max_update_dedup_map(max_update_dedup_map)
-                            max_update_dedup_dirty = False
-
                     # Антиспам для MAX: ограничиваем частоту событий от одного user_id
                     if _is_max_rate_limited(user_id, max_cooldown):
                         continue
-
-                    # После рестарта обрабатываем только новые команды пользователя (например /start),
-                    # чтобы не отрабатывать "фантомные" callback-и из очереди.
-                    if not max_unlocked_by_fresh_command:
-                        if (time.monotonic() - max_process_start_mono) >= max(1.0, fresh_command_wait_seconds):
-                            max_unlocked_by_fresh_command = True
-                            logger.info(
-                                "MAX: авто-разблокировка обработки апдейтов после рестарта (таймаут %.0fs)",
-                                fresh_command_wait_seconds,
-                            )
-                        else:
-                            is_fresh_command = False
-                            if source == "start":
-                                is_fresh_command = True
-                            elif isinstance(source, tuple) and len(source) >= 2 and source[0] == "message":
-                                txt = (source[1] or "").strip()
-                                if txt.startswith("/"):
-                                    is_fresh_command = True
-                            if not is_fresh_command:
-                                logger.debug(
-                                    "MAX: пропуск апдейта до новой команды (user_id=%s, source=%s)",
-                                    user_id,
-                                    source,
-                                )
-                                continue
-                            max_unlocked_by_fresh_command = True
-                            logger.info("MAX: получена новая команда, обработка апдейтов включена")
 
                     if source == "start":
                         from user_storage import needs_phone_verification_channel
@@ -1676,9 +1673,88 @@ async def run_max_bot() -> None:
                         ):
                             response = await _handle_stc_callback_max(user_id, callback_id)
                         elif callback_id and callback_id.startswith("open_issue:"):
-                            response = await _handle_open_issue_max(user_id, callback_id)
-                            if response is None:
-                                response = handle_start(user_id)
+                            # Быстрый UX: сразу «открываю заявку…», а детали догружаем в фоне (Jira может отвечать 3–10s).
+                            issue_key = (callback_id or "").split(":", 1)[-1].strip()
+                            rid = int(_open_issue_req_id_max.get(user_id, 0) or 0) + 1
+                            _open_issue_req_id_max[user_id] = rid
+
+                            await _send_response_max(
+                                bot=bot,
+                                user_id=user_id,
+                                r_chat=r_chat,
+                                r_user=r_user,
+                                response={
+                                    "text": f"⏳ <b>Заявка {issue_key or '—'}</b>\n\nОткрываю…",
+                                    "parse_mode": "HTML",
+                                    "buttons": [
+                                        {"id": "my_tickets", "label": "🔙 К списку заявок"},
+                                        {"id": "back_to_main", "label": "🔙 В главное меню"},
+                                    ],
+                                },
+                                source=("callback", "open_issue_loading"),
+                            )
+
+                            async def _load_and_send_open_issue(current_rid: int) -> None:
+                                try:
+                                    # Пункт 3 плана: жёсткий таймаут для интерактивного UI.
+                                    resp = await asyncio.wait_for(
+                                        _handle_open_issue_max(user_id, callback_id),
+                                        timeout=3.0,
+                                    )
+                                    if resp is None:
+                                        resp = handle_start(user_id)
+                                    if _open_issue_req_id_max.get(user_id) != current_rid:
+                                        return
+                                    await _send_response_max(
+                                        bot=bot,
+                                        user_id=user_id,
+                                        r_chat=r_chat,
+                                        r_user=r_user,
+                                        response=resp,
+                                        source=("callback", callback_id),
+                                    )
+                                except asyncio.TimeoutError:
+                                    if _open_issue_req_id_max.get(user_id) != current_rid:
+                                        return
+                                    await _send_response_max(
+                                        bot=bot,
+                                        user_id=user_id,
+                                        r_chat=r_chat,
+                                        r_user=r_user,
+                                        response={
+                                            "text": "⚠️ Jira отвечает долго. Попробуйте обновить.",
+                                            "parse_mode": "HTML",
+                                            "buttons": [
+                                                {"id": callback_id, "label": "🔄 Обновить"},
+                                                {"id": "my_tickets", "label": "🔙 К списку заявок"},
+                                                {"id": "back_to_main", "label": "🔙 В главное меню"},
+                                            ],
+                                        },
+                                        source=("callback", "open_issue_timeout"),
+                                    )
+                                except Exception as e:
+                                    logger.warning("MAX: не удалось открыть заявку %s: %s", issue_key or "?", e)
+                                    if _open_issue_req_id_max.get(user_id) != current_rid:
+                                        return
+                                    await _send_response_max(
+                                        bot=bot,
+                                        user_id=user_id,
+                                        r_chat=r_chat,
+                                        r_user=r_user,
+                                        response={
+                                            "text": "⚠️ Не удалось открыть заявку. Попробуйте ещё раз.",
+                                            "parse_mode": "HTML",
+                                            "buttons": [
+                                                {"id": callback_id, "label": "🔄 Обновить"},
+                                                {"id": "my_tickets", "label": "🔙 К списку заявок"},
+                                                {"id": "back_to_main", "label": "🔙 В главное меню"},
+                                            ],
+                                        },
+                                        source=("callback", "open_issue_error"),
+                                    )
+
+                            asyncio.create_task(_load_and_send_open_issue(rid))
+                            continue
                         elif callback_id and callback_id.startswith("add_comment:"):
                             from core.support.api import support_api as _support_api
                             from user_storage import is_user_registered
@@ -1706,7 +1782,7 @@ async def run_max_bot() -> None:
                                 }
                             else:
                                 response = {"text": "Заявка не найдена или доступ запрещён.", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
-                        elif callback_id == "ticket_rubik_password_change":
+                        elif callback_id in ("ticket_rubik_password_change", "tp_section_password"):
                             from user_storage import is_user_registered, get_user_profile as _get_profile_max
                             from core.ad_ldap import is_password_expired as _is_password_expired_max
                             import asyncio as _asyncio_max
@@ -2104,8 +2180,62 @@ async def run_max_bot() -> None:
                                 response = handle_main_menu(user_id)
                         else:
                             if callback_id == "my_tickets":
-                                tickets = await support_api.get_my_tickets_filtered("max", user_id)
-                                response = handle_callback(callback_id, user_id, my_tickets=tickets)
+                                # Быстрый UX: сразу показываем «загрузка», а список догружаем в фоне (Jira может отвечать 3–10s).
+                                rid = int(_my_tickets_req_id_max.get(user_id, 0) or 0) + 1
+                                _my_tickets_req_id_max[user_id] = rid
+
+                                await _send_response_max(
+                                    bot=bot,
+                                    user_id=user_id,
+                                    r_chat=r_chat,
+                                    r_user=r_user,
+                                    response={
+                                        "text": "⏳ <b>Мои заявки</b>\n\nЗагружаю список…",
+                                        "parse_mode": "HTML",
+                                        "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}],
+                                    },
+                                    source=("callback", "my_tickets_loading"),
+                                )
+
+                                async def _load_and_send_my_tickets(current_rid: int) -> None:
+                                    try:
+                                        tickets = await support_api.get_my_tickets_filtered("max", user_id)
+                                        resp = handle_callback("my_tickets", user_id, my_tickets=tickets)
+                                        if resp is None:
+                                            resp = handle_start(user_id)
+                                        # Не отправляем устаревший результат, если пользователь уже нажал «Мои заявки» ещё раз.
+                                        if _my_tickets_req_id_max.get(user_id) != current_rid:
+                                            return
+                                        await _send_response_max(
+                                            bot=bot,
+                                            user_id=user_id,
+                                            r_chat=r_chat,
+                                            r_user=r_user,
+                                            response=resp,
+                                            source=("callback", "my_tickets"),
+                                        )
+                                    except Exception as e:
+                                        logger.warning("MAX: не удалось загрузить «Мои заявки»: %s", e)
+                                        if _my_tickets_req_id_max.get(user_id) != current_rid:
+                                            return
+                                        await _send_response_max(
+                                            bot=bot,
+                                            user_id=user_id,
+                                            r_chat=r_chat,
+                                            r_user=r_user,
+                                            response={
+                                                "text": "⚠️ Не удалось загрузить список заявок. Попробуйте ещё раз.",
+                                                "parse_mode": "HTML",
+                                                "buttons": [
+                                                    {"id": "my_tickets", "label": "🔄 Обновить"},
+                                                    {"id": "back_to_main", "label": "🔙 В главное меню"},
+                                                ],
+                                            },
+                                            source=("callback", "my_tickets_error"),
+                                        )
+
+                                asyncio.create_task(_load_and_send_my_tickets(rid))
+                                continue
                             else:
                                 response = handle_callback(callback_id, user_id)
                             if response is None:
@@ -2282,11 +2412,17 @@ async def run_max_bot() -> None:
                                         path = random.choice(files)
                                         token = await _upload_image_max(bot, str(path))
                                         if token:
+                                            # не блокируем отправку картинки удалением предыдущего сообщения
                                             last = _last_bot_message_max.pop(user_id, None)
                                             if last and last.get("mid"):
-                                                await _delete_message_max(
-                                                    bot, last.get("chat_id"), last.get("user_id"), last["mid"]
-                                                )
+                                                async def _bg_delete_showracemenu():
+                                                    try:
+                                                        await _delete_message_max(
+                                                            bot, last.get("chat_id"), last.get("user_id"), last["mid"]
+                                                        )
+                                                    except Exception:
+                                                        return
+                                                asyncio.create_task(_bg_delete_showracemenu())
                                             att = _image_attachment_from_token(token)
                                             new_mid = await _send_message_max(
                                                 bot, r_chat, r_user, "\u200b", att, None, "source:showracemenu"
@@ -2301,9 +2437,14 @@ async def run_max_bot() -> None:
                                 if not sent:
                                     last = _last_bot_message_max.pop(user_id, None)
                                     if last and last.get("mid"):
-                                        await _delete_message_max(
-                                            bot, last.get("chat_id"), last.get("user_id"), last["mid"]
-                                        )
+                                        async def _bg_delete_showracemenu2():
+                                            try:
+                                                await _delete_message_max(
+                                                    bot, last.get("chat_id"), last.get("user_id"), last["mid"]
+                                                )
+                                            except Exception:
+                                                return
+                                        asyncio.create_task(_bg_delete_showracemenu2())
                                     new_mid = await _send_message_max(
                                         bot, r_chat, r_user, "…", None, None, "source:showracemenu"
                                     )
@@ -2744,43 +2885,21 @@ async def run_max_bot() -> None:
                     if response.pop("_set_pending_admin_search", False):
                         _pending_admin_delete_search_max[user_id] = True
 
-                    # Удаляем предыдущее сообщение бота и отправляем новое (как в the_bot_on_dute)
-                    last = _last_bot_message_max.pop(user_id, None)
-                    if last and last.get("mid"):
-                        await _delete_message_max(
-                            bot,
-                            last.get("chat_id"),
-                            last.get("user_id"),
-                            last["mid"],
-                        )
-
-                    buttons = response.get("buttons") or []
-                    attachments_max = response.get("_attachments_max")
-                    if attachments_max is None:
-                        attachments_max = _buttons_to_attachments_max(buttons)
-                    parse_mode = response.get("parse_mode") or "HTML"
-                    new_mid = await _send_message_max(
-                        bot,
-                        r_chat,
-                        r_user,
-                        response["text"],
-                        attachments_max,
-                        parse_mode,
-                        _source_to_log_tag(source),
+                    await _send_response_max(
+                        bot=bot,
+                        user_id=user_id,
+                        r_chat=r_chat,
+                        r_user=r_user,
+                        response=response,
+                        source=source,
                     )
-                    if new_mid:
-                        _last_bot_message_max[user_id] = {
-                            "chat_id": r_chat,
-                            "user_id": r_user,
-                            "mid": new_mid,
-                        }
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     logger.exception("MAX обработка update: %s", e)
     finally:
         _current_max_bot = None
-        await bot.close()
+        await bot.close_session()
 
 
 def main() -> None:

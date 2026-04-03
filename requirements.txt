@@ -4,10 +4,6 @@ cryptography>=41.0
 PyYAML>=6.0
 openpyxl>=3.1
 python-dotenv>=1.0
-requests>=2.31
 ldap3>=2.9
-# Для бота в MAX (при наличии MAX_BOT_TOKEN в .env)
-# maxapi — /showracemenu с картинкой через InputMedia(path=...). При установленном maxapi он используется первым.
+# MAX-бот (нужен MAX_BOT_TOKEN в .env)
 maxapi>=0.9
-# MaxBotAPI — полный функционал (кнопки, WMS, Lupa). Нужен, если maxapi не установлен.
-MaxBotAPI>=1.1

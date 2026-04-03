@@ -63,56 +63,40 @@ HELP_TEXT = (
 )
 
 
-def _tp_root_menu() -> dict:
-    return {
-        "text": "📋 <b>Создать заявку в ТП</b>\n\nВ каком разделе создаём заявку?",
-        "parse_mode": "HTML",
-        "buttons": [
-            {"id": "tp_group_programs", "label": "💻 Программы и сайт"},
-            {"id": "tp_group_equipment", "label": "🛠️ Оборудование"},
-            {"id": "tp_group_services", "label": "🧰 Услуги"},
-            {"id": "ticket_rubik_password_change", "label": "🔑 Смена пароля"},
-            {"id": "back_to_main", "label": "🔙 В главное меню"},
-        ],
-    }
+def _tp_root_menu(user_id: int) -> dict:
+    result = support_api.get_tp_root_menu(CHANNEL_ID, user_id)
+    if isinstance(result, Menu):
+        return menu_to_max(result)
+    if isinstance(result, Error):
+        return error_to_max(result)
+    return {"text": str(result)}
 
 
-def _tp_programs_menu() -> dict:
-    return {
-        "text": "💻 <b>Программы и сайт</b>\n\nВыберите направление:",
-        "parse_mode": "HTML",
-        "buttons": [
-            {"id": "tp_section_site", "label": "🌐 Поиск/Сайт"},
-            {"id": "tp_section_wms", "label": "📦 WMS"},
-            {"id": "tp_section_email", "label": "📧 Электронная почта"},
-            {"id": "create_ticket_tp", "label": "⬅️ Назад"},
-        ],
-    }
+def _tp_programs_menu(user_id: int) -> dict:
+    result = support_api.get_tp_programs_menu(CHANNEL_ID, user_id)
+    if isinstance(result, Menu):
+        return menu_to_max(result)
+    if isinstance(result, Error):
+        return error_to_max(result)
+    return {"text": str(result)}
 
 
-def _tp_equipment_menu() -> dict:
-    return {
-        "text": "🛠️ <b>Оборудование</b>\n\nВыберите тип заявки:",
-        "parse_mode": "HTML",
-        "buttons": [
-            {"id": "pc_issue_start", "label": "🖥️ Проблема в работе ПК"},
-            {"id": "orgtech_issue_start", "label": "🖨️ Оргтехника"},
-            {"id": "peripheral_issue_start", "label": "🧩 Периферийное оборудование"},
-            {"id": "network_issue_start", "label": "📶 Проблемы в работе сети"},
-            {"id": "create_ticket_tp", "label": "⬅️ Назад"},
-        ],
-    }
+def _tp_equipment_menu(user_id: int) -> dict:
+    result = support_api.get_tp_equipment_menu(CHANNEL_ID, user_id)
+    if isinstance(result, Menu):
+        return menu_to_max(result)
+    if isinstance(result, Error):
+        return error_to_max(result)
+    return {"text": str(result)}
 
 
-def _tp_services_menu() -> dict:
-    return {
-        "text": "🧰 <b>Услуги</b>\n\nВыберите тип заявки:",
-        "parse_mode": "HTML",
-        "buttons": [
-            {"id": "electronic_queue_start", "label": "🎫 Электронная очередь"},
-            {"id": "create_ticket_tp", "label": "⬅️ Назад"},
-        ],
-    }
+def _tp_services_menu(user_id: int) -> dict:
+    result = support_api.get_tp_services_menu(CHANNEL_ID, user_id)
+    if isinstance(result, Menu):
+        return menu_to_max(result)
+    if isinstance(result, Error):
+        return error_to_max(result)
+    return {"text": str(result)}
 
 
 def handle_start(user_id: int) -> dict:
@@ -215,13 +199,13 @@ def handle_callback(callback_id: str, user_id: int, my_tickets: Optional[list] =
         return None
     # Главное меню (для зарегистрированных)
     if callback_id == "create_ticket_tp":
-        return _tp_root_menu()
+        return _tp_root_menu(user_id)
     if callback_id == "tp_group_programs":
-        return _tp_programs_menu()
+        return _tp_programs_menu(user_id)
     if callback_id == "tp_group_equipment":
-        return _tp_equipment_menu()
+        return _tp_equipment_menu(user_id)
     if callback_id == "tp_group_services":
-        return _tp_services_menu()
+        return _tp_services_menu(user_id)
     if callback_id == "help":
         if not is_user_registered(user_id, CHANNEL_ID):
             return {"text": "Сначала пройдите регистрацию или привяжите аккаунт.", "parse_mode": "HTML", "buttons": back_btn}
@@ -307,7 +291,7 @@ def handle_callback(callback_id: str, user_id: int, my_tickets: Optional[list] =
         deleted = delete_user(uid)
         if deleted:
             text = f"✅ Пользователь удалён: {profile.get('full_name', '—')} ({profile.get('login', '—')}, ID {uid})."
-            logger.info("MAX админ %s удалил пользователя %s (%s)", user_id, uid, profile.get("login"))
+            logger.info("MAX админ %s удалил пользователя %s", user_id, uid)
         else:
             text = "Не удалось удалить пользователя."
         return {"text": text, "parse_mode": "HTML", "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}]}

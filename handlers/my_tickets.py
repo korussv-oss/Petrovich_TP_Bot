@@ -61,9 +61,12 @@ async def open_issue_view(callback: CallbackQuery):
     if not support_api.user_owns_issue(CHANNEL_ID, callback.from_user.id, issue_key):
         await callback.answer("Заявка не найдена.", show_alert=True)
         return
-    from core.jira_aa import get_issue_info, get_issue_comments
+    from core.jira_aa import get_issue_comments
+    from core.support.issue_binding_registry import get_bindings_by_issue
 
-    info = await get_issue_info(issue_key)
+    bindings = get_bindings_by_issue(issue_key)
+    project_key = (bindings[0].get("project_key") or "") if bindings else ""
+    info = await support_api.get_issue_details_for_display(issue_key, project_key)
     comments = await get_issue_comments(issue_key)
     summary = (info or {}).get("summary") or "—"
     status = jira_status_display_ru((info or {}).get("status"))
@@ -158,6 +161,7 @@ async def sa_stc_my_tasks(callback: CallbackQuery):
 async def _render_stc_issue_view(callback: CallbackQuery, issue_key: str):
     from core.stc_tasks import can_stc_user_access_issue, get_stc_assignee_tasks
     from core.jira_aa import get_issue_admin_details, get_issue_comments
+    from core.stc_tasks import get_issue_creator_phone
 
     if not await can_stc_user_access_issue(CHANNEL_ID, callback.from_user.id, issue_key):
         await callback.message.edit_text(
@@ -180,6 +184,8 @@ async def _render_stc_issue_view(callback: CallbackQuery, issue_key: str):
             creator = t.get("creator") or "—"
             req_label = t.get("request_type_label") or "—"
             break
+    creator_phone = get_issue_creator_phone(issue_key)
+    creator_phone_line = f"Телефон заявителя: {creator_phone}\n" if creator_phone else ""
     summary = info.get("summary") or "—"
     status = jira_status_display_ru(info.get("status"))
     desc = info.get("description") or "—"
@@ -197,6 +203,7 @@ async def _render_stc_issue_view(callback: CallbackQuery, issue_key: str):
         f"🛠️ <b>Задача {issue_key}</b>\n\n"
         f"Тип: {req_label}\n"
         f"Автор: {creator}\n"
+        f"{creator_phone_line}"
         f"Reporter: {reporter}\n"
         f"Assignee: {assignee}\n"
         f"Статус: {status}\n"

@@ -1,6 +1,7 @@
 """Пошаговое создание заявки «Электронная очередь» в MAX."""
 from typing import Optional
 
+from core.support import ticket_wizard
 from user_storage import is_user_registered
 from core.electronic_queue import ELECTRONIC_QUEUE_SERVICE_TYPES, ELECTRONIC_QUEUE_SERVICE_TYPE_BY_ID
 
@@ -24,7 +25,7 @@ async def start_electronic_queue(user_id: int) -> Optional[dict]:
         return None
     _flow[user_id] = {"step": "service_type", "data": {}}
     return {
-        "text": "🎫 <b>Электронная очередь</b>\n\nВыберите тип услуги:",
+        "text": ticket_wizard.equeue_service_type_screen().text,
         "parse_mode": "HTML",
         "buttons": _type_buttons(),
     }
@@ -49,11 +50,7 @@ async def handle_electronic_queue_callback(user_id: int, callback_id: str) -> Op
         state["data"] = data
         state["step"] = "description"
         return {
-            "text": (
-                "🎫 <b>Электронная очередь</b>\n\n"
-                f"✅ Тип услуги: {label}\n\n"
-                "Введите подробное описание:"
-            ),
+            "text": ticket_wizard.equeue_description_screen().text,
             "parse_mode": "HTML",
             "buttons": CANCEL_BTN,
         }

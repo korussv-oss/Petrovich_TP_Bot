@@ -120,7 +120,7 @@ async def register_user(
     # Пытаемся обогатить профиль jira_username (если есть соответствие в Jira)
     profile = await _enrich_profile_with_jira_username(profile)
     save_user_profile(user_id, profile)
-    logger.info("Пользователь %s зарегистрирован: %s", user_id, login)
+    logger.info("Пользователь %s зарегистрирован", user_id)
     return True, "Регистрация завершена."
 
 
@@ -202,5 +202,5 @@ def register_user_from_ad(
     # Подразделение из AD не сохраняем: в Jira другие названия. Запросим при первой заявке (Lupa/смена пароля и т.д.).
     # Обогащение jira_username выполняется асинхронно — вызывающий код может вызвать _enrich_profile_with_jira_username после save
     save_user_profile(user_id, profile_to_save)
-    logger.info("Пользователь %s зарегистрирован из AD: %s", user_id, login)
+    logger.info("Пользователь %s зарегистрирован из AD", user_id)
     return True, "Регистрация завершена."

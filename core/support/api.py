@@ -3,6 +3,7 @@
 Методы возвращают DTO (Text, Menu, Form, Error); адаптер рендерит их в канал.
 """
 import logging
+import os
 from typing import List, Optional
 
 from config import CONFIG
@@ -67,6 +68,78 @@ def get_main_menu_response(channel_id: str, user_id: int) -> Menu:
         buttons.append(MenuButton(id="admin_panel", label="⚙️ Админ-панель"))
 
     return Menu(text="Выберите действие:", buttons=buttons)
+
+
+# ---------------------------------------------------------------------------
+# TP (Техническая поддержка) — подменю «Создать заявку в ТП»
+# ---------------------------------------------------------------------------
+
+def get_tp_root_menu(channel_id: str, user_id: int) -> Menu | Error:
+    """
+    Единый источник меню «Создать заявку в ТП» для Telegram и MAX.
+    Возвращает Error, если пользователь не зарегистрирован.
+    """
+    from user_storage import is_user_registered
+    if not is_user_registered(user_id, channel_id or "telegram"):
+        return Error(message="Сначала пройдите регистрацию.")
+    return Menu(
+        text="📋 <b>Создать заявку в ТП</b>\n\nВ каком разделе создаём заявку?",
+        buttons=[
+            MenuButton(id="tp_group_programs", label="💻 Программы и сайт"),
+            MenuButton(id="tp_group_equipment", label="🛠️ Оборудование"),
+            MenuButton(id="tp_group_services", label="🧰 Услуги"),
+            MenuButton(id="tp_section_password", label="🔑 Смена пароля"),
+            MenuButton(id="back_to_main", label="🔙 В главное меню"),
+        ],
+        parse_mode="HTML",
+    )
+
+
+def get_tp_programs_menu(channel_id: str, user_id: int) -> Menu | Error:
+    from user_storage import is_user_registered
+    if not is_user_registered(user_id, channel_id or "telegram"):
+        return Error(message="Сначала пройдите регистрацию.")
+    return Menu(
+        text="💻 <b>Программы и сайт</b>\n\nВыберите направление:",
+        buttons=[
+            MenuButton(id="tp_section_site", label="🌐 Поиск/Сайт"),
+            MenuButton(id="tp_section_wms", label="📦 WMS"),
+            MenuButton(id="tp_section_email", label="📧 Электронная почта"),
+            MenuButton(id="create_ticket_tp", label="⬅️ Назад"),
+        ],
+        parse_mode="HTML",
+    )
+
+
+def get_tp_equipment_menu(channel_id: str, user_id: int) -> Menu | Error:
+    from user_storage import is_user_registered
+    if not is_user_registered(user_id, channel_id or "telegram"):
+        return Error(message="Сначала пройдите регистрацию.")
+    return Menu(
+        text="🛠️ <b>Оборудование</b>\n\nВыберите тип заявки:",
+        buttons=[
+            MenuButton(id="pc_issue_start", label="🖥️ Проблема в работе ПК"),
+            MenuButton(id="orgtech_issue_start", label="🖨️ Оргтехника"),
+            MenuButton(id="peripheral_issue_start", label="🧩 Периферийное оборудование"),
+            MenuButton(id="network_issue_start", label="📶 Проблемы в работе сети"),
+            MenuButton(id="create_ticket_tp", label="⬅️ Назад"),
+        ],
+        parse_mode="HTML",
+    )
+
+
+def get_tp_services_menu(channel_id: str, user_id: int) -> Menu | Error:
+    from user_storage import is_user_registered
+    if not is_user_registered(user_id, channel_id or "telegram"):
+        return Error(message="Сначала пройдите регистрацию.")
+    return Menu(
+        text="🧰 <b>Услуги</b>\n\nВыберите тип заявки:",
+        buttons=[
+            MenuButton(id="electronic_queue_start", label="🎫 Электронная очередь"),
+            MenuButton(id="create_ticket_tp", label="⬅️ Назад"),
+        ],
+        parse_mode="HTML",
+    )
 
 
 def get_admin_panel_response(channel_id: str, user_id: int) -> Menu | Error:
@@ -671,6 +744,16 @@ def get_jira_customer_request_url(issue_key: str, project_key: Optional[str] = N
     return f"{base}/browse/{key}"
 
 
+async def get_issue_details_for_display(issue_key: str, project_key: str = "") -> Optional[dict]:
+    """
+    Возвращает детали тикета для отображения пользователю (summary, status, description).
+    Маршрутизирует по project_key — единая точка входа для всех проектов.
+    Позволяет в будущем добавлять специфичные обработчики per-project без правки хэндлеров.
+    """
+    from core.jira_aa import get_issue_info
+    return await get_issue_info(issue_key)
+
+
 def get_jira_browse_url(issue_key: str) -> str:
     """Ссылка формата /browse/KEY (для исполнителей/администраторов)."""
     key = (issue_key or "").strip()
@@ -715,31 +798,59 @@ async def get_my_tickets_filtered(channel_id: str, user_id: int) -> List[dict]:
     «Отклонена», «Выполнена», «Resolved» и их аналогов (см. MY_TICKETS_EXCLUDED_STATUSES).
     Если заявка в Jira удалена (404), привязка удаляется из реестра и заявка не показывается.
     """
+    import asyncio
     from core.jira_aa import get_issue_status, issue_exists
     from core.support.issue_binding_registry import remove_bindings_by_issue
-    raw = get_my_tickets(channel_id, user_id)
+    from core.storage import use_sqlite_storage
+
+    # Если включён SQLite — операции реестра/профиля могут быть синхронными (sqlite3),
+    # поэтому читаем список заявок в отдельном потоке, чтобы не блокировать event loop.
+    if use_sqlite_storage():
+        raw = await asyncio.to_thread(get_my_tickets, channel_id, user_id)
+    else:
+        raw = get_my_tickets(channel_id, user_id)
     if not raw:
         return []
-    result = []
-    for item in raw:
+    # Пункт 6 плана: параллелим проверки Jira с лимитом, чтобы списки грузились быстрее,
+    # но не создавали шторм запросов.
+    try:
+        conc = int((os.getenv("MY_TICKETS_JIRA_CONCURRENCY") or "5").strip())
+    except Exception:
+        conc = 5
+    conc = max(1, min(20, conc))
+    sem = asyncio.Semaphore(conc)
+
+    async def _process(item: dict) -> dict | None:
         issue_key = (item.get("issue_key") or "").strip()
         if not issue_key:
-            continue
-        exists = await issue_exists(issue_key)
+            return None
+        async with sem:
+            exists = await issue_exists(issue_key)
         if exists is False:
-            remove_bindings_by_issue(issue_key)
-            continue
+            if use_sqlite_storage():
+                await asyncio.to_thread(remove_bindings_by_issue, issue_key)
+            else:
+                remove_bindings_by_issue(issue_key)
+            return None
         if exists is None:
-            result.append(item)
-            continue
-        status = await get_issue_status(issue_key)
+            return item
+        async with sem:
+            status = await get_issue_status(issue_key)
         if status is None:
-            result.append(item)
-            continue
+            return item
         if (status.strip().lower()) in MY_TICKETS_EXCLUDED_STATUSES:
+            return None
+        return item
+
+    processed = await asyncio.gather(*[_process(it) for it in raw], return_exceptions=True)
+    out: List[dict] = []
+    for r in processed:
+        if isinstance(r, Exception):
+            # Не валим список целиком из-за единичной ошибки.
             continue
-        result.append(item)
-    return result
+        if r:
+            out.append(r)
+    return out
 
 
 def user_owns_issue(channel_id: str, user_id: int, issue_key: str) -> bool:
@@ -793,6 +904,18 @@ class SupportAPI:
     def get_main_menu(self, channel_id: str, user_id: int) -> Menu:
         return get_main_menu_response(channel_id, user_id)
 
+    def get_tp_root_menu(self, channel_id: str, user_id: int) -> Menu | Error:
+        return get_tp_root_menu(channel_id, user_id)
+
+    def get_tp_programs_menu(self, channel_id: str, user_id: int) -> Menu | Error:
+        return get_tp_programs_menu(channel_id, user_id)
+
+    def get_tp_equipment_menu(self, channel_id: str, user_id: int) -> Menu | Error:
+        return get_tp_equipment_menu(channel_id, user_id)
+
+    def get_tp_services_menu(self, channel_id: str, user_id: int) -> Menu | Error:
+        return get_tp_services_menu(channel_id, user_id)
+
     def get_admin_panel(self, channel_id: str, user_id: int) -> Menu | Error:
         return get_admin_panel_response(channel_id, user_id)
 
@@ -823,6 +946,9 @@ class SupportAPI:
 
     def get_jira_browse_url(self, issue_key: str) -> str:
         return get_jira_browse_url(issue_key)
+
+    async def get_issue_details_for_display(self, issue_key: str, project_key: str = "") -> Optional[dict]:
+        return await get_issue_details_for_display(issue_key, project_key)
 
 
 support_api = SupportAPI()

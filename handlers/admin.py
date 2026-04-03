@@ -215,7 +215,7 @@ async def admin_del_confirm(callback: CallbackQuery, state: FSMContext):
     deleted = delete_user(uid)
     if deleted:
         text = f"✅ Пользователь удалён: {profile.get('full_name', '—')} ({profile.get('login', '—')}, ID {uid})."
-        logger.info("Админ %s удалил пользователя %s (%s)", callback.from_user.id, uid, profile.get("login"))
+        logger.info("Админ %s удалил пользователя %s", callback.from_user.id, uid)
     else:
         text = "Не удалось удалить пользователя."
     await callback.message.edit_text(text, parse_mode="HTML")
@@ -324,6 +324,6 @@ async def admin_delete_user_process(message: Message, state: FSMContext):
             f"✅ Пользователь удалён: {profile.get('full_name', '—')} ({profile.get('login', '—')}, ID {user_id_to_delete}).",
             reply_markup=get_main_menu_keyboard(message.from_user.id),
         )
-        logger.info("Админ %s удалил пользователя %s (%s)", message.from_user.id, user_id_to_delete, profile.get("login"))
+        logger.info("Админ %s удалил пользователя %s", message.from_user.id, user_id_to_delete)
     else:
         await message.reply("Не удалось удалить.", reply_markup=get_main_menu_keyboard(message.from_user.id))

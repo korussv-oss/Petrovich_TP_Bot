@@ -1,17 +1,20 @@
 """Пошаговое создание заявки «Проблема в работе ПК» в MAX."""
 from typing import Optional
 
+from core.support import ticket_wizard
+from adapters.max._utils import collect_attachments
+from adapters.max._wizard_flow import WizardFlowStore
 from user_storage import is_user_registered
 from core.pc_problem import PC_PROBLEM_KINDS, PC_PROBLEM_KIND_BY_ID
 
 CHANNEL_ID = "max"
 CANCEL_BTN = [{"id": "cancel", "label": "❌ Отмена"}]
 
-_flow: dict[int, dict] = {}
+_store = WizardFlowStore()
 
 
 def is_in_pc_flow(user_id: int) -> bool:
-    return user_id in _flow
+    return _store.has(user_id)
 
 
 def _kind_buttons() -> list:
@@ -35,71 +38,56 @@ def _attachments_buttons() -> list:
 async def start_pc(user_id: int) -> Optional[dict]:
     if not is_user_registered(user_id, CHANNEL_ID):
         return None
-    _flow[user_id] = {"step": "kind", "data": {}}
+    _store.create(user_id, ticket_type_id="pc_problem", step="kind")
     return {
-        "text": "🖥️ <b>Проблема в работе ПК</b>\n\nС чем наблюдаются проблемы?",
+        "text": ticket_wizard.pc_kind_screen().text,
         "parse_mode": "HTML",
         "buttons": _kind_buttons(),
     }
 
 
 async def handle_pc_callback(user_id: int, callback_id: str) -> Optional[dict]:
-    state = _flow.get(user_id)
-    if not state:
+    session = _store.get(user_id)
+    if not session:
         return None
     if callback_id == "cancel":
-        _flow.pop(user_id, None)
+        _store.clear(user_id)
         from adapters.max.handlers import handle_main_menu
         return handle_main_menu(user_id)
 
-    step = state.get("step")
-    data = state.get("data") or {}
-
-    if step == "kind" and callback_id.startswith("pc_kind_"):
+    if session.step == "kind" and callback_id.startswith("pc_kind_"):
         kind_id = callback_id.replace("pc_kind_", "", 1).strip()
         label = PC_PROBLEM_KIND_BY_ID.get(kind_id)
         if not label:
             return {"text": "Неверный выбор. Выберите категорию проблемы.", "parse_mode": "HTML", "buttons": _kind_buttons()}
-        data["pc_problem_kind_id"] = kind_id
-        data["pc_problem_kind_label"] = label
-        state["data"] = data
-        state["step"] = "description"
+        _store.set_step(user_id, "description", data={"pc_problem_kind_id": kind_id, "pc_problem_kind_label": label})
         return {
-            "text": (
-                "🖥️ <b>Проблема в работе ПК</b>\n\n"
-                f"✅ Категория: {label}\n\n"
-                "Опишите проблему (Description) или нажмите «Пропустить»."
-            ),
+            "text": ticket_wizard.pc_description_screen(kind_label=label).text,
             "parse_mode": "HTML",
             "buttons": _desc_buttons(),
         }
 
-    if step == "description" and callback_id == "pc_skip_description":
-        data["description"] = ""
-        data["pc_attachment_tokens"] = []
-        state["data"] = data
-        state["step"] = "attachments"
+    if session.step == "description" and callback_id == "pc_skip_description":
+        _store.set_step(user_id, "attachments", data={"description": "", "pc_attachment_tokens": []})
         return {
-            "text": (
-                "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый).\n\n"
-                "Или нажмите «Создать заявку» / «Пропустить вложения»."
-            ),
+            "text": ticket_wizard.pc_attachments_screen(added_count=0).text,
             "parse_mode": "HTML",
             "buttons": _attachments_buttons(),
         }
 
-    if step == "attachments" and callback_id in ("pc_finish_ticket", "pc_skip_attachments"):
+    if session.step == "attachments" and callback_id in ("pc_finish_ticket", "pc_skip_attachments"):
+        session = _store.get(user_id)
         if callback_id == "pc_skip_attachments":
-            data["pc_attachment_tokens"] = []
-        ticket_data = dict(data)
-        attachment_tokens = list(ticket_data.get("pc_attachment_tokens") or [])
-        _flow.pop(user_id, None)
+            _store.update_data(user_id, pc_attachment_tokens=[])
+            session = _store.get(user_id)
+        attachment_tokens = list(session.data.get("pc_attachment_tokens") or [])
+        _store.clear(user_id)
         return {
             "create_ticket": {
                 "ticket_type_id": "pc_problem",
                 "form_data": {
-                    "pc_problem_kind_id": (ticket_data.get("pc_problem_kind_id") or "").strip(),
-                    "description": (ticket_data.get("description") or "").strip(),
+                    "pc_problem_kind_id": (session.data.get("pc_problem_kind_id") or "").strip(),
+                    "description": (session.data.get("description") or "").strip(),
                 },
                 "attachment_tokens": attachment_tokens,
             }
@@ -108,55 +96,35 @@ async def handle_pc_callback(user_id: int, callback_id: str) -> Optional[dict]:
 
 
 async def handle_pc_message(user_id: int, text: str, attachment_list: list | None = None) -> Optional[dict]:
-    state = _flow.get(user_id)
-    if not state:
+    session = _store.get(user_id)
+    if not session:
         return None
-    step = state.get("step")
-    data = state.get("data") or {}
 
     if (text or "").strip().lower() in ("отмена", "cancel", "/cancel"):
-        _flow.pop(user_id, None)
+        _store.clear(user_id)
         from adapters.max.handlers import handle_main_menu
         return handle_main_menu(user_id)
 
-    if step == "kind":
+    if session.step == "kind":
         return {"text": "Выберите категорию проблемы кнопкой ниже.", "parse_mode": "HTML", "buttons": _kind_buttons()}
 
-    if step == "description":
-        data["description"] = (text or "").strip()
-        data["pc_attachment_tokens"] = []
-        state["data"] = data
-        state["step"] = "attachments"
+    if session.step == "description":
+        _store.set_step(user_id, "attachments", data={"description": (text or "").strip(), "pc_attachment_tokens": []})
         return {
-            "text": (
-                "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый).\n\n"
-                "Или нажмите «Создать заявку» / «Пропустить вложения»."
-            ),
+            "text": ticket_wizard.pc_attachments_screen(added_count=0).text,
             "parse_mode": "HTML",
             "buttons": _attachments_buttons(),
         }
 
-    if step == "attachments":
-        tokens = list(data.get("pc_attachment_tokens") or [])
-        for att in (attachment_list or []):
-            if not isinstance(att, dict):
-                continue
-            if len(tokens) >= 10:
-                break
-            if att.get("url"):
-                tokens.append(att)
-        data["pc_attachment_tokens"] = tokens
-        state["data"] = data
+    if session.step == "attachments":
+        tokens = collect_attachments(session.data.get("pc_attachment_tokens") or [], attachment_list)
+        _store.update_data(user_id, pc_attachment_tokens=tokens)
         if attachment_list:
             return {
-                "text": f"📎 Добавлено {len(tokens)} из 10. Можно приложить ещё или завершить создание заявки.",
+                "text": ticket_wizard.pc_attachments_screen(added_count=len(tokens)).text,
                 "parse_mode": "HTML",
                 "buttons": _attachments_buttons(),
             }
-        return {
-            "text": "Пришлите вложение или нажмите кнопку завершения.",
-            "parse_mode": "HTML",
-            "buttons": _attachments_buttons(),
-        }
+        return {"text": "Пришлите вложение или нажмите кнопку завершения.", "parse_mode": "HTML", "buttons": _attachments_buttons()}
 
     return {"text": "Используйте кнопки ниже.", "parse_mode": "HTML", "buttons": CANCEL_BTN}

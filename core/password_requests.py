@@ -14,6 +14,10 @@ from core.support import delivery as delivery_module
 
 logger = logging.getLogger(__name__)
 
+# SQLite storage (optional)
+from core.storage import use_sqlite_storage
+from core.storage import sqlite_backend as _sqlite
+
 # Статусы, при которых считаем пароль успешно изменённым
 STATUS_RESOLVED = frozenset({"resolved", "готово", "исправлено", "done"})
 # Статусы отказа в смене пароля
@@ -41,6 +45,9 @@ def _save(data: Dict[str, Dict]) -> None:
 
 def add_pending(issue_key: str, user_id: int, channel_id: str = "telegram") -> None:
     """Регистрирует заявку для оповещения пользователя при смене статуса (в нужном канале)."""
+    if use_sqlite_storage():
+        _sqlite.add_pending_password(issue_key, user_id, channel_id)
+        return
     key = (issue_key or "").strip().upper()
     if not key:
         return
@@ -52,6 +59,8 @@ def add_pending(issue_key: str, user_id: int, channel_id: str = "telegram") -> N
 
 def get_all_pending() -> List[Tuple[str, int, str]]:
     """Возвращает список (issue_key, user_id, channel_id) по всем ожидающим заявкам."""
+    if use_sqlite_storage():
+        return _sqlite.list_pending_password()
     data = _load()
     return [
         (k, v["user_id"], (v.get("channel_id") or "telegram").strip().lower())
@@ -62,6 +71,8 @@ def get_all_pending() -> List[Tuple[str, int, str]]:
 
 def _get_pending_data() -> Dict[str, Dict]:
     """Возвращает полные данные по ожидающим заявкам (включая last_comment_count)."""
+    if use_sqlite_storage():
+        return _sqlite.get_pending_password_raw()
     return _load()
 
 
@@ -97,6 +108,9 @@ def _comment_body_plain(comment: Dict[str, Any], max_len: int = 500) -> str:
 
 def _set_last_comment_count(issue_key: str, count: int) -> None:
     """Сохраняет количество комментариев для заявки (для уведомлений о новых)."""
+    if use_sqlite_storage():
+        _sqlite.set_pending_password_last_comment_count(issue_key, count)
+        return
     key = (issue_key or "").strip().upper()
     if not key:
         return
@@ -117,6 +131,9 @@ def get_pending_issue_key_by_user(user_id: int) -> Optional[str]:
 
 def remove_pending(issue_key: str) -> None:
     """Удаляет заявку из ожидающих (после оповещения)."""
+    if use_sqlite_storage():
+        _sqlite.remove_pending_password(issue_key)
+        return
     key = (issue_key or "").strip().upper()
     if not key:
         return
@@ -137,7 +154,10 @@ async def check_statuses_and_notify() -> None:
     """
     from core.jira_aa import get_issue_status
 
-    pending = get_all_pending()
+    if use_sqlite_storage():
+        pending = await asyncio.to_thread(get_all_pending)
+    else:
+        pending = get_all_pending()
     if not pending:
         return
     for issue_key, user_id, channel_id in pending:
@@ -156,7 +176,10 @@ async def check_statuses_and_notify() -> None:
                     )
                 except Exception as e:
                     logger.warning("Не удалось отправить оповещение %s/user_id=%s (Resolved): %s", channel_id, user_id, e)
-                remove_pending(issue_key)
+                if use_sqlite_storage():
+                    await asyncio.to_thread(remove_pending, issue_key)
+                else:
+                    remove_pending(issue_key)
             elif status_lower in STATUS_REJECTED:
                 try:
                     await delivery_module.deliver(
@@ -168,7 +191,10 @@ async def check_statuses_and_notify() -> None:
                     )
                 except Exception as e:
                     logger.warning("Не удалось отправить оповещение %s/user_id=%s (Отклонено): %s", channel_id, user_id, e)
-                remove_pending(issue_key)
+                if use_sqlite_storage():
+                    await asyncio.to_thread(remove_pending, issue_key)
+                else:
+                    remove_pending(issue_key)
         except Exception as e:
             logger.warning("Ошибка проверки заявки %s: %s", issue_key, e)
         await asyncio.sleep(0.5)
@@ -178,10 +204,16 @@ async def check_comments_and_notify() -> None:
     """Проверяет новые комментарии по ожидающим заявкам и отправляет уведомление пользователю."""
     from core.jira_aa import get_issue_comments
 
-    pending = get_all_pending()
+    if use_sqlite_storage():
+        pending = await asyncio.to_thread(get_all_pending)
+    else:
+        pending = get_all_pending()
     if not pending:
         return
-    data = _get_pending_data()
+    if use_sqlite_storage():
+        data = await asyncio.to_thread(_get_pending_data)
+    else:
+        data = _get_pending_data()
     for issue_key, user_id, channel_id in pending:
         try:
             comments = await get_issue_comments(issue_key)

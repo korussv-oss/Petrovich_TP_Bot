@@ -1,0 +1,46 @@
+[project]
+name = "rubik-bot"
+requires-python = ">=3.11"
+
+# ---------------------------------------------------------------------------
+# Ruff — linter + formatter
+# Docs: https://docs.astral.sh/ruff/
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+# Exclude helper/migration scripts and generated artefacts
+exclude = [
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "data/",
+    "docs/",
+    "_*.py",          # _migrate_states.py, _audit_pii.py, etc.
+]
+
+[tool.ruff.lint]
+# E  — pycodestyle errors
+# F  — pyflakes (undefined names, unused imports, etc.)
+# W  — pycodestyle warnings
+# UP — pyupgrade (modern Python idioms)
+select = ["E", "F", "W", "UP"]
+
+ignore = [
+    "E501",   # line too long — не блокируем, длинные строки допустимы
+    "E402",   # module-level import not at top — встречается в условных импортах
+    "UP007",  # use X | Y for union — сохраняем Optional[] для читаемости
+    "UP035",  # typing import deprecated — совместимость с python 3.11
+]
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

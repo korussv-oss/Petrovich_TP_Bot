@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from config import CONFIG
@@ -31,14 +32,20 @@ logging.basicConfig(
     ),
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     handlers=[
-        logging.FileHandler("data/bot.log", encoding="utf-8"),
+        RotatingFileHandler(
+            "data/bot.log",
+            encoding="utf-8",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+        ),
         logging.StreamHandler(),
     ],
 )
 logger = logging.getLogger(__name__)
 
 _singleton_lock_fp = None
-_telegram_dp = None  # создаём один раз, чтобы не повторять dp.include_router на рестартах
+_telegram_dp = None       # создаём один раз, чтобы не повторять dp.include_router на рестартах
+_notification_bot = None  # singleton Bot для доставки уведомлений — не пересоздаём на каждое сообщение
 
 
 def _env_int(name: str, default: int) -> int:
@@ -137,7 +144,7 @@ async def _run_telegram_bot() -> None:
     from aiogram import Bot, Dispatcher
     from aiogram.client.default import DefaultBotProperties
     from aiogram.enums import ParseMode
-    from aiogram.fsm.storage.memory import MemoryStorage
+    from core.fsm_storage import JsonFsmStorage
 
     from handlers.start import router as start_router
     from handlers.registration import router as registration_router
@@ -157,7 +164,7 @@ async def _run_telegram_bot() -> None:
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     global _telegram_dp
     if _telegram_dp is None:
-        dp = Dispatcher(storage=MemoryStorage())
+        dp = Dispatcher(storage=JsonFsmStorage("data/fsm_state.json"))
         cooldown = _env_float("ANTISPAM_COOLDOWN", 1.5)
         dp.update.outer_middleware(AntispamMiddleware(cooldown=cooldown))
 
@@ -187,9 +194,8 @@ async def _run_max_bot() -> None:
         logger.info("MAX: MAX_BOT_TOKEN не задан, бот в MAX не запускается")
         return
 
-    from adapters.max.main_max import run_max_bot
-
     logger.info("MAX: сервис запускается")
+    from adapters.max.main_max import run_max_bot
     await run_max_bot()
 
 
@@ -216,24 +222,32 @@ async def main():
     telegram_delivery_timeout_seconds = _env_float("TELEGRAM_DELIVERY_TIMEOUT_SECONDS", 3.0)
     telegram_delivery_cooldown_seconds = _env_float("TELEGRAM_DELIVERY_COOLDOWN_SECONDS", 30.0)
     telegram_send_disabled_until = 0.0
+
+    async def _get_or_create_notification_bot():
+        """Возвращает переиспользуемый Bot-объект для уведомлений (singleton)."""
+        global _notification_bot
+        if _notification_bot is None:
+            from aiogram import Bot
+            from aiogram.client.default import DefaultBotProperties
+            from aiogram.enums import ParseMode
+            token = (CONFIG.get("TELEGRAM", {}) or {}).get("TOKEN", "").strip()
+            _notification_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        return _notification_bot
+
     async def deliver_to_channel(channel_id: str, channel_user_id: int, text: str, reply_markup=None):
         nonlocal telegram_send_disabled_until
         if (channel_id or "").strip().lower() == "telegram":
             if not telegram_enabled:
                 logger.warning("Доставка в Telegram пропущена (бот выключен): user_id=%s", channel_user_id)
                 return
-            # Если Telegram уже “падает”, не трогаем сеть слишком часто.
+            # Если Telegram уже "падает", не трогаем сеть слишком часто.
             now = _time.monotonic()
             if now < telegram_send_disabled_until:
                 logger.debug("Доставка в Telegram пропущена (cooldown): user_id=%s", channel_user_id)
                 return
-            from aiogram import Bot
-            from aiogram.client.default import DefaultBotProperties
-            from aiogram.enums import ParseMode
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-            token = (CONFIG.get("TELEGRAM", {}) or {}).get("TOKEN", "").strip()
-            bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+            bot = await _get_or_create_notification_bot()
             try:
                 markup = None
                 if reply_markup:
@@ -256,9 +270,10 @@ async def main():
                     channel_user_id,
                     e,
                 )
+                # Сбрасываем singleton при ошибке сессии, чтобы при следующей попытке создать новый.
+                global _notification_bot
+                _notification_bot = None
                 return
-            finally:
-                await bot.session.close()
             return
 
         if (channel_id or "").strip().lower() == "max":
@@ -294,7 +309,8 @@ async def main():
         )
     )
 
-    service_tasks = []
+    telegram_task = None
+    max_task = None
     if telegram_enabled:
         telegram_task = asyncio.create_task(_supervise("TELEGRAM", _run_telegram_bot, restart_delay_seconds=5.0))
     if max_enabled:
@@ -308,13 +324,9 @@ async def main():
             *( [max_task] if max_enabled else [] ),
         )
     finally:
-        status_task.cancel()
-        comments_task.cancel()
-        if telegram_enabled:
-            telegram_task.cancel()
-        if max_enabled:
-            max_task.cancel()
-        for t in (status_task, comments_task):
+        for t in filter(None, [status_task, comments_task, telegram_task, max_task]):
+            t.cancel()
+        for t in filter(None, [status_task, comments_task, telegram_task, max_task]):
             try:
                 await t
             except asyncio.CancelledError:
@@ -322,4 +334,11 @@ async def main():
 
 
 if __name__ == "__main__":
+    import sys
+    if sys.platform == "win32":
+        # aiohttp long-polling не работает с IocpProactor (Windows default).
+        # WindowsSelectorEventLoopPolicy использует select() — корректно обрабатывает
+        # входящие данные от сервера во время ожидания (long-poll).
+        # На Linux это не нужно — там epoll используется по умолчанию.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())

@@ -11,7 +11,9 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from config import CONFIG
-from core.jira_aa import get_issue_admin_details
+import asyncio
+
+from core.jira_aa import get_issues_admin_details_batch
 from core.jira_status_ru import jira_status_display_ru
 from core.support.api import get_jira_browse_url
 from core.support.issue_binding_registry import get_all_bindings
@@ -165,16 +167,27 @@ async def build_admin_detailed_report() -> Optional[Path]:
         c.font = Font(bold=True)
         c.alignment = Alignment(horizontal="center", vertical="center")
 
+    # Batch: все детали заявок за один JQL-запрос + все SLA-поля параллельно
+    details_batch = await get_issues_admin_details_batch(issue_keys)
+    sla_fields_batch: list = await asyncio.gather(
+        *[_get_issue_fields_with_names(k) for k in issue_keys],
+        return_exceptions=True,
+    )
+    sla_by_key = {
+        k: (v if isinstance(v, dict) else {})
+        for k, v in zip(issue_keys, sla_fields_batch)
+    }
+
     row = 2
     for issue_key in issue_keys:
         binding = by_issue[issue_key]
         author = _author_from_binding(binding)
-        info = await get_issue_admin_details(issue_key) or {}
+        info = details_batch.get(issue_key) or {}
         assignee = (info.get("assignee_display") or "—").strip() or "—"
         status = jira_status_display_ru(info.get("status"))
         jira_link = get_jira_browse_url(issue_key) or ""
 
-        fields = await _get_issue_fields_with_names(issue_key)
+        fields = sla_by_key.get(issue_key)
         sla_value = _extract_sla_value(fields or {}, "Время решения IT-услуги")
 
         ws.cell(row=row, column=1, value=author)

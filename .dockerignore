@@ -22,3 +22,11 @@ env/
 .idea/
 .vscode/
 
+# Документация и вспомогательные скрипты
+docs/
+_*.py
+*.lock.txt
+
+# CI
+.github/
+

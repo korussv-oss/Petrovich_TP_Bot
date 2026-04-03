@@ -32,6 +32,10 @@ RUN mkdir -p /app/data
 # Опционально объявляем том для данных (можно монтировать в docker run / docker-compose)
 VOLUME ["/app/data"]
 
+# Проверка "живости": бот создаёт файл-замок при запуске — его наличие == процесс работает
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD python -c "import os, sys; sys.exit(0 if os.path.exists('/app/data/rubik_singleton.lock') else 1)"
+
 # Команда запуска: Telegram-бот + (при наличии MAX_BOT_TOKEN) MAX-бот в одном процессе
 CMD ["python", "main.py"]
 
