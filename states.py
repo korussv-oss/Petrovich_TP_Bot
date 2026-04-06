@@ -79,6 +79,8 @@ class TicketWizardStates(StatesGroup):
 
     # Lupa (lupa_search)
     LUPA_DEPARTMENT = State()
+    # Выбор подразделения Jira (HD) для профиля перед повторной отправкой заявки
+    PROFILE_DEPARTMENT_FOR_TICKET = State()
     LUPA_SERVICE = State()
     LUPA_REQUEST_TYPE = State()
     LUPA_CITY = State()

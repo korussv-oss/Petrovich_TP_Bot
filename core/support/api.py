@@ -12,6 +12,9 @@ from validators import sanitize_jira_text
 
 logger = logging.getLogger(__name__)
 
+# Возврат create_ticket при отсутствии profile.department для форм с обязательным Jira-полем подразделения.
+NEED_PROFILE_DEPARTMENT = "__NEED_PROFILE_DEPARTMENT__"
+
 
 def _channel_user_id(channel_id: str, user_id: int) -> tuple:
     """Идентификатор пользователя в канале (для реестра и профиля)."""
@@ -228,6 +231,14 @@ async def create_ticket(
         ok, msg = await request_password_change(user_id, new_password, channel_id)
         return ok, msg, None
 
+    from user_storage import get_user_profile
+    from core.forms_catalog import form_requires_profile_department
+
+    if form_requires_profile_department(ticket_type_id):
+        _prof = get_user_profile(user_id, channel_id) or {}
+        if not ((_prof.get("department") or "").strip()):
+            return False, NEED_PROFILE_DEPARTMENT, None
+
     if ticket_type_id == "wms_issue":
         from user_storage import get_user_profile
         from core.jira_form_engine import create_issue_from_form
@@ -299,7 +310,6 @@ async def create_ticket(
         subdivision = (
             (form_data.get("subdivision") or "").strip()
             or (profile.get("department") or "").strip()
-            or (profile.get("department_wms") or "").strip()
         )
         if not subdivision:
             return False, "Укажите подразделение при создании заявки (выберите из списка).", None
@@ -897,6 +907,8 @@ def get_registration_step_response(
 
 class SupportAPI:
     """Фасад API Support Core."""
+
+    NEED_PROFILE_DEPARTMENT = NEED_PROFILE_DEPARTMENT  # см. модульную константу NEED_PROFILE_DEPARTMENT
 
     def get_start(self, channel_id: str, user_id: int) -> Text | Menu:
         return get_start_response(channel_id, user_id)

@@ -10,7 +10,7 @@ from aiogram.fsm.context import FSMContext
 
 from user_storage import is_user_registered, get_user_profile, save_user_profile, check_employee_id_taken
 
-from core.support.api import support_api
+from core.support.api import support_api, NEED_PROFILE_DEPARTMENT
 from core.support.models import Menu, Error
 from core.support import ticket_wizard
 from core.support.ticket_wizard import (
@@ -72,6 +72,106 @@ import tempfile
 logger = logging.getLogger(__name__)
 router = Router()
 CHANNEL_ID = "telegram"
+
+
+async def _start_profile_department_prompt_telegram(
+    state: FSMContext,
+    user_id: int,
+    *,
+    ticket_type_id: str,
+    form_data: dict,
+    attachment_file_ids: list | None = None,
+    reply_message=None,
+    edit: bool = False,
+) -> None:
+    """Сохраняет черновик заявки и показывает выбор подразделения Jira (сохраняется в profile.department)."""
+    from core.jira_departments import get_departments_async
+    from keyboards import get_department_keyboard
+
+    depts = await get_departments_async()
+    await state.set_state(TicketWizardStates.PROFILE_DEPARTMENT_FOR_TICKET)
+    await state.update_data(
+        pending_ticket_type_id=ticket_type_id,
+        pending_ticket_form_data=dict(form_data),
+        pending_ticket_attachment_file_ids=list(attachment_file_ids or []),
+        profile_dept_pick_list=depts,
+    )
+    text = (
+        "🏢 <b>Подразделение для заявок в поддержку</b>\n\n"
+        "Выберите ваше подразделение — оно будет <b>сохранено в учётной записи бота</b> "
+        "и подставится в заявки. Затем заявка будет создана автоматически."
+    )
+    kb = get_department_keyboard(departments=depts) if depts else get_main_menu_keyboard(user_id)
+    if not depts:
+        text = (
+            "🏢 Не удалось загрузить список подразделений. Попробуйте позже или обратитесь к администратору."
+        )
+    if edit and reply_message is not None:
+        await reply_message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    elif reply_message is not None:
+        await reply_message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def _telegram_submit_ticket_or_prompt_department(
+    *,
+    state: FSMContext,
+    user_id: int,
+    ticket_type_id: str,
+    form_data: dict,
+    attachment_file_ids: list | None,
+    bot,
+    reply_message,
+    edit_on_success: bool,
+) -> None:
+    """
+    Создаёт заявку или переводит в PROFILE_DEPARTMENT_FOR_TICKET.
+    reply_message — Message для edit_text (callback) или answer (финиш).
+    """
+    attachment_paths: list[str] = []
+    if attachment_file_ids:
+        attachment_paths = await _download_tg_files(bot, list(attachment_file_ids))
+    try:
+        success, key_or_msg, full_msg = await support_api.create_ticket(
+            CHANNEL_ID,
+            user_id,
+            ticket_type_id,
+            form_data,
+            attachment_paths=attachment_paths or None,
+        )
+        if not success and key_or_msg == NEED_PROFILE_DEPARTMENT:
+            await _start_profile_department_prompt_telegram(
+                state,
+                user_id,
+                ticket_type_id=ticket_type_id,
+                form_data=form_data,
+                attachment_file_ids=list(attachment_file_ids or []),
+                reply_message=reply_message,
+                edit=edit_on_success,
+            )
+            return
+        display = full_msg or key_or_msg or ("Заявка создана" if success else "Ошибка")
+        if success and ticket_type_id == "wms_issue" and key_or_msg and attachment_paths:
+            try:
+                from core.jira_wms import add_attachments_to_issue
+
+                added, _ = await add_attachments_to_issue(key_or_msg, attachment_paths)
+                if added:
+                    display += f"\n\n📎 Приложено файлов: {added}."
+            except Exception as exc:
+                logger.warning("_telegram_submit_ticket_or_prompt_department: wms attachments: %s", exc)
+        await state.clear()
+        text = f"✅ {display}" if success else f"❌ {display}"
+        if edit_on_success:
+            await reply_message.edit_text(text, parse_mode="HTML", reply_markup=get_main_menu_keyboard(user_id))
+        else:
+            await reply_message.answer(text, parse_mode="HTML", reply_markup=get_main_menu_keyboard(user_id))
+    finally:
+        for p in attachment_paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
 
 # ===========================================================================
 # Thin-adapter helpers (Phase 16)
@@ -272,44 +372,19 @@ async def _apply_wizard_screen(
         form_data = payload.get("form_data") or {}
         file_ids: list = list(payload.get("attachment_tokens") or [])
         bot = update.bot if hasattr(update, "bot") else update.message.bot
-
-        attachment_paths: list[str] = []
-        if file_ids:
-            attachment_paths = await _download_tg_files(bot, file_ids)
-
-        try:
-            success, key_or_msg, full_msg = await support_api.create_ticket(
-                CHANNEL_ID,
-                user_id,
-                ttype,
-                form_data,
-                attachment_paths=attachment_paths or None,
-            )
-            display = full_msg or key_or_msg or ("Заявка создана" if success else "Ошибка")
-
-            if success and ttype == "wms_issue" and key_or_msg and attachment_paths:
-                try:
-                    from core.jira_wms import add_attachments_to_issue
-                    added, _ = await add_attachments_to_issue(key_or_msg, attachment_paths)
-                    if added:
-                        display += f"\n\n📎 Приложено файлов: {added}."
-                except Exception as exc:
-                    logger.warning("_apply_wizard_screen: wms attachments: %s", exc)
-        finally:
-            for p in attachment_paths:
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-
-        await state.clear()
-        text = f"✅ {display}" if success else f"❌ {display}"
+        reply_message = update.message if isinstance(update, CallbackQuery) else update
+        await _telegram_submit_ticket_or_prompt_department(
+            state=state,
+            user_id=user_id,
+            ticket_type_id=ttype,
+            form_data=form_data,
+            attachment_file_ids=file_ids,
+            bot=bot,
+            reply_message=reply_message,
+            edit_on_success=isinstance(update, CallbackQuery),
+        )
         if isinstance(update, CallbackQuery):
-            await update.message.edit_text(text, parse_mode="HTML",
-                                           reply_markup=get_main_menu_keyboard(user_id))
-        else:
-            await update.answer(text, parse_mode="HTML",
-                                reply_markup=get_main_menu_keyboard(user_id))
+            await update.answer()
         return
 
     if screen.kind == "error":
@@ -332,6 +407,71 @@ async def _apply_wizard_screen(
         await update.message.edit_text(screen.text, parse_mode="HTML", reply_markup=keyboard)
     else:
         await update.answer(screen.text, parse_mode="HTML", reply_markup=keyboard)
+
+
+# ---------------------------------------------------------------------------
+# Подразделение Jira (profile.department) перед заявкой с обязательным customfield_11406
+# ---------------------------------------------------------------------------
+
+
+@router.callback_query(TicketWizardStates.PROFILE_DEPARTMENT_FOR_TICKET, F.data == "cancel")
+async def ticket_profile_dept_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        "❌ Создание заявки отменено. Подразделение в профиле не изменено.",
+        reply_markup=get_main_menu_keyboard(callback.from_user.id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(TicketWizardStates.PROFILE_DEPARTMENT_FOR_TICKET, F.data.startswith("department_page_"))
+async def ticket_profile_dept_page(callback: CallbackQuery, state: FSMContext):
+    try:
+        page = int(callback.data.replace("department_page_", ""))
+    except ValueError:
+        await callback.answer()
+        return
+    from keyboards import get_department_keyboard
+
+    data = await state.get_data()
+    depts = data.get("profile_dept_pick_list") or []
+    await callback.message.edit_reply_markup(reply_markup=get_department_keyboard(departments=depts, page=page))
+    await callback.answer()
+
+
+@router.callback_query(TicketWizardStates.PROFILE_DEPARTMENT_FOR_TICKET, F.data.startswith("department_"))
+async def ticket_profile_dept_select(callback: CallbackQuery, state: FSMContext):
+    if "department_page_" in (callback.data or ""):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    depts = data.get("profile_dept_pick_list") or []
+    raw = (callback.data or "").replace("department_", "")
+    if not raw.isdigit():
+        await callback.answer()
+        return
+    idx = int(raw)
+    if idx < 0 or idx >= len(depts):
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    value = depts[idx]
+    profile = get_user_profile(callback.from_user.id) or {}
+    profile["department"] = value
+    save_user_profile(callback.from_user.id, profile)
+    ticket_type_id = data.get("pending_ticket_type_id") or ""
+    form_data = data.get("pending_ticket_form_data") or {}
+    file_ids = data.get("pending_ticket_attachment_file_ids") or []
+    await _telegram_submit_ticket_or_prompt_department(
+        state=state,
+        user_id=callback.from_user.id,
+        ticket_type_id=ticket_type_id,
+        form_data=form_data,
+        attachment_file_ids=list(file_ids),
+        bot=callback.bot,
+        reply_message=callback.message,
+        edit_on_success=True,
+    )
+    await callback.answer()
 
 
 # ===========================================================================
@@ -1083,17 +1223,8 @@ async def tp_email_owa_attachment_add(message: Message, state: FSMContext):
 async def _finish_email_owa_common(callback: CallbackQuery, state: FSMContext, file_ids: list):
     data = await state.get_data()
     profile = get_user_profile(callback.from_user.id) or {}
-    department = (profile.get("department") or "").strip()
     phone = (profile.get("phone") or "").strip()
     jira_username = (profile.get("jira_username") or "").strip()
-    if not department:
-        await state.clear()
-        await callback.message.edit_text(
-            "❌ В профиле не указано подразделение. Сначала выберите его в заявке Lupa.",
-            reply_markup=get_main_menu_keyboard(callback.from_user.id),
-        )
-        await callback.answer()
-        return
     if not phone:
         await state.clear()
         await callback.message.edit_text(
@@ -1118,44 +1249,17 @@ async def _finish_email_owa_common(callback: CallbackQuery, state: FSMContext, f
         "description": (data.get("description") or "").strip(),
     }
 
-    attachment_paths = []
-    if file_ids:
-        import os
-        import tempfile
-        bot = callback.bot
-        for fid in file_ids[:10]:
-            try:
-                f = await bot.get_file(fid)
-                safe_name = f.file_path.replace("/", "_").replace("\\", "_") if f.file_path else str(fid)
-                path = os.path.join(tempfile.gettempdir(), f"email_owa_attach_{safe_name}")
-                await bot.download_file(f.file_path, path)
-                if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
-                    attachment_paths.append(path)
-            except Exception as e:
-                logger.warning("Скачивание вложения TG email_owa %s: %s", fid[:20] if isinstance(fid, str) else fid, e)
-    try:
-        success, issue_key, msg = await support_api.create_ticket(
-            CHANNEL_ID,
-            callback.from_user.id,
-            "email_owa_outlook",
-            form_data,
-            attachment_paths=attachment_paths,
-        )
-        display_text = msg or issue_key
-        await state.clear()
-        await callback.message.edit_text(
-            f"✅ {display_text}" if success else f"❌ {display_text}",
-            parse_mode="HTML",
-            reply_markup=get_main_menu_keyboard(callback.from_user.id),
-        )
-        await callback.answer()
-    finally:
-        import os
-        for p in attachment_paths:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    await _telegram_submit_ticket_or_prompt_department(
+        state=state,
+        user_id=callback.from_user.id,
+        ticket_type_id="email_owa_outlook",
+        form_data=form_data,
+        attachment_file_ids=list(file_ids),
+        bot=callback.bot,
+        reply_message=callback.message,
+        edit_on_success=True,
+    )
+    await callback.answer()
 
 
 @router.callback_query(TicketWizardStates.EMAIL_OWA_ATTACHMENTS, F.data == "email_owa_skip_attachments")
@@ -2335,17 +2439,8 @@ async def pc_attachment_add(message: Message, state: FSMContext):
 async def _finish_pc_issue_common(callback: CallbackQuery, state: FSMContext, file_ids: list):
     data = await state.get_data()
     profile = get_user_profile(callback.from_user.id) or {}
-    department = (profile.get("department") or "").strip()
     phone = (profile.get("phone") or "").strip()
     jira_username = (profile.get("jira_username") or "").strip()
-    if not department:
-        await state.clear()
-        await callback.message.edit_text(
-            "❌ В профиле не указано подразделение. Сначала выберите его в заявке Lupa.",
-            reply_markup=get_main_menu_keyboard(callback.from_user.id),
-        )
-        await callback.answer()
-        return
     if not phone:
         await state.clear()
         await callback.message.edit_text(
@@ -2368,42 +2463,17 @@ async def _finish_pc_issue_common(callback: CallbackQuery, state: FSMContext, fi
         "description": (data.get("description") or "").strip(),
     }
 
-    attachment_paths = []
-    if file_ids:
-        import os
-        import tempfile
-
-        bot = callback.bot
-        for fid in file_ids[:10]:
-            try:
-                f = await bot.get_file(fid)
-                safe_name = f.file_path.replace("/", "_").replace("\\", "_") if f.file_path else str(fid)
-                path = os.path.join(tempfile.gettempdir(), f"pc_attach_{safe_name}")
-                await bot.download_file(f.file_path, path)
-                if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
-                    attachment_paths.append(path)
-            except Exception as e:
-                logger.warning("Скачивание вложения TG pc_problem %s: %s", fid[:20] if isinstance(fid, str) else fid, e)
-
-    try:
-        success, issue_key, msg = await support_api.create_ticket(
-            CHANNEL_ID, callback.from_user.id, "pc_problem", form_data, attachment_paths=attachment_paths
-        )
-        display_text = msg or issue_key
-        await state.clear()
-        await callback.message.edit_text(
-            f"✅ {display_text}" if success else f"❌ {display_text}",
-            parse_mode="HTML",
-            reply_markup=get_main_menu_keyboard(callback.from_user.id),
-        )
-        await callback.answer()
-    finally:
-        import os
-        for p in attachment_paths:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    await _telegram_submit_ticket_or_prompt_department(
+        state=state,
+        user_id=callback.from_user.id,
+        ticket_type_id="pc_problem",
+        form_data=form_data,
+        attachment_file_ids=list(file_ids),
+        bot=callback.bot,
+        reply_message=callback.message,
+        edit_on_success=True,
+    )
+    await callback.answer()
 
 
 @router.callback_query(TicketWizardStates.PC_ATTACHMENTS, F.data == "pc_skip_attachments")
@@ -2563,17 +2633,8 @@ async def orgtech_attachment_add(message: Message, state: FSMContext):
 async def _finish_orgtech_common(callback: CallbackQuery, state: FSMContext, file_ids: list):
     data = await state.get_data()
     profile = get_user_profile(callback.from_user.id) or {}
-    department = (profile.get("department") or "").strip()
     phone = (profile.get("phone") or "").strip()
     jira_username = (profile.get("jira_username") or "").strip()
-    if not department:
-        await state.clear()
-        await callback.message.edit_text(
-            "❌ В профиле не указано подразделение. Сначала выберите его в заявке Lupa.",
-            reply_markup=get_main_menu_keyboard(callback.from_user.id),
-        )
-        await callback.answer()
-        return
     if not phone:
         await state.clear()
         await callback.message.edit_text(
@@ -2596,41 +2657,17 @@ async def _finish_orgtech_common(callback: CallbackQuery, state: FSMContext, fil
         "location": (data.get("location") or "").strip(),
         "description": (data.get("description") or "").strip(),
     }
-    attachment_paths = []
-    if file_ids:
-        import os
-        import tempfile
-        bot = callback.bot
-        for fid in file_ids[:10]:
-            try:
-                f = await bot.get_file(fid)
-                safe_name = f.file_path.replace("/", "_").replace("\\", "_") if f.file_path else str(fid)
-                path = os.path.join(tempfile.gettempdir(), f"orgtech_attach_{safe_name}")
-                await bot.download_file(f.file_path, path)
-                if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
-                    attachment_paths.append(path)
-            except Exception as e:
-                logger.warning("Скачивание вложения TG orgtech %s: %s", fid[:20] if isinstance(fid, str) else fid, e)
-
-    try:
-        success, issue_key, msg = await support_api.create_ticket(
-            CHANNEL_ID, callback.from_user.id, "orgtech_problem", form_data, attachment_paths=attachment_paths
-        )
-        display_text = msg or issue_key
-        await state.clear()
-        await callback.message.edit_text(
-            f"✅ {display_text}" if success else f"❌ {display_text}",
-            parse_mode="HTML",
-            reply_markup=get_main_menu_keyboard(callback.from_user.id),
-        )
-        await callback.answer()
-    finally:
-        import os
-        for p in attachment_paths:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    await _telegram_submit_ticket_or_prompt_department(
+        state=state,
+        user_id=callback.from_user.id,
+        ticket_type_id="orgtech_problem",
+        form_data=form_data,
+        attachment_file_ids=list(file_ids),
+        bot=callback.bot,
+        reply_message=callback.message,
+        edit_on_success=True,
+    )
+    await callback.answer()
 
 
 @router.callback_query(TicketWizardStates.ORGTECH_ATTACHMENTS, F.data == "orgtech_skip_attachments")
@@ -2787,17 +2824,8 @@ async def peripheral_attachment_add(message: Message, state: FSMContext):
 async def _finish_peripheral_common(callback: CallbackQuery, state: FSMContext, file_ids: list):
     data = await state.get_data()
     profile = get_user_profile(callback.from_user.id) or {}
-    department = (profile.get("department") or "").strip()
     phone = (profile.get("phone") or "").strip()
     jira_username = (profile.get("jira_username") or "").strip()
-    if not department:
-        await state.clear()
-        await callback.message.edit_text(
-            "❌ В профиле не указано подразделение. Сначала выберите его в заявке Lupa.",
-            reply_markup=get_main_menu_keyboard(callback.from_user.id),
-        )
-        await callback.answer()
-        return
     if not phone:
         await state.clear()
         await callback.message.edit_text(
@@ -2820,41 +2848,17 @@ async def _finish_peripheral_common(callback: CallbackQuery, state: FSMContext, 
         "ip_address": (data.get("ip_address") or "").strip(),
         "description": (data.get("description") or "").strip(),
     }
-    attachment_paths = []
-    if file_ids:
-        import os
-        import tempfile
-        bot = callback.bot
-        for fid in file_ids[:10]:
-            try:
-                f = await bot.get_file(fid)
-                safe_name = f.file_path.replace("/", "_").replace("\\", "_") if f.file_path else str(fid)
-                path = os.path.join(tempfile.gettempdir(), f"peripheral_attach_{safe_name}")
-                await bot.download_file(f.file_path, path)
-                if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
-                    attachment_paths.append(path)
-            except Exception as e:
-                logger.warning("Скачивание вложения TG peripheral %s: %s", fid[:20] if isinstance(fid, str) else fid, e)
-
-    try:
-        success, issue_key, msg = await support_api.create_ticket(
-            CHANNEL_ID, callback.from_user.id, "peripheral_equipment", form_data, attachment_paths=attachment_paths
-        )
-        display_text = msg or issue_key
-        await state.clear()
-        await callback.message.edit_text(
-            f"✅ {display_text}" if success else f"❌ {display_text}",
-            parse_mode="HTML",
-            reply_markup=get_main_menu_keyboard(callback.from_user.id),
-        )
-        await callback.answer()
-    finally:
-        import os
-        for p in attachment_paths:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    await _telegram_submit_ticket_or_prompt_department(
+        state=state,
+        user_id=callback.from_user.id,
+        ticket_type_id="peripheral_equipment",
+        form_data=form_data,
+        attachment_file_ids=list(file_ids),
+        bot=callback.bot,
+        reply_message=callback.message,
+        edit_on_success=True,
+    )
+    await callback.answer()
 
 
 @router.callback_query(TicketWizardStates.PERIPHERAL_ATTACHMENTS, F.data == "peripheral_skip_attachments")
@@ -3158,17 +3162,8 @@ async def network_attachment_add(message: Message, state: FSMContext):
 async def _finish_network_common(callback: CallbackQuery, state: FSMContext, file_ids: list):
     data = await state.get_data()
     profile = get_user_profile(callback.from_user.id) or {}
-    department = (profile.get("department") or "").strip()
     phone = (profile.get("phone") or "").strip()
     jira_username = (profile.get("jira_username") or "").strip()
-    if not department:
-        await state.clear()
-        await callback.message.edit_text(
-            "❌ В профиле не указано подразделение. Сначала выберите его в заявке Lupa.",
-            reply_markup=get_main_menu_keyboard(callback.from_user.id),
-        )
-        await callback.answer()
-        return
     if not phone:
         await state.clear()
         await callback.message.edit_text(
@@ -3214,41 +3209,17 @@ async def _finish_network_common(callback: CallbackQuery, state: FSMContext, fil
         "ip_address": "нет",
         "preferred_contact_time": "нет",
     }
-    attachment_paths = []
-    if file_ids:
-        import os
-        import tempfile
-        bot = callback.bot
-        for fid in file_ids[:10]:
-            try:
-                f = await bot.get_file(fid)
-                safe_name = f.file_path.replace("/", "_").replace("\\", "_") if f.file_path else str(fid)
-                path = os.path.join(tempfile.gettempdir(), f"network_attach_{safe_name}")
-                await bot.download_file(f.file_path, path)
-                if os.path.isfile(path) and os.path.getsize(path) <= 10 * 1024 * 1024:
-                    attachment_paths.append(path)
-            except Exception as e:
-                logger.warning("Скачивание вложения TG network %s: %s", fid[:20] if isinstance(fid, str) else fid, e)
-
-    try:
-        success, issue_key, msg = await support_api.create_ticket(
-            CHANNEL_ID, callback.from_user.id, "network_problem", form_data, attachment_paths=attachment_paths
-        )
-        display_text = msg or issue_key
-        await state.clear()
-        await callback.message.edit_text(
-            f"✅ {display_text}" if success else f"❌ {display_text}",
-            parse_mode="HTML",
-            reply_markup=get_main_menu_keyboard(callback.from_user.id),
-        )
-        await callback.answer()
-    finally:
-        import os
-        for p in attachment_paths:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    await _telegram_submit_ticket_or_prompt_department(
+        state=state,
+        user_id=callback.from_user.id,
+        ticket_type_id="network_problem",
+        form_data=form_data,
+        attachment_file_ids=list(file_ids),
+        bot=callback.bot,
+        reply_message=callback.message,
+        edit_on_success=True,
+    )
+    await callback.answer()
 
 
 @router.callback_query(TicketWizardStates.NETWORK_ATTACHMENTS, F.data == "network_skip_attachments")
@@ -3320,13 +3291,8 @@ async def electronic_queue_description(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     profile = get_user_profile(message.from_user.id) or {}
-    department = (profile.get("department") or "").strip()
     phone = (profile.get("phone") or "").strip()
     jira_username = (profile.get("jira_username") or "").strip()
-    if not department:
-        await state.clear()
-        await message.reply("❌ В профиле не указано подразделение.", reply_markup=get_main_menu_keyboard(message.from_user.id))
-        return
     if not phone:
         await state.clear()
         await message.reply("❌ В профиле не указан телефон.", reply_markup=get_main_menu_keyboard(message.from_user.id))
@@ -3340,13 +3306,15 @@ async def electronic_queue_description(message: Message, state: FSMContext):
         "service_type": (data.get("service_type") or "").strip(),
         "description": text,
     }
-    success, issue_key, msg = await support_api.create_ticket(CHANNEL_ID, message.from_user.id, "electronic_queue", form_data)
-    await state.clear()
-    display_text = msg or issue_key
-    await message.reply(
-        f"✅ {display_text}" if success else f"❌ {display_text}",
-        parse_mode="HTML",
-        reply_markup=get_main_menu_keyboard(message.from_user.id),
+    await _telegram_submit_ticket_or_prompt_department(
+        state=state,
+        user_id=message.from_user.id,
+        ticket_type_id="electronic_queue",
+        form_data=form_data,
+        attachment_file_ids=[],
+        bot=message.bot,
+        reply_message=message,
+        edit_on_success=False,
     )
 
 

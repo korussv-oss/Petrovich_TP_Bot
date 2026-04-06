@@ -27,6 +27,15 @@ def _resolve_source(source: str, form_data: Dict[str, Any], profile: Dict[str, A
     return None
 
 
+def _friendly_required_field_message(field_id: str) -> str:
+    if field_id == "customfield_11406":
+        return (
+            "Не заполнено подразделение в учётных данных бота. "
+            "Бот должен был предложить выбрать подразделение — начните создание заявки заново."
+        )
+    return f"Не заполнено обязательное поле формы: {field_id}."
+
+
 async def _get_request_type_fields(base_url: str, token: str, service_desk_id: str, request_type_id: str) -> List[dict]:
     url = urljoin(base_url + "/", f"rest/servicedeskapi/servicedesk/{service_desk_id}/requesttype/{request_type_id}/field")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}", "X-ExperimentalApi": "opt-in"}
@@ -196,7 +205,7 @@ async def _create_jsm_issue(
             value = sanitize_jira_text(text, max_len=max_len) if text else ""
         is_empty = value is None or value == "" or value == {} or value == []
         if required and is_empty:
-            return False, f"Не заполнено обязательное поле формы: {field_id}.", project_key
+            return False, _friendly_required_field_message(field_id), project_key
         if is_empty or (allowed and field_id not in allowed):
             continue
         payload_fields[field_id] = value
@@ -273,7 +282,7 @@ async def _create_rest_issue(
             value = sanitize_jira_text(text, max_len=max_len) if text else ""
         is_empty = value is None or value == "" or value == {}
         if required and is_empty:
-            return False, f"Не заполнено обязательное поле формы: {field_id}.", project_key
+            return False, _friendly_required_field_message(field_id), project_key
         if not is_empty:
             fields[field_id] = value
     payload = {"fields": fields}

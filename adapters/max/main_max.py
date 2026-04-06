@@ -1620,6 +1620,10 @@ async def run_max_bot() -> None:
                                 "parse_mode": "HTML",
                                 "buttons": [{"id": "back_to_main", "label": "◀️ Отмена"}],
                             }
+                        elif callback_id and str(callback_id).startswith("jd"):
+                            from adapters.max.jira_profile_department_max import handle_jira_dept_max_callback
+
+                            response = await handle_jira_dept_max_callback(bot, user_id, str(callback_id))
                         elif callback_id == "pc_issue_start":
                             response = await pc_flow.start_pc(user_id)
                             if response is None:
@@ -1849,39 +1853,16 @@ async def run_max_bot() -> None:
                                 form_data = ct.get("form_data", {})
                                 attachment_tokens = ct.get("attachment_tokens") or []
                                 ticket_type_id = ct.get("ticket_type_id") or "wms_issue"
-                                import tempfile
-                                import os as _os
-                                temp_paths = []
-                                try:
-                                    for att in attachment_tokens[:10]:
-                                        if not isinstance(att, dict) or not att.get("url"):
-                                            continue
-                                        downloaded = await _download_attachment_max(bot, att)
-                                        if downloaded:
-                                            content, name = downloaded
-                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="wms_")
-                                            f.write(content)
-                                            f.close()
-                                            temp_paths.append(f.name)
-                                    if ticket_type_id == "wms_settings":
-                                        success, issue_key, user_msg = await support_api.create_ticket("max", user_id, ticket_type_id, form_data, attachment_paths=temp_paths)
-                                    else:
-                                        success, issue_key, user_msg = await support_api.create_ticket("max", user_id, ticket_type_id, form_data)
-                                        if success and issue_key and temp_paths:
-                                            from core.jira_wms import add_attachments_to_issue
-                                            added, _ = await add_attachments_to_issue(issue_key, temp_paths)
-                                            logger.info("MAX WMS: к заявке %s добавлено вложений: %s", issue_key, added)
-                                    if ticket_type_id != "wms_settings" and attachment_tokens and not temp_paths:
-                                        logger.warning("MAX WMS: вложений было %s, скачано 0", len(attachment_tokens))
-                                finally:
-                                    for p in temp_paths:
-                                        try:
-                                            _os.unlink(p)
-                                        except Exception:
-                                            pass
-                                msg_show = user_msg if success else issue_key
-                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                if ticket_type_id == "wms_settings":
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, ticket_type_id, form_data, attachment_tokens, wms_attach_after_create=False
+                                    )
+                                else:
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, ticket_type_id, form_data, attachment_tokens, wms_attach_after_create=True
+                                    )
                         elif pc_flow.is_in_pc_flow(user_id) and (
                             callback_id == "cancel"
                             or callback_id.startswith("pc_kind_")
@@ -1894,32 +1875,11 @@ async def run_max_bot() -> None:
                                 ct = response["create_ticket"]
                                 form_data = ct.get("form_data", {})
                                 attachment_tokens = ct.get("attachment_tokens") or []
-                                import tempfile
-                                import os as _os
-                                temp_paths = []
-                                try:
-                                    for att in attachment_tokens[:10]:
-                                        if not isinstance(att, dict) or not att.get("url"):
-                                            continue
-                                        downloaded = await _download_attachment_max(bot, att)
-                                        if downloaded:
-                                            content, name = downloaded
-                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="pc_")
-                                            f.write(content)
-                                            f.close()
-                                            temp_paths.append(f.name)
-                                    success, issue_key, user_msg = await support_api.create_ticket(
-                                        "max", user_id, "pc_problem", form_data, attachment_paths=temp_paths
-                                    )
-                                finally:
-                                    for p in temp_paths:
-                                        try:
-                                            _os.unlink(p)
-                                        except Exception:
-                                            pass
-                                msg_show = user_msg if success else issue_key
-                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot, user_id, "pc_problem", form_data, attachment_tokens, wms_attach_after_create=False
+                                )
                         elif orgtech_flow.is_in_orgtech_flow(user_id) and (
                             callback_id == "cancel"
                             or callback_id.startswith("orgtech_kind_")
@@ -1932,32 +1892,11 @@ async def run_max_bot() -> None:
                                 ct = response["create_ticket"]
                                 form_data = ct.get("form_data", {})
                                 attachment_tokens = ct.get("attachment_tokens") or []
-                                import tempfile
-                                import os as _os
-                                temp_paths = []
-                                try:
-                                    for att in attachment_tokens[:10]:
-                                        if not isinstance(att, dict) or not att.get("url"):
-                                            continue
-                                        downloaded = await _download_attachment_max(bot, att)
-                                        if downloaded:
-                                            content, name = downloaded
-                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="orgtech_")
-                                            f.write(content)
-                                            f.close()
-                                            temp_paths.append(f.name)
-                                    success, issue_key, user_msg = await support_api.create_ticket(
-                                        "max", user_id, "orgtech_problem", form_data, attachment_paths=temp_paths
-                                    )
-                                finally:
-                                    for p in temp_paths:
-                                        try:
-                                            _os.unlink(p)
-                                        except Exception:
-                                            pass
-                                msg_show = user_msg if success else issue_key
-                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot, user_id, "orgtech_problem", form_data, attachment_tokens, wms_attach_after_create=False
+                                )
                         elif peripheral_flow.is_in_peripheral_flow(user_id) and (
                             callback_id == "cancel"
                             or callback_id.startswith("peripheral_kind_")
@@ -1970,32 +1909,11 @@ async def run_max_bot() -> None:
                                 ct = response["create_ticket"]
                                 form_data = ct.get("form_data", {})
                                 attachment_tokens = ct.get("attachment_tokens") or []
-                                import tempfile
-                                import os as _os
-                                temp_paths = []
-                                try:
-                                    for att in attachment_tokens[:10]:
-                                        if not isinstance(att, dict) or not att.get("url"):
-                                            continue
-                                        downloaded = await _download_attachment_max(bot, att)
-                                        if downloaded:
-                                            content, name = downloaded
-                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="peripheral_")
-                                            f.write(content)
-                                            f.close()
-                                            temp_paths.append(f.name)
-                                    success, issue_key, user_msg = await support_api.create_ticket(
-                                        "max", user_id, "peripheral_equipment", form_data, attachment_paths=temp_paths
-                                    )
-                                finally:
-                                    for p in temp_paths:
-                                        try:
-                                            _os.unlink(p)
-                                        except Exception:
-                                            pass
-                                msg_show = user_msg if success else issue_key
-                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot, user_id, "peripheral_equipment", form_data, attachment_tokens, wms_attach_after_create=False
+                                )
                         elif network_flow.is_in_network_flow(user_id) and (
                             callback_id == "cancel"
                             or callback_id.startswith("network_type_")
@@ -2011,32 +1929,11 @@ async def run_max_bot() -> None:
                                 ct = response["create_ticket"]
                                 form_data = ct.get("form_data", {})
                                 attachment_tokens = ct.get("attachment_tokens") or []
-                                import tempfile
-                                import os as _os
-                                temp_paths = []
-                                try:
-                                    for att in attachment_tokens[:10]:
-                                        if not isinstance(att, dict) or not att.get("url"):
-                                            continue
-                                        downloaded = await _download_attachment_max(bot, att)
-                                        if downloaded:
-                                            content, name = downloaded
-                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="network_")
-                                            f.write(content)
-                                            f.close()
-                                            temp_paths.append(f.name)
-                                    success, issue_key, user_msg = await support_api.create_ticket(
-                                        "max", user_id, "network_problem", form_data, attachment_paths=temp_paths
-                                    )
-                                finally:
-                                    for p in temp_paths:
-                                        try:
-                                            _os.unlink(p)
-                                        except Exception:
-                                            pass
-                                msg_show = user_msg if success else issue_key
-                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot, user_id, "network_problem", form_data, attachment_tokens, wms_attach_after_create=False
+                                )
                         elif electronic_queue_flow.is_in_electronic_queue_flow(user_id) and (
                             callback_id == "cancel" or callback_id.startswith("eq_type_")
                         ):
@@ -2047,9 +1944,11 @@ async def run_max_bot() -> None:
                                 ct = response["create_ticket"]
                                 form_data = ct.get("form_data", {})
                                 ticket_type_id = ct.get("ticket_type_id") or "electronic_queue"
-                                success, issue_key, user_msg = await support_api.create_ticket("max", user_id, ticket_type_id, form_data)
-                                msg_show = user_msg if success else issue_key
-                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot, user_id, ticket_type_id, form_data, [], wms_attach_after_create=False
+                                )
                         elif email_flow.is_in_email_owa_flow(user_id) and (
                             callback_id == "cancel"
                             or callback_id.startswith("email_owa_req_")
@@ -2062,32 +1961,11 @@ async def run_max_bot() -> None:
                                 ct = response["create_ticket"]
                                 form_data = ct.get("form_data", {})
                                 attachment_tokens = ct.get("attachment_tokens") or []
-                                import tempfile
-                                import os as _os
-                                temp_paths = []
-                                try:
-                                    for att in attachment_tokens[:10]:
-                                        if not isinstance(att, dict) or not att.get("url"):
-                                            continue
-                                        downloaded = await _download_attachment_max(bot, att)
-                                        if downloaded:
-                                            content, name = downloaded
-                                            ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                            f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="email_owa_")
-                                            f.write(content)
-                                            f.close()
-                                            temp_paths.append(f.name)
-                                    success, issue_key, user_msg = await support_api.create_ticket(
-                                        "max", user_id, "email_owa_outlook", form_data, attachment_paths=temp_paths
-                                    )
-                                finally:
-                                    for p in temp_paths:
-                                        try:
-                                            _os.unlink(p)
-                                        except Exception:
-                                            pass
-                                msg_show = user_msg if success else issue_key
-                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot, user_id, "email_owa_outlook", form_data, attachment_tokens, wms_attach_after_create=False
+                                )
                         elif email_forwarding_flow.is_in_email_forwarding_flow(user_id) and (
                             callback_id == "cancel" or callback_id.startswith("email_fwd_onoff:")
                         ):
@@ -2627,39 +2505,16 @@ async def run_max_bot() -> None:
                                     form_data = ct.get("form_data", {})
                                     attachment_tokens = ct.get("attachment_tokens") or []
                                     ticket_type_id = ct.get("ticket_type_id") or "wms_issue"
-                                    import tempfile
-                                    import os as _os
-                                    temp_paths = []
-                                    try:
-                                        for att in attachment_tokens[:10]:
-                                            if not isinstance(att, dict) or not att.get("url"):
-                                                continue
-                                            downloaded = await _download_attachment_max(bot, att)
-                                            if downloaded:
-                                                content, name = downloaded
-                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="wms_")
-                                                f.write(content)
-                                                f.close()
-                                                temp_paths.append(f.name)
-                                        if ticket_type_id == "wms_settings":
-                                            success, issue_key, user_msg = await support_api.create_ticket("max", user_id, ticket_type_id, form_data, attachment_paths=temp_paths)
-                                        else:
-                                            success, issue_key, user_msg = await support_api.create_ticket("max", user_id, ticket_type_id, form_data)
-                                            if success and issue_key and temp_paths:
-                                                from core.jira_wms import add_attachments_to_issue
-                                                added, _ = await add_attachments_to_issue(issue_key, temp_paths)
-                                                logger.info("MAX WMS: к заявке %s добавлено вложений: %s", issue_key, added)
-                                        if ticket_type_id != "wms_settings" and attachment_tokens and not temp_paths:
-                                            logger.warning("MAX WMS: вложений было %s, скачано 0", len(attachment_tokens))
-                                    finally:
-                                        for p in temp_paths:
-                                            try:
-                                                _os.unlink(p)
-                                            except Exception:
-                                                pass
-                                    msg_show = user_msg if success else issue_key
-                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    if ticket_type_id == "wms_settings":
+                                        response = await max_submit_ticket_with_profile_department(
+                                            bot, user_id, ticket_type_id, form_data, attachment_tokens, wms_attach_after_create=False
+                                        )
+                                    else:
+                                        response = await max_submit_ticket_with_profile_department(
+                                            bot, user_id, ticket_type_id, form_data, attachment_tokens, wms_attach_after_create=True
+                                        )
                             elif pc_flow.is_in_pc_flow(user_id):
                                 response = await pc_flow.handle_pc_message(user_id, text, attachment_list=attachment_list)
                                 if response is None:
@@ -2668,32 +2523,11 @@ async def run_max_bot() -> None:
                                     ct = response["create_ticket"]
                                     form_data = ct.get("form_data", {})
                                     attachment_tokens = ct.get("attachment_tokens") or []
-                                    import tempfile
-                                    import os as _os
-                                    temp_paths = []
-                                    try:
-                                        for att in attachment_tokens[:10]:
-                                            if not isinstance(att, dict) or not att.get("url"):
-                                                continue
-                                            downloaded = await _download_attachment_max(bot, att)
-                                            if downloaded:
-                                                content, name = downloaded
-                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="pc_")
-                                                f.write(content)
-                                                f.close()
-                                                temp_paths.append(f.name)
-                                        success, issue_key, user_msg = await support_api.create_ticket(
-                                            "max", user_id, "pc_problem", form_data, attachment_paths=temp_paths
-                                        )
-                                    finally:
-                                        for p in temp_paths:
-                                            try:
-                                                _os.unlink(p)
-                                            except Exception:
-                                                pass
-                                    msg_show = user_msg if success else issue_key
-                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, "pc_problem", form_data, attachment_tokens, wms_attach_after_create=False
+                                    )
                             elif orgtech_flow.is_in_orgtech_flow(user_id):
                                 response = await orgtech_flow.handle_orgtech_message(user_id, text, attachment_list=attachment_list)
                                 if response is None:
@@ -2702,32 +2536,11 @@ async def run_max_bot() -> None:
                                     ct = response["create_ticket"]
                                     form_data = ct.get("form_data", {})
                                     attachment_tokens = ct.get("attachment_tokens") or []
-                                    import tempfile
-                                    import os as _os
-                                    temp_paths = []
-                                    try:
-                                        for att in attachment_tokens[:10]:
-                                            if not isinstance(att, dict) or not att.get("url"):
-                                                continue
-                                            downloaded = await _download_attachment_max(bot, att)
-                                            if downloaded:
-                                                content, name = downloaded
-                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="orgtech_")
-                                                f.write(content)
-                                                f.close()
-                                                temp_paths.append(f.name)
-                                        success, issue_key, user_msg = await support_api.create_ticket(
-                                            "max", user_id, "orgtech_problem", form_data, attachment_paths=temp_paths
-                                        )
-                                    finally:
-                                        for p in temp_paths:
-                                            try:
-                                                _os.unlink(p)
-                                            except Exception:
-                                                pass
-                                    msg_show = user_msg if success else issue_key
-                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, "orgtech_problem", form_data, attachment_tokens, wms_attach_after_create=False
+                                    )
                             elif peripheral_flow.is_in_peripheral_flow(user_id):
                                 response = await peripheral_flow.handle_peripheral_message(user_id, text, attachment_list=attachment_list)
                                 if response is None:
@@ -2736,32 +2549,11 @@ async def run_max_bot() -> None:
                                     ct = response["create_ticket"]
                                     form_data = ct.get("form_data", {})
                                     attachment_tokens = ct.get("attachment_tokens") or []
-                                    import tempfile
-                                    import os as _os
-                                    temp_paths = []
-                                    try:
-                                        for att in attachment_tokens[:10]:
-                                            if not isinstance(att, dict) or not att.get("url"):
-                                                continue
-                                            downloaded = await _download_attachment_max(bot, att)
-                                            if downloaded:
-                                                content, name = downloaded
-                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="peripheral_")
-                                                f.write(content)
-                                                f.close()
-                                                temp_paths.append(f.name)
-                                        success, issue_key, user_msg = await support_api.create_ticket(
-                                            "max", user_id, "peripheral_equipment", form_data, attachment_paths=temp_paths
-                                        )
-                                    finally:
-                                        for p in temp_paths:
-                                            try:
-                                                _os.unlink(p)
-                                            except Exception:
-                                                pass
-                                    msg_show = user_msg if success else issue_key
-                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, "peripheral_equipment", form_data, attachment_tokens, wms_attach_after_create=False
+                                    )
                             elif network_flow.is_in_network_flow(user_id):
                                 response = await network_flow.handle_network_message(user_id, text, attachment_list=attachment_list)
                                 if response is None:
@@ -2770,32 +2562,11 @@ async def run_max_bot() -> None:
                                     ct = response["create_ticket"]
                                     form_data = ct.get("form_data", {})
                                     attachment_tokens = ct.get("attachment_tokens") or []
-                                    import tempfile
-                                    import os as _os
-                                    temp_paths = []
-                                    try:
-                                        for att in attachment_tokens[:10]:
-                                            if not isinstance(att, dict) or not att.get("url"):
-                                                continue
-                                            downloaded = await _download_attachment_max(bot, att)
-                                            if downloaded:
-                                                content, name = downloaded
-                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="network_")
-                                                f.write(content)
-                                                f.close()
-                                                temp_paths.append(f.name)
-                                        success, issue_key, user_msg = await support_api.create_ticket(
-                                            "max", user_id, "network_problem", form_data, attachment_paths=temp_paths
-                                        )
-                                    finally:
-                                        for p in temp_paths:
-                                            try:
-                                                _os.unlink(p)
-                                            except Exception:
-                                                pass
-                                    msg_show = user_msg if success else issue_key
-                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, "network_problem", form_data, attachment_tokens, wms_attach_after_create=False
+                                    )
                             elif electronic_queue_flow.is_in_electronic_queue_flow(user_id):
                                 response = await electronic_queue_flow.handle_electronic_queue_message(user_id, text, attachment_list=attachment_list)
                                 if response is None:
@@ -2804,9 +2575,11 @@ async def run_max_bot() -> None:
                                     ct = response["create_ticket"]
                                     form_data = ct.get("form_data", {})
                                     ticket_type_id = ct.get("ticket_type_id") or "electronic_queue"
-                                    success, issue_key, user_msg = await support_api.create_ticket("max", user_id, ticket_type_id, form_data)
-                                    msg_show = user_msg if success else issue_key
-                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, ticket_type_id, form_data, [], wms_attach_after_create=False
+                                    )
                             elif email_flow.is_in_email_owa_flow(user_id):
                                 response = await email_flow.handle_email_owa_message(user_id, text, attachment_list=attachment_list)
                                 if response is None:
@@ -2815,32 +2588,11 @@ async def run_max_bot() -> None:
                                     ct = response["create_ticket"]
                                     form_data = ct.get("form_data", {})
                                     attachment_tokens = ct.get("attachment_tokens") or []
-                                    import tempfile
-                                    import os as _os
-                                    temp_paths = []
-                                    try:
-                                        for att in attachment_tokens[:10]:
-                                            if not isinstance(att, dict) or not att.get("url"):
-                                                continue
-                                            downloaded = await _download_attachment_max(bot, att)
-                                            if downloaded:
-                                                content, name = downloaded
-                                                ext = _os.path.splitext(name)[1] if name and "." in name else ".bin"
-                                                f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="email_owa_")
-                                                f.write(content)
-                                                f.close()
-                                                temp_paths.append(f.name)
-                                        success, issue_key, user_msg = await support_api.create_ticket(
-                                            "max", user_id, "email_owa_outlook", form_data, attachment_paths=temp_paths
-                                        )
-                                    finally:
-                                        for p in temp_paths:
-                                            try:
-                                                _os.unlink(p)
-                                            except Exception:
-                                                pass
-                                    msg_show = user_msg if success else issue_key
-                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, "email_owa_outlook", form_data, attachment_tokens, wms_attach_after_create=False
+                                    )
                             elif email_forwarding_flow.is_in_email_forwarding_flow(user_id):
                                 response = await email_forwarding_flow.handle_email_forwarding_message(user_id, text)
                                 if response is None:

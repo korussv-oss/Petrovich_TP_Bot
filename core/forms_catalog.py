@@ -36,3 +36,25 @@ def get_forms_catalog() -> Dict[str, Any]:
 def get_form_definition(form_id: str) -> Optional[Dict[str, Any]]:
     form = get_forms_catalog().get((form_id or "").strip())
     return form if isinstance(form, dict) else None
+
+
+def form_requires_profile_department(form_id: str) -> bool:
+    """
+    True, если в Jira-маппинге формы есть обязательное поле с источником profile.department
+    (JSM customfield_11406 «Подразделение» и аналоги).
+    """
+    form = get_form_definition(form_id)
+    if not form:
+        return False
+    jira = form.get("jira") or {}
+    fields = jira.get("fields") or {}
+    if not isinstance(fields, dict):
+        return False
+    for _fid, rule in fields.items():
+        if not isinstance(rule, dict):
+            continue
+        if (rule.get("source") or "").strip() != "profile.department":
+            continue
+        if bool(rule.get("required")):
+            return True
+    return False
