@@ -8,7 +8,12 @@ from typing import Optional
 from core.support.api import support_api
 from core.support.models import Text, Menu, Error
 from adapters.max.render import menu_to_max, text_to_max, error_to_max
-from user_storage import get_user_profile, is_user_registered
+from user_storage import (
+    get_user_profile,
+    is_user_registered,
+    save_user_profile,
+    resolve_channel_user_id,
+)
 
 logger = logging.getLogger(__name__)
 CHANNEL_ID = "max"
@@ -61,6 +66,68 @@ HELP_TEXT = (
     "Заявки можно отслеживать в разделе «Мои заявки».\n"
     "Если не нашли форму, которая подходит к вашей проблеме то обратитесь на первую линию 1111/8-921-888-17-61"
 )
+
+_ADMIN_DEPT_ITEMS = 8
+_pending_admin_dept: dict[int, dict] = {}
+
+
+def _admin_dept_build_ui(depts: list[str], page: int) -> dict:
+    if not depts:
+        return {
+            "text": "🏢 Не удалось загрузить список подразделений. Попробуйте позже.",
+            "parse_mode": "HTML",
+            "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}],
+        }
+    start = page * _ADMIN_DEPT_ITEMS
+    end = start + _ADMIN_DEPT_ITEMS
+    chunk = depts[start:end]
+    buttons: list[dict] = []
+    for i, name in enumerate(chunk):
+        idx = start + i
+        label = (name or "")[:64] if name else str(idx)
+        buttons.append({"id": f"admin_dept_{idx}", "label": label})
+    if page > 0:
+        buttons.append({"id": f"admin_dept_pg_{page - 1}", "label": "◀️ Назад"})
+    if end < len(depts):
+        buttons.append({"id": f"admin_dept_pg_{page + 1}", "label": "Вперёд ▶️"})
+    buttons.append({"id": "admin_dept_cancel", "label": "❌ Отмена"})
+    return {
+        "text": "🏢 <b>Смена подразделения</b>\n\nВыберите новое <b>подразделение</b> (Department):",
+        "parse_mode": "HTML",
+        "buttons": buttons,
+    }
+
+
+def _admin_profile_response(user_id: int) -> dict:
+    profile = get_user_profile(user_id, CHANNEL_ID) or {}
+
+    def _v(key: str) -> str:
+        val = profile.get(key)
+        if val is None:
+            return "—"
+        s = str(val).strip()
+        return s if s else "—"
+
+    primary = resolve_channel_user_id(CHANNEL_ID, int(user_id))
+    primary_line = f"\n<b>Основной ID профиля:</b> {primary}" if int(primary) != int(user_id) else ""
+    text = (
+        "👤 <b>Профиль</b>\n\n"
+        f"<b>ФИО:</b> {_v('full_name')}\n"
+        f"<b>Телефон:</b> {_v('phone')}\n"
+        f"<b>MAX ID:</b> {user_id}"
+        f"{primary_line}\n"
+        f"<b>Логин:</b> {_v('login')}\n"
+        f"<b>Email:</b> {_v('email')}\n"
+        f"<b>Табельный номер:</b> {_v('employee_id')}\n"
+        f"<b>Подразделение:</b> {_v('department')}\n"
+        f"<b>Подразделение WMS:</b> {_v('department_wms')}\n"
+        f"<b>Jira username:</b> {_v('jira_username')}\n"
+    )
+    return {
+        "text": text,
+        "parse_mode": "HTML",
+        "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}],
+    }
 
 
 def _tp_root_menu(user_id: int) -> dict:
@@ -217,6 +284,58 @@ def handle_callback(callback_id: str, user_id: int, my_tickets: Optional[list] =
             return menu_to_max(result)
         if isinstance(result, Error):
             return error_to_max(result)
+    if callback_id == "admin_profile":
+        from config import is_channel_admin
+        if not is_channel_admin(CHANNEL_ID, user_id):
+            return {"text": "Нет прав доступа.", "parse_mode": "HTML", "buttons": back_btn}
+        return _admin_profile_response(user_id)
+    if callback_id == "admin_change_department":
+        from config import is_channel_admin
+        if not is_channel_admin(CHANNEL_ID, user_id):
+            return {"text": "Нет прав доступа.", "parse_mode": "HTML", "buttons": back_btn}
+        from core.jira_departments import get_departments
+        depts = get_departments() or []
+        _pending_admin_dept[int(user_id)] = {"dept_list": list(depts), "page": 0}
+        return _admin_dept_build_ui(_pending_admin_dept[int(user_id)]["dept_list"], 0)
+    if callback_id == "admin_dept_cancel":
+        _pending_admin_dept.pop(int(user_id), None)
+        return {"text": "❌ Смена подразделения отменена.", "parse_mode": "HTML", "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}]}
+    if callback_id and callback_id.startswith("admin_dept_pg_"):
+        st = _pending_admin_dept.get(int(user_id)) or {}
+        depts = list(st.get("dept_list") or [])
+        try:
+            page = int(callback_id.replace("admin_dept_pg_", "", 1))
+        except ValueError:
+            page = 0
+        if page < 0:
+            page = 0
+        st["page"] = page
+        _pending_admin_dept[int(user_id)] = st
+        return _admin_dept_build_ui(depts, page)
+    if callback_id and callback_id.startswith("admin_dept_"):
+        st = _pending_admin_dept.get(int(user_id))
+        if not st:
+            return {"text": "⚠️ Сессия устарела. Откройте «Сменить подразделение» ещё раз.", "parse_mode": "HTML", "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}]}
+        depts = list(st.get("dept_list") or [])
+        raw = callback_id.replace("admin_dept_", "", 1)
+        if not raw.isdigit():
+            return None
+        idx = int(raw)
+        if idx < 0 or idx >= len(depts):
+            return {"text": "Неверный выбор.", "parse_mode": "HTML", "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}]}
+        selected = depts[idx]
+        primary = resolve_channel_user_id(CHANNEL_ID, int(user_id))
+        old = get_user_profile(int(primary), "telegram") if int(primary) != int(user_id) else get_user_profile(int(primary), CHANNEL_ID)
+        old = old or {}
+        profile = dict(old)
+        profile["department"] = selected
+        save_user_profile(int(primary), profile, old_profile=old)
+        _pending_admin_dept.pop(int(user_id), None)
+        return {
+            "text": f"✅ Подразделение обновлено: <b>{selected}</b>",
+            "parse_mode": "HTML",
+            "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}],
+        }
     if callback_id == "admin_delete_user":
         from config import is_channel_admin
         if not is_channel_admin(CHANNEL_ID, user_id):

@@ -156,6 +156,8 @@ def get_admin_panel_response(channel_id: str, user_id: int) -> Menu | Error:
     buttons: List[MenuButton] = []
     if is_channel_admin(channel_id or "telegram", user_id):
         buttons.append(MenuButton(id="admin_delete_user", label="👤 Удалить пользователя"))
+        buttons.append(MenuButton(id="admin_change_department", label="🏢 Сменить подразделение"))
+        buttons.append(MenuButton(id="admin_profile", label="👤 Профиль"))
         if (channel_id or "telegram").strip().lower() == "max":
             buttons.append(MenuButton(id="admin_ticket_counter", label="🔢 Счётчик заявок"))
             buttons.append(MenuButton(id="admin_detailed_report", label="📥 Подробный отчёт"))

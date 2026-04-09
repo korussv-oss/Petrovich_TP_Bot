@@ -33,9 +33,10 @@ class CommentStates(StatesGroup):
 
 
 class AdminStates(StatesGroup):
-    """Админ: удаление пользователя (список, поиск по ФИО, логин/ID)."""
+    """Админ: удаление пользователя + действия с собственным профилем."""
     WAITING_FOR_USER_ID_OR_LOGIN = State()
     WAITING_FOR_FIO_SEARCH = State()
+    WAITING_FOR_DEPARTMENT = State()
 
 
 class WmsTicketStates(StatesGroup):

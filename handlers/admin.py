@@ -18,8 +18,16 @@ from keyboards import (
     get_admin_user_list_keyboard,
     get_admin_user_matches_keyboard,
     get_admin_confirm_delete_keyboard,
+    get_department_keyboard,
 )
-from user_storage import get_user_profile, delete_user, find_by_login, get_all_users_sorted, search_users_by_fio
+from user_storage import (
+    get_user_profile,
+    save_user_profile,
+    delete_user,
+    find_by_login,
+    get_all_users_sorted,
+    search_users_by_fio,
+)
 from core.support.api import support_api
 from core.support.models import Menu, Error
 from adapters.telegram.render import render_menu_to_kwargs
@@ -53,6 +61,107 @@ async def admin_panel(callback: CallbackQuery, state: FSMContext):
     if isinstance(result, Menu):
         kwargs = render_menu_to_kwargs(result)
         await callback.message.edit_text(**kwargs)
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin_profile")
+async def admin_profile(callback: CallbackQuery, state: FSMContext):
+    """Показать профиль текущего администратора (ФИО, телефон, ID, табельный номер, подразделения и т.д.)."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав доступа.", show_alert=True)
+        return
+    await state.clear()
+    profile = get_user_profile(callback.from_user.id, CHANNEL_ID) or {}
+
+    def _v(key: str) -> str:
+        val = profile.get(key)
+        if val is None:
+            return "—"
+        s = str(val).strip()
+        return s if s else "—"
+
+    text = (
+        "👤 <b>Профиль</b>\n\n"
+        f"<b>ФИО:</b> {_v('full_name')}\n"
+        f"<b>Телефон:</b> {_v('phone')}\n"
+        f"<b>Telegram ID:</b> {callback.from_user.id}\n"
+        f"<b>Логин:</b> {_v('login')}\n"
+        f"<b>Email:</b> {_v('email')}\n"
+        f"<b>Табельный номер:</b> {_v('employee_id')}\n"
+        f"<b>Подразделение:</b> {_v('department')}\n"
+        f"<b>Подразделение WMS:</b> {_v('department_wms')}\n"
+        f"<b>Jira username:</b> {_v('jira_username')}\n"
+    )
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]]
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "admin_change_department")
+async def admin_change_department_start(callback: CallbackQuery, state: FSMContext):
+    """Начать смену подразделения в собственной карточке администратора."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав доступа.", show_alert=True)
+        return
+    await state.set_state(AdminStates.WAITING_FOR_DEPARTMENT)
+    from core.jira_departments import get_departments_async
+
+    departments = await get_departments_async()
+    await callback.message.edit_text(
+        "🏢 <b>Смена подразделения</b>\n\nВыберите новое <b>подразделение</b> (Department):",
+        parse_mode="HTML",
+        reply_markup=get_department_keyboard(departments=departments),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.WAITING_FOR_DEPARTMENT, F.data.startswith("department_page_"))
+async def admin_change_department_page(callback: CallbackQuery, state: FSMContext):
+    try:
+        page = int(callback.data.replace("department_page_", ""))
+    except ValueError:
+        await callback.answer()
+        return
+    from core.jira_departments import get_departments_async
+
+    departments = await get_departments_async()
+    await callback.message.edit_reply_markup(reply_markup=get_department_keyboard(departments=departments, page=page))
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.WAITING_FOR_DEPARTMENT, F.data.startswith("department_"))
+async def admin_change_department_select(callback: CallbackQuery, state: FSMContext):
+    from core.jira_departments import get_departments_async
+
+    departments = await get_departments_async()
+    raw = callback.data.replace("department_", "")
+    if not raw.isdigit():
+        await callback.answer()
+        return
+    idx = int(raw)
+    if idx < 0 or idx >= len(departments):
+        await callback.answer("Подразделение недоступно.", show_alert=True)
+        return
+    selected = departments[idx]
+
+    profile = get_user_profile(callback.from_user.id, CHANNEL_ID) or {}
+    profile = dict(profile)
+    profile["department"] = selected
+    save_user_profile(callback.from_user.id, profile)
+
+    await state.clear()
+    await callback.message.edit_text(
+        f"✅ Подразделение обновлено: <b>{selected}</b>",
+        parse_mode="HTML",
+    )
+    result = support_api.get_admin_panel(CHANNEL_ID, callback.from_user.id)
+    if isinstance(result, Menu):
+        await callback.message.answer(**render_menu_to_kwargs(result))
     await callback.answer()
 
 
