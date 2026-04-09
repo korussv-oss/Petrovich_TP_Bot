@@ -608,15 +608,41 @@ async def _get_updates_raw_botapi(
     Получить сырой список апдейтов через BotAPI https://botapi.max.ru/updates.
     Возвращает (updates, next_offset) где next_offset рассчитан по max(update_id)+1, если update_id присутствует.
     """
+    def _sanitize_headers(h: dict) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if not isinstance(h, dict):
+            return out
+        for k, v in h.items():
+            if k is None:
+                continue
+            ks = str(k).strip()
+            if not ks:
+                continue
+            if v is None:
+                continue
+            out[ks] = v if isinstance(v, str) else str(v)
+        return out
+
     url = "https://botapi.max.ru/updates"
     params: dict = {"timeout": int(timeout), "limit": int(limit)}
     if offset is not None:
         params["offset"] = int(offset)
-    headers = {"Authorization": token, "Accept": "application/json"}
+    headers = _sanitize_headers({"Authorization": token, "Accept": "application/json"})
 
     # Используем существующую aiohttp session maxapi, но абсолютный URL разрешён.
     session = getattr(bot, "session", None)
-    if session is None or getattr(session, "closed", False):
+    bad_default_headers = False
+    try:
+        sh = getattr(session, "headers", None)
+        if sh is not None:
+            for k in sh.keys():
+                if not isinstance(k, str) or k is None:
+                    bad_default_headers = True
+                    break
+    except Exception:
+        bad_default_headers = True
+
+    if session is None or getattr(session, "closed", False) or bad_default_headers:
         import aiohttp
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout + 15))
         temp_session = True
