@@ -130,6 +130,12 @@ def _admin_profile_response(user_id: int) -> dict:
     }
 
 
+def admin_change_department_start_with_depts(user_id: int, depts: list[str]) -> dict:
+    """MAX: старт UI смены подразделения, когда список уже получен асинхронно."""
+    _pending_admin_dept[int(user_id)] = {"dept_list": list(depts or []), "page": 0}
+    return _admin_dept_build_ui(_pending_admin_dept[int(user_id)]["dept_list"], 0)
+
+
 def _tp_root_menu(user_id: int) -> dict:
     result = support_api.get_tp_root_menu(CHANNEL_ID, user_id)
     if isinstance(result, Menu):

@@ -2057,6 +2057,64 @@ async def run_max_bot() -> None:
                             else:
                                 response = handle_main_menu(user_id)
                         else:
+                            if callback_id == "admin_change_department":
+                                # UX: Jira departments могут грузиться 1–5s. Показываем «загрузка» и догружаем в фоне.
+                                rid = int(_my_tickets_req_id_max.get(user_id, 0) or 0) + 1
+                                _my_tickets_req_id_max[user_id] = rid
+
+                                await _send_response_max(
+                                    bot=bot,
+                                    user_id=user_id,
+                                    r_chat=r_chat,
+                                    r_user=r_user,
+                                    response={
+                                        "text": "⏳ <b>Смена подразделения</b>\n\nЗагружаю список подразделений…",
+                                        "parse_mode": "HTML",
+                                        "buttons": [{"id": "admin_panel", "label": "🔙 В админ-панель"}],
+                                    },
+                                    source=("callback", "admin_change_department_loading"),
+                                )
+
+                                async def _load_and_send_admin_depts(current_rid: int) -> None:
+                                    try:
+                                        from core.jira_departments import get_departments_async
+                                        from adapters.max.handlers import admin_change_department_start_with_depts
+
+                                        depts = await get_departments_async()
+                                        # Не отправляем устаревший результат (если пользователь нажал снова)
+                                        if _my_tickets_req_id_max.get(user_id) != current_rid:
+                                            return
+                                        resp = admin_change_department_start_with_depts(user_id, list(depts or []))
+                                        await _send_response_max(
+                                            bot=bot,
+                                            user_id=user_id,
+                                            r_chat=r_chat,
+                                            r_user=r_user,
+                                            response=resp,
+                                            source=("callback", "admin_change_department"),
+                                        )
+                                    except Exception as e:
+                                        logger.warning("MAX: не удалось загрузить подразделения Jira: %s", e)
+                                        if _my_tickets_req_id_max.get(user_id) != current_rid:
+                                            return
+                                        await _send_response_max(
+                                            bot=bot,
+                                            user_id=user_id,
+                                            r_chat=r_chat,
+                                            r_user=r_user,
+                                            response={
+                                                "text": "⚠️ Не удалось загрузить список подразделений. Попробуйте ещё раз.",
+                                                "parse_mode": "HTML",
+                                                "buttons": [
+                                                    {"id": "admin_change_department", "label": "🔄 Обновить"},
+                                                    {"id": "admin_panel", "label": "🔙 В админ-панель"},
+                                                ],
+                                            },
+                                            source=("callback", "admin_change_department_error"),
+                                        )
+
+                                asyncio.create_task(_load_and_send_admin_depts(rid))
+                                continue
                             if callback_id == "my_tickets":
                                 # Быстрый UX: сразу показываем «загрузка», а список догружаем в фоне (Jira может отвечать 3–10s).
                                 rid = int(_my_tickets_req_id_max.get(user_id, 0) or 0) + 1
