@@ -30,6 +30,7 @@ CANCEL_BTN = [{"id": "cancel", "label": "❌ Отмена"}]
 WMS_SUBTYPE_BUTTONS = [
     {"id": "wms_type_issue", "label": "🚨 Проблема в работе WMS"},
     {"id": "wms_type_settings", "label": "⚙️ Изменение настроек системы WMS"},
+    {"id": "wms_type_wait_products", "label": "⏳ Товары в WAIT"},
     {"id": "wms_type_psi_user", "label": "👤 Создать/изменить/удалить пользователя PSIwms"},
     {"id": "wms_type_back", "label": "⬅️ Назад"},
 ]
@@ -139,6 +140,38 @@ async def handle_wms_callback(user_id: int, callback_id: str) -> Optional[dict]:
             return {"text": "Список подразделений WMS недоступен. Попробуйте позже.", "parse_mode": "HTML", "buttons": CANCEL_BTN}
         return {
             "text": ticket_wizard.wms_settings_department_screen(depts).text,
+            "parse_mode": "HTML",
+            "buttons": _buttons_wms_departments(depts, 0),
+        }
+
+    # --- wms_wait_products: старт ---
+    if callback_id == "wms_type_wait_products" and session.step == "subtype":
+        profile = get_user_profile(user_id, CHANNEL_ID) or {}
+        dept_wms = (profile.get("department_wms") or "").strip()
+        if dept_wms:
+            _store.create(
+                user_id,
+                ticket_type_id="wms_wait_products",
+                step="wait_products_description",
+                data={"ticket_type_id": "wms_wait_products", "department": dept_wms},
+            )
+            return {
+                "text": ticket_wizard.wms_wait_products_description_screen().text,
+                "parse_mode": "HTML",
+                "buttons": CANCEL_BTN,
+            }
+        from core.jira_wms_departments import get_wms_departments_async
+        depts = await get_wms_departments_async()
+        _store.create(
+            user_id,
+            ticket_type_id="wms_wait_products",
+            step="wait_products_department",
+            data={"ticket_type_id": "wms_wait_products", "departments": depts or [], "dept_page": 0},
+        )
+        if not depts:
+            return {"text": "Список подразделений WMS недоступен. Попробуйте позже.", "parse_mode": "HTML", "buttons": CANCEL_BTN}
+        return {
+            "text": ticket_wizard.wms_wait_products_department_screen(depts).text,
             "parse_mode": "HTML",
             "buttons": _buttons_wms_departments(depts, 0),
         }
@@ -256,6 +289,8 @@ async def handle_wms_callback(user_id: int, callback_id: str) -> Optional[dict]:
         _store.update_data(user_id, dept_page=safe_page)
         if session.step == "settings_department":
             title = "⚙️ <b>Изменение настроек системы WMS</b>"
+        elif session.step == "wait_products_department":
+            title = "📦 <b>Товары в WAIT</b>"
         elif session.step == "psi_department":
             title = "👤 <b>Создать/изменить/удалить пользователя PSIwms</b>"
         else:
@@ -287,6 +322,13 @@ async def handle_wms_callback(user_id: int, callback_id: str) -> Optional[dict]:
                 "text": ticket_wizard.wms_settings_service_type_screen().text,
                 "parse_mode": "HTML",
                 "buttons": _buttons_wms_service_type(),
+            }
+        if session.step == "wait_products_department":
+            _store.set_step(user_id, "wait_products_description", data={"department": value})
+            return {
+                "text": ticket_wizard.wms_wait_products_description_screen().text,
+                "parse_mode": "HTML",
+                "buttons": CANCEL_BTN,
             }
         if session.step == "psi_department":
             _store.set_step(user_id, "psi_comment", data={"department": value})
@@ -390,6 +432,21 @@ async def handle_wms_message(user_id: int, text: str, attachment_list: Optional[
             "parse_mode": "HTML",
             "buttons": [{"id": "finish_wms_settings", "label": "✅ Завершить создание задачи"}, {"id": "cancel", "label": "❌ Отмена"}],
         }
+
+    if session.step == "wait_products_description":
+        if not text:
+            return {"text": "Введите описание.", "parse_mode": "HTML", "buttons": CANCEL_BTN}
+        data = dict(session.data)
+        department = (data.get("department") or "").strip()
+        profile = get_user_profile(user_id, CHANNEL_ID) or {}
+        if not department:
+            department = (profile.get("department_wms") or profile.get("department") or "").strip()
+        if not department:
+            _store.clear(user_id)
+            return {"text": "Не указано подразделение WMS.", "parse_mode": "HTML", "buttons": BACK_BTN}
+        form_data = {"department": department, "description": text}
+        _store.clear(user_id)
+        return {"create_ticket": {"ticket_type_id": "wms_wait_products", "form_data": form_data, "attachment_tokens": []}}
 
     # --- psi_user: шаги ---
     if session.step == "psi_title":

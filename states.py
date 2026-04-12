@@ -49,11 +49,6 @@ class WmsTicketStates(StatesGroup):
     WAITING_FOR_ATTACHMENTS = State()
 
 
-class CabinetEditStates(StatesGroup):
-    """Редактирование одного поля в личном кабинете."""
-    WAITING_VALUE = State()
-
-
 class BindAccountStates(StatesGroup):
     """Привязка аккаунта по контакту (телефон)."""
     WAITING_FOR_CONTACT = State()
@@ -93,6 +88,10 @@ class TicketWizardStates(StatesGroup):
     WMS_SETTINGS_SERVICE_TYPE = State()
     WMS_SETTINGS_DESCRIPTION = State()
     WMS_SETTINGS_ATTACHMENTS = State()
+
+    # WMS «Товары в WAIT» (wms_wait_products)
+    WMS_WAIT_PRODUCTS_DEPARTMENT = State()
+    WMS_WAIT_PRODUCTS_DESCRIPTION = State()
 
     # PSI user (wms_psi_user)
     PSI_TITLE = State()
@@ -144,6 +143,23 @@ class TicketWizardStates(StatesGroup):
     EMAIL_FORWARDING_FROM = State()
     EMAIL_FORWARDING_TO = State()
     EMAIL_FORWARDING_DATE = State()
+
+    # AA: чат-бот по базам знаний (aa_kb_chatbot)
+    AA_KB_CHATBOT_EDIT_TYPE = State()
+    AA_KB_CHATBOT_POSITION = State()
+    AA_KB_CHATBOT_PHONE = State()
+
+    # AA: доступ к корпоративной почте через браузер (aa_mail_browser)
+    AA_MAIL_BROWSER_EDIT_TYPE = State()
+    AA_MAIL_BROWSER_POSITION = State()
+    AA_MAIL_BROWSER_PHONE = State()
+
+    # AA: учётная запись для входа на ПК (aa_pc_account)
+    AA_PC_ACCOUNT_ACTION = State()
+    AA_PC_ACCOUNT_COPY_SOURCE = State()
+    AA_PC_ACCOUNT_SECURITY_GROUP = State()
+    AA_PC_ACCOUNT_POSITION = State()
+    AA_PC_ACCOUNT_PHONE = State()
 
     # Email groups
     EMAIL_GROUPS_WHAT_TO_DO = State()

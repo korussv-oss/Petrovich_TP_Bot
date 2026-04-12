@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 import aiohttp
 
 from config import CONFIG
+from core.jira_labels import merge_chatbot_into_labels
 from core.forms_catalog import get_form_definition
 from validators import sanitize_jira_text, normalize_phone_for_jira
 
@@ -209,6 +210,8 @@ async def _create_jsm_issue(
         if is_empty or (allowed and field_id not in allowed):
             continue
         payload_fields[field_id] = value
+    if payload_fields and allowed and "labels" in allowed:
+        merge_chatbot_into_labels(payload_fields)
     if not payload_fields:
         return False, "Не удалось собрать поля формы для отправки в Jira.", project_key
     payload = {
@@ -233,6 +236,10 @@ async def _create_jsm_issue(
         issue_key = (data.get("issueKey") or "").strip()
         if not issue_key:
             return False, "Jira вернула пустой ключ заявки.", project_key
+        if not allowed or "labels" not in allowed:
+            from core.jira_aa import _ensure_issue_has_chatbot_label  # type: ignore[attr-defined]
+
+            await _ensure_issue_has_chatbot_label(base_url, token, issue_key)
         return True, issue_key, project_key
     except Exception as e:
         return False, str(e), project_key
@@ -285,6 +292,7 @@ async def _create_rest_issue(
             return False, _friendly_required_field_message(field_id), project_key
         if not is_empty:
             fields[field_id] = value
+    merge_chatbot_into_labels(fields)
     payload = {"fields": fields}
     url = urljoin(base_url + "/", "rest/api/2/issue")
     headers = {"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Bearer {token}"}

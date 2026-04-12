@@ -8,7 +8,7 @@ from typing import List, Optional
 
 from config import CONFIG
 from core.support.models import Text, Menu, MenuButton, Form, FormField, Error
-from validators import sanitize_jira_text
+from validators import sanitize_jira_text, normalize_phone_for_jira
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,7 @@ def get_tp_root_menu(channel_id: str, user_id: int) -> Menu | Error:
         text="📋 <b>Создать заявку в ТП</b>\n\nВ каком разделе создаём заявку?",
         buttons=[
             MenuButton(id="tp_group_programs", label="💻 Программы и сайт"),
+            MenuButton(id="tp_group_access", label="🔐 Доступы и учетные записи"),
             MenuButton(id="tp_group_equipment", label="🛠️ Оборудование"),
             MenuButton(id="tp_group_services", label="🧰 Услуги"),
             MenuButton(id="tp_section_password", label="🔑 Смена пароля"),
@@ -108,6 +109,22 @@ def get_tp_programs_menu(channel_id: str, user_id: int) -> Menu | Error:
             MenuButton(id="tp_section_site", label="🌐 Поиск/Сайт"),
             MenuButton(id="tp_section_wms", label="📦 WMS"),
             MenuButton(id="tp_section_email", label="📧 Электронная почта"),
+            MenuButton(id="create_ticket_tp", label="⬅️ Назад"),
+        ],
+        parse_mode="HTML",
+    )
+
+
+def get_tp_access_accounts_menu(channel_id: str, user_id: int) -> Menu | Error:
+    from user_storage import is_user_registered
+    if not is_user_registered(user_id, channel_id or "telegram"):
+        return Error(message="Сначала пройдите регистрацию.")
+    return Menu(
+        text="🔐 <b>Доступы и учетные записи</b>\n\nВыберите направление:",
+        buttons=[
+            MenuButton(id="tp_access_pc_account", label="🖥️ Учетная запись для входа на ПК"),
+            MenuButton(id="tp_access_kb_chatbot", label="📚 Чат-бот по базам знаний"),
+            MenuButton(id="tp_access_mail_browser", label="🔐 Доступ к корпоративной почте через браузер"),
             MenuButton(id="create_ticket_tp", label="⬅️ Назад"),
         ],
         parse_mode="HTML",
@@ -644,6 +661,258 @@ async def create_ticket(
             msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
         return True, result, msg
 
+    if ticket_type_id == "wms_wait_products":
+        from user_storage import get_user_profile
+        from core.jira_wms import create_wms_wait_products
+        from core.support.issue_binding_registry import add_binding
+        profile = get_user_profile(user_id, channel_id) or {}
+        department = (form_data.get("department") or profile.get("department_wms") or profile.get("department") or "").strip()
+        description = (form_data.get("description") or "").strip()
+        if not department:
+            return False, "Укажите подразделение WMS (в профиле или выберите из списка).", None
+        if not description:
+            return False, "Введите описание.", None
+        full_name = (profile.get("full_name") or "").strip()
+        phone = (profile.get("phone") or "").strip()
+        jira_username = (profile.get("jira_username") or "").strip() or None
+        ok, result = await create_wms_wait_products(
+            department=department,
+            description=description,
+            full_name=full_name,
+            phone=phone,
+            jira_username=jira_username,
+        )
+        if not ok:
+            return False, result, None
+        add_binding(channel_id, user_id, result, "PW", "wms_wait_products")
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            link = f'{jira_url}/browse/{result}'
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "aa_kb_chatbot":
+        from user_storage import get_user_profile, save_user_profile, resolve_channel_user_id
+        from core.jira_aa import create_aa_knowledge_chatbot_issue
+        from core.support.issue_binding_registry import add_binding
+
+        profile = get_user_profile(user_id, channel_id) or {}
+        department = (profile.get("department") or "").strip()
+        if not department:
+            return False, NEED_PROFILE_DEPARTMENT, None
+
+        login = (profile.get("login") or "").strip()
+        if not login:
+            return False, "В профиле не указан рабочий логин (AD account).", None
+
+        full_name = (profile.get("full_name") or "").strip()
+        if not full_name:
+            return False, "В профиле не указано ФИО.", None
+
+        position = (form_data.get("position") or profile.get("position") or "").strip()
+        if not position:
+            return False, "Укажите должность (Position).", None
+
+        phone_raw = (form_data.get("existing_phone") or profile.get("phone") or "").strip()
+        if not phone_raw:
+            return False, "Укажите номер телефона (Existing phone number).", None
+        phone_jira = normalize_phone_for_jira(phone_raw)
+        if not phone_jira:
+            return False, "Некорректный номер телефона.", None
+
+        kb = CONFIG.get("JIRA_AA_KB_CHATBOT") or {}
+        create_l = (kb.get("EDIT_OPTION_CREATE") or "Создать").strip()
+        edit_l = (kb.get("EDIT_OPTION_EDIT") or "Редактировать").strip()
+        aa_edit = (form_data.get("aa_edit_type") or "").strip()
+        if aa_edit not in (create_l, edit_l):
+            return False, "Выберите «Создать» или «Редактировать».", None
+
+        description = (form_data.get("description") or "").strip()
+
+        jira_username = (profile.get("jira_username") or "").strip() or None
+        ok, result = await create_aa_knowledge_chatbot_issue(
+            full_name=full_name,
+            position=position,
+            department=department,
+            aa_edit_type=aa_edit,
+            ad_account=login,
+            existing_phone=phone_jira,
+            description=description,
+            jira_username=jira_username,
+        )
+        if not ok:
+            return False, result, None
+
+        add_binding(channel_id, user_id, result, "AA", "aa_kb_chatbot")
+        primary = resolve_channel_user_id(channel_id, user_id)
+        old_prof = get_user_profile(user_id, channel_id) or {}
+        new_prof = dict(old_prof)
+        new_prof["position"] = position
+        new_prof["phone"] = phone_raw
+        save_user_profile(primary, new_prof, old_profile=old_prof)
+
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            link = f'{jira_url}/browse/{result}'
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "aa_mail_browser":
+        from user_storage import get_user_profile, save_user_profile, resolve_channel_user_id
+        from core.jira_aa import create_aa_mail_browser_issue
+        from core.support.issue_binding_registry import add_binding
+
+        profile = get_user_profile(user_id, channel_id) or {}
+        department = (profile.get("department") or "").strip()
+        if not department:
+            return False, NEED_PROFILE_DEPARTMENT, None
+
+        login = (profile.get("login") or "").strip()
+        if not login:
+            return False, "В профиле не указан рабочий логин (AD account).", None
+
+        full_name = (profile.get("full_name") or "").strip()
+        if not full_name:
+            return False, "В профиле не указано ФИО.", None
+
+        position = (form_data.get("position") or profile.get("position") or "").strip()
+        if not position:
+            return False, "Укажите должность (Position).", None
+
+        phone_raw = (form_data.get("existing_phone") or profile.get("phone") or "").strip()
+        if not phone_raw:
+            return False, "Укажите номер телефона (Existing phone number).", None
+        phone_jira = normalize_phone_for_jira(phone_raw)
+        if not phone_jira:
+            return False, "Некорректный номер телефона.", None
+
+        mb = CONFIG.get("JIRA_AA_MAIL_BROWSER") or {}
+        kb = CONFIG.get("JIRA_AA_KB_CHATBOT") or {}
+        create_l = (mb.get("EDIT_OPTION_CREATE") or kb.get("EDIT_OPTION_CREATE") or "Создать").strip()
+        edit_l = (mb.get("EDIT_OPTION_EDIT") or kb.get("EDIT_OPTION_EDIT") or "Редактировать").strip()
+        aa_edit = (form_data.get("aa_edit_type") or "").strip()
+        if aa_edit not in (create_l, edit_l):
+            return False, "Выберите «Создать» или «Редактировать».", None
+
+        description = (form_data.get("description") or "").strip()
+
+        jira_username = (profile.get("jira_username") or "").strip() or None
+        ok, result = await create_aa_mail_browser_issue(
+            full_name=full_name,
+            position=position,
+            department=department,
+            aa_edit_type=aa_edit,
+            ad_account=login,
+            existing_phone=phone_jira,
+            description=description,
+            jira_username=jira_username,
+        )
+        if not ok:
+            return False, result, None
+
+        add_binding(channel_id, user_id, result, "AA", "aa_mail_browser")
+        primary = resolve_channel_user_id(channel_id, user_id)
+        old_prof = get_user_profile(user_id, channel_id) or {}
+        new_prof = dict(old_prof)
+        new_prof["position"] = position
+        new_prof["phone"] = phone_raw
+        save_user_profile(primary, new_prof, old_profile=old_prof)
+
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            link = f'{jira_url}/browse/{result}'
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "aa_pc_account":
+        from user_storage import get_user_profile, save_user_profile, resolve_channel_user_id
+        from core.jira_aa import create_aa_pc_account_issue
+        from core.support.issue_binding_registry import add_binding
+
+        profile = get_user_profile(user_id, channel_id) or {}
+        department = (profile.get("department") or "").strip()
+        if not department:
+            return False, NEED_PROFILE_DEPARTMENT, None
+
+        login = (profile.get("login") or "").strip()
+        if not login:
+            return False, "В профиле не указан рабочий логин (AD account).", None
+
+        full_name = (profile.get("full_name") or "").strip()
+        if not full_name:
+            return False, "В профиле не указано ФИО.", None
+
+        position = (form_data.get("position") or profile.get("position") or "").strip()
+        if not position:
+            return False, "Укажите должность (Position).", None
+
+        phone_raw = (form_data.get("existing_phone") or profile.get("phone") or "").strip()
+        if not phone_raw:
+            return False, "Укажите номер телефона (Existing phone number).", None
+        phone_jira = normalize_phone_for_jira(phone_raw)
+        if not phone_jira:
+            return False, "Некорректный номер телефона.", None
+
+        pc = CONFIG.get("JIRA_AA_PC_ACCOUNT") or {}
+        act_copy = (pc.get("ACTION_COPY") or "Копировать права").strip()
+        act_unlock = (pc.get("ACTION_UNLOCK") or "Разблокировать учетную запись").strip()
+        act_group = (pc.get("ACTION_GROUP") or "Дать доступ к группе безопасности").strip()
+        valid_actions = frozenset({act_copy, act_unlock, act_group})
+        ad_edit = (form_data.get("aa_ad_edit_type") or "").strip()
+        if ad_edit not in valid_actions:
+            return False, "Выберите требуемое действие из списка.", None
+
+        copy_src = (form_data.get("copy_rights_source") or "").strip().lower()
+        group_name = (form_data.get("security_group_name") or "").strip()
+        if ad_edit == act_copy and not copy_src:
+            return False, "Укажите логин, с кого копировать права (например: i.ivanov).", None
+        if ad_edit == act_group and not group_name:
+            return False, "Укажите имя группы безопасности AD.", None
+        if ad_edit != act_copy:
+            copy_src = ""
+        if ad_edit != act_group:
+            group_name = ""
+
+        description = (form_data.get("description") or "").strip()
+
+        jira_username = (profile.get("jira_username") or "").strip() or None
+        ok, result = await create_aa_pc_account_issue(
+            full_name=full_name,
+            position=position,
+            department=department,
+            ad_edit_type=ad_edit,
+            ad_account=login,
+            existing_phone=phone_jira,
+            copy_rights_source=copy_src,
+            security_group_name=group_name,
+            description=description,
+            jira_username=jira_username,
+        )
+        if not ok:
+            return False, result, None
+
+        add_binding(channel_id, user_id, result, "AA", "aa_pc_account")
+        primary = resolve_channel_user_id(channel_id, user_id)
+        old_prof = get_user_profile(user_id, channel_id) or {}
+        new_prof = dict(old_prof)
+        new_prof["position"] = position
+        new_prof["phone"] = phone_raw
+        save_user_profile(primary, new_prof, old_profile=old_prof)
+
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            link = f'{jira_url}/browse/{result}'
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
     return False, f"Неизвестный тип заявки: {ticket_type_id}.", None
 
 
@@ -688,6 +957,7 @@ def get_ticket_type_label(ticket_type_id: Optional[str], project_key: Optional[s
         "lupa_search": "Поиск/Сайт",
         "wms_issue": "Проблема в работе WMS",
         "wms_settings": "Изменение настроек системы WMS",
+        "wms_wait_products": "Товары в WAIT",
         "wms_psi_user": "Пользователь PSIwms",
         "pc_problem": "Проблема в работе ПК",
         "orgtech_problem": "Оргтехника",
@@ -697,6 +967,9 @@ def get_ticket_type_label(ticket_type_id: Optional[str], project_key: Optional[s
         "email_owa_outlook": "Электронная почта (Owa/Outlook)",
         "email_forwarding": "Настройка переадресации",
         "email_groups": "Группы рассылки",
+        "aa_kb_chatbot": "Чат-бот по базам знаний",
+        "aa_mail_browser": "Доступ к почте через браузер",
+        "aa_pc_account": "Учетная запись для входа на ПК",
     }
     if tid in mapping:
         return mapping[tid]
@@ -929,6 +1202,9 @@ class SupportAPI:
 
     def get_tp_services_menu(self, channel_id: str, user_id: int) -> Menu | Error:
         return get_tp_services_menu(channel_id, user_id)
+
+    def get_tp_access_accounts_menu(self, channel_id: str, user_id: int) -> Menu | Error:
+        return get_tp_access_accounts_menu(channel_id, user_id)
 
     def get_admin_panel(self, channel_id: str, user_id: int) -> Menu | Error:
         return get_admin_panel_response(channel_id, user_id)

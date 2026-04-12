@@ -130,6 +130,7 @@ def _profile_from_attrs(attrs: Dict[str, List], fallback_phone: str = "") -> Opt
         _get_first(attrs, "mobile") or _get_first(attrs, "telephoneNumber") or _get_first(attrs, "ipPhone")
     )
     department = _get_first(attrs, "department")
+    title = _get_first(attrs, "title")
 
     if not login and not email:
         return None
@@ -140,13 +141,17 @@ def _profile_from_attrs(attrs: Dict[str, List], fallback_phone: str = "") -> Opt
         normalize_phone_display(phone_raw) if phone_raw else (normalize_phone_display(fallback_phone) if fallback_phone else "")
     )
 
-    return {
+    out: Dict[str, str] = {
         "full_name": full_name or "",
         "login": (login or "").strip().lower(),
         "email": (email or "").strip().lower(),
         "phone": phone_display,
         "department": (department or "").strip(),
     }
+    if (title or "").strip():
+        # Должность для JSM (AA и др.): в AD обычно в атрибуте title
+        out["position"] = (title or "").strip()
+    return out
 
 
 def search_users_by_query(query: str, *, limit: int = 10) -> List[Dict[str, str]]:
@@ -234,7 +239,8 @@ def search_users_by_query(query: str, *, limit: int = 10) -> List[Dict[str, str]
 def search_user_by_phone(phone: str) -> Optional[Dict[str, str]]:
     """
     Ищет в AD пользователя по номеру телефона (telephoneNumber, mobile, ipPhone).
-    Возвращает профиль для бота: full_name, login, email, phone, department
+    Возвращает профиль для бота: full_name, login, email, phone, department;
+    при наличии в AD — position (из title).
     или None, если не найден / AD недоступен.
     """
     cfg = _ad_config()

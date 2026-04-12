@@ -120,6 +120,7 @@ def _admin_profile_response(user_id: int) -> dict:
         f"<b>Email:</b> {_v('email')}\n"
         f"<b>Табельный номер:</b> {_v('employee_id')}\n"
         f"<b>Подразделение:</b> {_v('department')}\n"
+        f"<b>Должность:</b> {_v('position')}\n"
         f"<b>Подразделение WMS:</b> {_v('department_wms')}\n"
         f"<b>Jira username:</b> {_v('jira_username')}\n"
     )
@@ -165,6 +166,15 @@ def _tp_equipment_menu(user_id: int) -> dict:
 
 def _tp_services_menu(user_id: int) -> dict:
     result = support_api.get_tp_services_menu(CHANNEL_ID, user_id)
+    if isinstance(result, Menu):
+        return menu_to_max(result)
+    if isinstance(result, Error):
+        return error_to_max(result)
+    return {"text": str(result)}
+
+
+def _tp_access_accounts_menu(user_id: int) -> dict:
+    result = support_api.get_tp_access_accounts_menu(CHANNEL_ID, user_id)
     if isinstance(result, Menu):
         return menu_to_max(result)
     if isinstance(result, Error):
@@ -270,9 +280,28 @@ def handle_callback(callback_id: str, user_id: int, my_tickets: Optional[list] =
     if callback_id == "tp_email_forwarding":
         # Обрабатывается в main_max: пошаговый сценарий заявки «Настройка переадресации»
         return None
+    if callback_id == "tp_access_kb_chatbot":
+        return None
+    if callback_id in ("aa_kb_edit_create", "aa_kb_edit_edit", "aa_kb_restart_flow"):
+        return None
+    if callback_id in ("aa_mail_edit_create", "aa_mail_edit_edit", "aa_mail_restart_flow"):
+        return None
+    if callback_id == "tp_access_mail_browser":
+        return None
+    if callback_id == "tp_access_pc_account":
+        return None
+    if callback_id in (
+        "aa_pc_action_copy",
+        "aa_pc_action_unlock",
+        "aa_pc_action_group",
+        "aa_pc_restart_flow",
+    ):
+        return None
     # Главное меню (для зарегистрированных)
     if callback_id == "create_ticket_tp":
         return _tp_root_menu(user_id)
+    if callback_id == "tp_group_access":
+        return _tp_access_accounts_menu(user_id)
     if callback_id == "tp_group_programs":
         return _tp_programs_menu(user_id)
     if callback_id == "tp_group_equipment":

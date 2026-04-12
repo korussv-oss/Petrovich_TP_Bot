@@ -10,6 +10,7 @@ from urllib.parse import urljoin
 import aiohttp
 
 from config import CONFIG
+from core.jira_labels import merge_chatbot_into_labels
 from validators import sanitize_jira_text, normalize_phone_for_jira
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,11 @@ async def _get_jsm_request_type_allowed_fields(
         base_url + "/",
         f"rest/servicedeskapi/servicedesk/{service_desk_id}/requesttype/{request_type_id}/field",
     )
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "X-ExperimentalApi": "opt-in",
+    }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
@@ -40,8 +45,8 @@ async def _get_jsm_request_type_allowed_fields(
                     logger.warning("PC request type fields: %s %s", resp.status, await resp.text())
                     return set()
                 data = await resp.json()
-        values = data.get("values") or []
-        return {v.get("fieldId") for v in values if isinstance(v, dict) and v.get("fieldId")}
+        rows = list(data.get("requestTypeFields") or data.get("values") or [])
+        return {v.get("fieldId") for v in rows if isinstance(v, dict) and v.get("fieldId")}
     except Exception as e:
         logger.warning("PC request type fields failed: %s", e)
         return set()
@@ -215,6 +220,8 @@ async def create_pc_issue(
         request_field_values[field_department] = {"id": department_id}
     if not allowed_fields or field_phone in allowed_fields:
         request_field_values[field_phone] = phone_jira
+    if allowed_fields and "labels" in allowed_fields:
+        merge_chatbot_into_labels(request_field_values)
 
     files = list(attachment_paths or [])[:MAX_ATTACHMENTS_PER_ISSUE]
     if files:
@@ -251,6 +258,10 @@ async def create_pc_issue(
                             await _set_reporter(base_url, token, issue_key, jira_username)
                         except Exception as e:
                             logger.warning("PC: не удалось изменить автора для %s на %s: %s", issue_key, jira_username, e)
+                    if not allowed_fields or "labels" not in allowed_fields:
+                        from core.jira_aa import _ensure_issue_has_chatbot_label  # type: ignore[attr-defined]
+
+                        await _ensure_issue_has_chatbot_label(base_url, token, issue_key)
                     return True, issue_key
                 text = await resp.text()
                 logger.warning("PC create failed: %s %s", resp.status, text[:500])

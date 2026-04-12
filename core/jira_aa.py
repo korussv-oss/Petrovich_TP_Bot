@@ -7,15 +7,19 @@ import asyncio
 import logging
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple, TypedDict, overload, Literal
 from urllib.parse import urljoin
 
 import aiohttp
 
 from config import CONFIG
-from validators import validate_issue_key, sanitize_jira_text
+from validators import validate_issue_key, sanitize_jira_text, normalize_phone_for_jira
+from core.jira_labels import JIRA_LABEL_CHATBOT, merge_chatbot_into_labels
 from core.jira_retry import retry_jira
+from core.http_error_utils import classify_http_error
+from core.log_rate_limit import log_rate_limited
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +34,47 @@ FIELDS = JIRA_AA.get("FIELDS", {})
 _JIRA_TTL_CACHE: dict[tuple, tuple[float, Any]] = {}
 # key -> asyncio.Task
 _JIRA_INFLIGHT: dict[tuple, asyncio.Task] = {}
+
+_JIRA_HTTP_SESSION: aiohttp.ClientSession | None = None
+_JIRA_HTTP_SESSION_LOCK = asyncio.Lock()
+
+
+async def _get_jira_http_session() -> aiohttp.ClientSession:
+    """
+    Shared aiohttp session for Jira reads.
+    Reduces connect/close overhead and avoids connection storms under concurrency.
+    """
+    global _JIRA_HTTP_SESSION
+    async with _JIRA_HTTP_SESSION_LOCK:
+        if _JIRA_HTTP_SESSION is not None and not _JIRA_HTTP_SESSION.closed:
+            return _JIRA_HTTP_SESSION
+        connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+        _JIRA_HTTP_SESSION = aiohttp.ClientSession(connector=connector)
+        return _JIRA_HTTP_SESSION
+
+
+@dataclass(frozen=True)
+class CommentsResult:
+    comments: list[dict] | None
+    http_status: int | None
+
+
+class IssueInfo(TypedDict):
+    summary: str
+    status: str
+    description: str
+
+
+class IssueAdminDetails(TypedDict):
+    summary: str
+    status: str
+    description: str
+    assignee_display: str
+    assignee_username: str
+    reporter_display: str
+    reporter_username: str
+    issue_type: str
+    project_key: str
 
 
 def _cache_get(key: tuple) -> Any | None:
@@ -67,15 +112,23 @@ async def _get_jsm_request_type_allowed_fields(
         base_url + "/",
         f"rest/servicedeskapi/servicedesk/{service_desk_id}/requesttype/{request_type_id}/field",
     )
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "X-ExperimentalApi": "opt-in",
+    }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status != 200:
                     return set()
                 data = await resp.json()
-                values = data.get("values") or []
-                return {item["fieldId"] for item in values if item.get("fieldId")}
+                rows = list(data.get("requestTypeFields") or data.get("values") or [])
+                return {
+                    item["fieldId"]
+                    for item in rows
+                    if isinstance(item, dict) and item.get("fieldId")
+                }
     except Exception as e:
         logger.warning("JSM: не удалось получить список полей request type: %s", e)
         return set()
@@ -121,10 +174,10 @@ async def _create_via_servicedesk(
         if "description" in allowed:
             request_field_values["description"] = description
         if "labels" in allowed:
-            request_field_values["labels"] = ["чатбот"]
+            merge_chatbot_into_labels(request_field_values)
         request_field_values = {k: v for k, v in request_field_values.items() if k in allowed}
     else:
-        logger.debug("JSM: отправляем только кастомные поля (summary/description не передаём)")
+        logger.debug("JSM: список полей типа запроса пуст — не передаём labels в create (метка через REST после создания)")
     if not request_field_values:
         logger.error("JSM: нет полей для отправки")
         return None
@@ -150,6 +203,8 @@ async def _create_via_servicedesk(
                         result = {"key": issue_key, "id": data.get("issueId")}
                         if assignee_username and JIRA_AA.get("SET_ASSIGNEE", True):
                             await _set_assignee(base_url, token, issue_key, assignee_username)
+                        if not allowed or "labels" not in allowed:
+                            await _ensure_issue_has_chatbot_label(base_url, token, issue_key)
                         return result
                 text = await resp.text()
                 logger.warning("JSM create failed: %s %s", resp.status, text[:400])
@@ -255,6 +310,56 @@ async def _set_reporter(base_url: str, token: str, issue_key: str, username: str
         logger.warning("Не удалось установить reporter: %s", e)
 
 
+async def _ensure_issue_has_chatbot_label(base_url: str, token: str, issue_key: str) -> None:
+    """Добавляет метку «чатбот» через REST, если при создании через JSM поле labels не в списке допустимых полей типа запроса."""
+    issue_key = _safe_issue_key(issue_key)
+    if not issue_key:
+        return
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    url_get = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}?fields=labels")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url_get, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.warning("JSM KB labels: не прочитать labels %s: %s %s", issue_key, resp.status, (text or "")[:300])
+                    return
+                data = await resp.json()
+    except Exception as e:
+        logger.warning("JSM KB labels: GET labels %s: %s", issue_key, e)
+        return
+    existing = (data.get("fields") or {}).get("labels")
+    if not isinstance(existing, list):
+        existing = []
+    if JIRA_LABEL_CHATBOT in existing:
+        return
+    new_labels = [str(x).strip() for x in existing if str(x).strip()]
+    if JIRA_LABEL_CHATBOT not in new_labels:
+        new_labels.append(JIRA_LABEL_CHATBOT)
+    url_put = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}")
+    body = {"fields": {"labels": new_labels}}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.put(url_put, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status in (200, 204):
+                    logger.debug("JSM KB: метка «%s» добавлена к %s", JIRA_LABEL_CHATBOT, issue_key)
+                else:
+                    text = await resp.text()
+                    logger.warning(
+                        "JSM KB: не удалось выставить метку «%s» для %s: %s %s",
+                        JIRA_LABEL_CHATBOT,
+                        issue_key,
+                        resp.status,
+                        (text or "")[:400],
+                    )
+    except Exception as e:
+        logger.warning("JSM KB: PUT labels %s: %s", issue_key, e)
+
+
 async def issue_exists(issue_key: str) -> Optional[bool]:
     """
     Проверяет, существует ли заявка в Jira.
@@ -320,7 +425,7 @@ async def _get_issue_info_http(issue_key: str) -> Optional[Dict[str, Any]]:
                 desc = (fields.get("description") or "").strip()
                 if desc and len(desc) > 200:
                     desc = desc[:200] + "..."
-                return {"summary": summary, "status": status_name, "description": desc}
+                return IssueInfo(summary=summary, status=status_name, description=desc)
     except Exception as e:
         logger.debug("get_issue_info %s: %s", issue_key, e)
         return None
@@ -331,7 +436,7 @@ async def get_issue_info(
     *,
     timeout_total: float | None = None,
     ttl_seconds: float = 20.0,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[IssueInfo]:
     """
     Cached + in-flight dedup wrapper around Jira issue info.
 
@@ -364,7 +469,7 @@ async def get_issue_info(
 
 
 @retry_jira(max_attempts=3, base_delay=1.0)
-async def get_issue_admin_details(issue_key: str) -> Optional[Dict[str, Any]]:
+async def get_issue_admin_details(issue_key: str) -> Optional[IssueAdminDetails]:
     """
     Расширенная информация о задаче для карточки СА:
     summary, status, description, assignee, reporter, issuetype, project.
@@ -395,17 +500,17 @@ async def get_issue_admin_details(issue_key: str) -> Optional[Dict[str, Any]]:
                 desc = (f.get("description") or "").strip()
                 if desc and len(desc) > 800:
                     desc = desc[:800] + "..."
-                return {
-                    "summary": (f.get("summary") or "").strip(),
-                    "status": (status_obj.get("name") or "").strip(),
-                    "description": desc,
-                    "assignee_display": (assignee_obj.get("displayName") or "").strip(),
-                    "assignee_username": (assignee_obj.get("name") or assignee_obj.get("key") or "").strip(),
-                    "reporter_display": (reporter_obj.get("displayName") or "").strip(),
-                    "reporter_username": (reporter_obj.get("name") or reporter_obj.get("key") or "").strip(),
-                    "issue_type": (issuetype_obj.get("name") or "").strip(),
-                    "project_key": (project_obj.get("key") or "").strip().upper(),
-                }
+                return IssueAdminDetails(
+                    summary=(f.get("summary") or "").strip(),
+                    status=(status_obj.get("name") or "").strip(),
+                    description=desc,
+                    assignee_display=(assignee_obj.get("displayName") or "").strip(),
+                    assignee_username=(assignee_obj.get("name") or assignee_obj.get("key") or "").strip(),
+                    reporter_display=(reporter_obj.get("displayName") or "").strip(),
+                    reporter_username=(reporter_obj.get("name") or reporter_obj.get("key") or "").strip(),
+                    issue_type=(issuetype_obj.get("name") or "").strip(),
+                    project_key=(project_obj.get("key") or "").strip().upper(),
+                )
     except Exception as e:
         logger.debug("get_issue_admin_details %s: %s", issue_key, e)
         return None
@@ -415,7 +520,7 @@ async def get_issues_admin_details_batch(
     issue_keys: List[str],
     *,
     batch_size: int = 50,
-) -> Dict[str, Dict[str, Any]]:
+) -> Dict[str, IssueAdminDetails]:
     """
     Batch-версия get_issue_admin_details: одним JQL-запросом получает детали
     нескольких заявок (вместо N отдельных HTTP-запросов).
@@ -436,7 +541,7 @@ async def get_issues_admin_details_batch(
     headers = {"Accept": "application/json", "Content-Type": "application/json",
                "Authorization": f"Bearer {token}"}
     url = urljoin(base_url + "/", "rest/api/2/search")
-    result: Dict[str, Dict[str, Any]] = {}
+    result: Dict[str, IssueAdminDetails] = {}
 
     valid_keys = [k for k in issue_keys if _safe_issue_key(k)]
     for start in range(0, len(valid_keys), batch_size):
@@ -467,17 +572,17 @@ async def get_issues_admin_details_batch(
                         desc = (f.get("description") or "").strip()
                         if desc and len(desc) > 800:
                             desc = desc[:800] + "..."
-                        result[key] = {
-                            "summary": (f.get("summary") or "").strip(),
-                            "status": (status_obj.get("name") or "").strip(),
-                            "description": desc,
-                            "assignee_display": (assignee_obj.get("displayName") or "").strip(),
-                            "assignee_username": (assignee_obj.get("name") or assignee_obj.get("key") or "").strip(),
-                            "reporter_display": (reporter_obj.get("displayName") or "").strip(),
-                            "reporter_username": (reporter_obj.get("name") or reporter_obj.get("key") or "").strip(),
-                            "issue_type": (issuetype_obj.get("name") or "").strip(),
-                            "project_key": (project_obj.get("key") or "").strip().upper(),
-                        }
+                        result[key] = IssueAdminDetails(
+                            summary=(f.get("summary") or "").strip(),
+                            status=(status_obj.get("name") or "").strip(),
+                            description=desc,
+                            assignee_display=(assignee_obj.get("displayName") or "").strip(),
+                            assignee_username=(assignee_obj.get("name") or assignee_obj.get("key") or "").strip(),
+                            reporter_display=(reporter_obj.get("displayName") or "").strip(),
+                            reporter_username=(reporter_obj.get("name") or reporter_obj.get("key") or "").strip(),
+                            issue_type=(issuetype_obj.get("name") or "").strip(),
+                            project_key=(project_obj.get("key") or "").strip().upper(),
+                        )
         except Exception as e:
             logger.warning("get_issues_admin_details_batch chunk %s..%s: %s", start, start + len(chunk), e)
     return result
@@ -680,6 +785,28 @@ def _is_internal_comment(comment: Dict[str, Any]) -> bool:
     return False
 
 
+@overload
+async def get_issue_comments(
+    issue_key: str,
+    include_internal: bool = False,
+    return_http_status: Literal[False] = False,
+    *,
+    timeout_total: float | None = None,
+    ttl_seconds: float = 10.0,
+) -> list[dict] | None: ...
+
+
+@overload
+async def get_issue_comments(
+    issue_key: str,
+    include_internal: bool = False,
+    return_http_status: Literal[True] = True,
+    *,
+    timeout_total: float | None = None,
+    ttl_seconds: float = 10.0,
+) -> CommentsResult: ...
+
+
 async def get_issue_comments(
     issue_key: str,
     include_internal: bool = False,
@@ -687,7 +814,7 @@ async def get_issue_comments(
     *,
     timeout_total: float | None = None,
     ttl_seconds: float = 10.0,
-) -> Any:
+) -> list[dict] | None | CommentsResult:
     """
     Возвращает список комментариев задачи или None при сетевой/HTTP ошибке (не путать с пустым списком).
 
@@ -736,10 +863,10 @@ async def _get_issue_comments_uncached(
     base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
     token = (jira.get("TOKEN") or "").strip()
     if not base_url or not token:
-        return (None, None) if return_http_status else None
+        return CommentsResult(None, None) if return_http_status else None
     issue_key = _safe_issue_key(issue_key)
     if not issue_key:
-        return (None, None) if return_http_status else None
+        return CommentsResult(None, None) if return_http_status else None
     # expand=properties нужен, чтобы отличать public/internal комментарии в JSM.
     url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key}/comment")
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
@@ -748,40 +875,48 @@ async def _get_issue_comments_uncached(
     # Большое maxResults снижает кол-во запросов к Jira при типичных объемах.
     page_size = 100
     try:
-        async with aiohttp.ClientSession() as session:
-            while True:
-                params = {
-                    "expand": "properties",
-                    "startAt": start_at,
-                    "maxResults": page_size,
-                }
-                async with session.get(
-                    url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.warning(
-                            "get_issue_comments %s: HTTP %s %s",
-                            issue_key,
-                            resp.status,
-                            (body or "")[:300],
+        session = await _get_jira_http_session()
+        while True:
+            params = {
+                "expand": "properties",
+                "startAt": start_at,
+                "maxResults": page_size,
+            }
+            async with session.get(
+                url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    body_preview = (body or "")[:300]
+                    info = classify_http_error(status=int(resp.status), body_text=body or "")
+                    mapped = info.mapped_status
+                    if info.log_level == "info":
+                        logger.info("get_issue_comments %s: HTTP %s %s", issue_key, resp.status, body_preview)
+                    else:
+                        # Prevent log spam in background loops
+                        log_rate_limited(
+                            logger.warning,
+                            key=f"jira:get_issue_comments:{issue_key}:{resp.status}",
+                            interval_seconds=60.0,
+                            msg="get_issue_comments %s: HTTP %s %s",
+                            args=(issue_key, resp.status, body_preview),
                         )
-                        return (None, resp.status) if return_http_status else None
-                    data = await resp.json()
-                    comments_page = list(data.get("comments") or [])
-                    if not comments_page:
-                        break
-                    all_comments.extend(comments_page)
+                    return CommentsResult(None, int(mapped or resp.status)) if return_http_status else None
+                data = await resp.json()
+                comments_page = list(data.get("comments") or [])
+                if not comments_page:
+                    break
+                all_comments.extend(comments_page)
 
-                    total = data.get("total")
-                    # total может отсутствовать в некоторых конфигурациях; тогда ориентируемся на размер страницы.
-                    if isinstance(total, int) and start_at + len(all_comments) >= total:
-                        break
+                total = data.get("total")
+                # total может отсутствовать в некоторых конфигурациях; тогда ориентируемся на размер страницы.
+                if isinstance(total, int) and start_at + len(all_comments) >= total:
+                    break
 
-                    # Jira может вернуть меньше page_size в последней странице.
-                    if len(comments_page) < page_size:
-                        break
-                    start_at += len(comments_page)
+                # Jira может вернуть меньше page_size в последней странице.
+                if len(comments_page) < page_size:
+                    break
+                start_at += len(comments_page)
 
         # Сделаем порядок комментариев детерминированным: Jira обычно возвращает в нужном порядке,
         # но при пагинации/настройках лучше сортировать явно.
@@ -808,13 +943,106 @@ async def _get_issue_comments_uncached(
 
         all_comments.sort(key=_sort_key)
         if include_internal:
-            return (all_comments, 200) if return_http_status else all_comments
+            return CommentsResult(all_comments, 200) if return_http_status else all_comments
         filtered = [c for c in all_comments if not _is_internal_comment(c)]
-        return (filtered, 200) if return_http_status else filtered
+        return CommentsResult(filtered, 200) if return_http_status else filtered
     except Exception as e:
         # str(TimeoutError()) is empty on some platforms, so log type too.
-        logger.warning("get_issue_comments %s: %s: %r", issue_key, type(e).__name__, e)
-        return (None, None) if return_http_status else None
+        log_rate_limited(
+            logger.warning,
+            key=f"jira:get_issue_comments:exc:{(issue_key or '').strip().upper()}:{type(e).__name__}",
+            interval_seconds=60.0,
+            msg="get_issue_comments %s: %s: %r",
+            args=(issue_key, type(e).__name__, e),
+        )
+        return CommentsResult(None, None) if return_http_status else None
+
+
+async def get_issue_comments_tail(
+    issue_key: str,
+    *,
+    limit: int = 5,
+    include_internal: bool = False,
+    timeout_total: float | None = None,
+    ttl_seconds: float = 10.0,
+) -> CommentsResult:
+    """
+    Быстрый вариант для UI карточки: возвращает только последние N комментариев.
+    Делает 1-2 запроса вместо полной пагинации.
+    """
+    key = ("get_issue_comments_tail", (issue_key or "").strip().upper(), int(limit), bool(include_internal))
+    cached = _cache_get(key)
+    if isinstance(cached, CommentsResult):
+        return cached
+
+    issue_key_safe = _safe_issue_key(issue_key)
+    if not issue_key_safe:
+        res = CommentsResult(None, None)
+        _cache_set(key, res, ttl_seconds)
+        return res
+
+    jira = CONFIG.get("JIRA", {})
+    base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
+    token = (jira.get("TOKEN") or "").strip()
+    if not base_url or not token:
+        res = CommentsResult(None, None)
+        _cache_set(key, res, ttl_seconds)
+        return res
+
+    url = urljoin(base_url + "/", f"rest/api/2/issue/{issue_key_safe}/comment")
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+
+    async def _do() -> CommentsResult:
+        session = await _get_jira_http_session()
+        # 1) Get total cheaply (maxResults=1) with expand=properties if we need internal filtering later.
+        params1 = {"startAt": 0, "maxResults": 1, "expand": "properties"}
+        async with session.get(url, headers=headers, params=params1, timeout=aiohttp.ClientTimeout(total=10)) as r1:
+            if r1.status != 200:
+                body = await r1.text()
+                info = classify_http_error(status=int(r1.status), body_text=body or "")
+                mapped = int(info.mapped_status or r1.status)
+                return CommentsResult(None, mapped)
+            data1 = await r1.json()
+            try:
+                total = int(data1.get("total") or 0)
+            except Exception:
+                total = 0
+
+        # 2) Fetch tail page.
+        n = max(1, int(limit))
+        start_at = max(0, max(0, total - n))
+        params2 = {"startAt": start_at, "maxResults": n, "expand": "properties"}
+        async with session.get(url, headers=headers, params=params2, timeout=aiohttp.ClientTimeout(total=15)) as r2:
+            if r2.status != 200:
+                body = await r2.text()
+                info = classify_http_error(status=int(r2.status), body_text=body or "")
+                mapped = int(info.mapped_status or r2.status)
+                return CommentsResult(None, mapped)
+            data2 = await r2.json()
+            comments_page = list(data2.get("comments") or [])
+            # Keep deterministic order and apply internal filter if needed.
+            if include_internal:
+                return CommentsResult(comments_page, 200)
+            filtered = [c for c in comments_page if isinstance(c, dict) and not _is_internal_comment(c)]
+            return CommentsResult(filtered, 200)
+
+    try:
+        if timeout_total is not None:
+            res = await asyncio.wait_for(_do(), timeout=float(timeout_total))
+        else:
+            res = await _do()
+    except Exception as e:
+        log_rate_limited(
+            logger.warning,
+            key=f"jira:get_issue_comments_tail:exc:{(issue_key or '').strip().upper()}:{type(e).__name__}",
+            interval_seconds=60.0,
+            msg="get_issue_comments_tail %s: %s: %r",
+            args=(issue_key, type(e).__name__, e),
+        )
+        res = CommentsResult(None, None)
+
+    _cache_set(key, res, ttl_seconds)
+    return res
 
 
 async def add_comment(issue_key: str, body: str) -> bool:
@@ -1108,15 +1336,14 @@ async def create_password_change_issue(
     customer_request_type_field = JIRA_AA.get("FIELD_CUSTOMER_REQUEST_TYPE", "").strip()
     request_type_value = JIRA_AA.get("REQUEST_TYPE_VALUE", "Смена пароля").strip()
 
-    issue_data = {
-        "fields": {
-            "project": {"key": project_key},
-            "summary": summary,
-            "issuetype": issuetype_payload,
-            "description": description,
-            "labels": ["чатбот"],
-        }
+    fields_rest: Dict[str, Any] = {
+        "project": {"key": project_key},
+        "summary": summary,
+        "issuetype": issuetype_payload,
+        "description": description,
     }
+    merge_chatbot_into_labels(fields_rest)
+    issue_data = {"fields": fields_rest}
 
     # Assignee при создании через REST недоступен на экране — выставим после создания (PUT).
 
@@ -1171,3 +1398,711 @@ async def create_password_change_issue(
     except Exception as e:
         logger.exception("Ошибка создания задачи AA: %s", e)
         return {"ok": False, "status": "exception", "error": str(e)}
+
+
+# --- JSM: «Чат-бот по базам знаний» (AA), конфиг JIRA_AA_KB_CHATBOT ---
+
+
+async def _jsm_fetch_request_type_field_rows(
+    base_url: str,
+    token: str,
+    service_desk_id: str,
+    request_type_id: str,
+) -> List[Dict[str, Any]]:
+    url = urljoin(
+        base_url + "/",
+        f"rest/servicedeskapi/servicedesk/{service_desk_id}/requesttype/{request_type_id}/field",
+    )
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "X-ExperimentalApi": "opt-in",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                if resp.status != 200:
+                    logger.warning("JSM KB: поля request type: HTTP %s %s", resp.status, (await resp.text())[:300])
+                    return []
+                data = await resp.json()
+        rows = list(data.get("requestTypeFields") or data.get("values") or [])
+        return [r for r in rows if isinstance(r, dict)]
+    except Exception as e:
+        logger.warning("JSM KB: поля request type: %s", e)
+        return []
+
+
+def _kb_row_by_field_id(rows: List[Dict[str, Any]], field_id: str) -> Optional[Dict[str, Any]]:
+    fid = (field_id or "").strip()
+    if not fid:
+        return None
+    for r in rows:
+        if (r.get("fieldId") or "").strip() == fid:
+            return r
+    return None
+
+
+def _kb_collect_valid_values(field_row: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not field_row or not isinstance(field_row, dict):
+        return []
+    for key in ("validValues", "values", "choices"):
+        raw = field_row.get(key)
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, dict)]
+    return []
+
+
+def _kb_select_option_payload(field_row: Optional[Dict[str, Any]], selected_label: str) -> Optional[Any]:
+    target = (selected_label or "").strip()
+    if not target:
+        return None
+    target_l = target.lower()
+    for opt in _kb_collect_valid_values(field_row):
+        label = (opt.get("label") or "").strip()
+        value = opt.get("value")
+        value_s = str(value).strip() if value is not None else ""
+        if label.lower() == target_l or value_s.lower() == target_l:
+            oid = opt.get("id")
+            if oid is not None and str(oid).strip():
+                return {"id": str(oid)}
+            if value_s:
+                return {"id": value_s} if str(value).isdigit() else {"value": value_s}
+            if label:
+                return {"value": label}
+    return {"value": target}
+
+
+def _kb_expects_option_array(field_row: Optional[Dict[str, Any]]) -> bool:
+    """Чекбоксы / multi-select в JSM отдают jiraSchema type=array, items=option — в API нужен список опций."""
+    if not field_row or not isinstance(field_row, dict):
+        return False
+    schema = field_row.get("jiraSchema") or {}
+    if not isinstance(schema, dict):
+        return False
+    return (schema.get("type") == "array") and (schema.get("items") == "option")
+
+
+def _kb_put_option_in_rfv(
+    rfv: Dict[str, Any],
+    field_id: str,
+    field_row: Optional[Dict[str, Any]],
+    selected_label: str,
+    *,
+    fallback_plain: Optional[str] = None,
+) -> None:
+    label = (selected_label or "").strip() or (fallback_plain or "").strip()
+    if not label:
+        return
+    pl = _kb_select_option_payload(field_row, label)
+    if pl is None:
+        pl = {"value": label}
+    if _kb_expects_option_array(field_row):
+        rfv[field_id] = [pl]
+    else:
+        rfv[field_id] = pl
+
+
+def _kb_resolve_field_id(
+    rows: List[Dict[str, Any]],
+    allowed: Set[str],
+    explicit: str,
+    name_hints: tuple[str, ...],
+) -> str:
+    exp = (explicit or "").strip()
+    if exp and (not allowed or exp in allowed):
+        return exp
+    for r in rows:
+        fid = (r.get("fieldId") or "").strip()
+        if not fid:
+            continue
+        if allowed and fid not in allowed:
+            continue
+        name = (r.get("name") or r.get("label") or "").lower()
+        if any(h in name for h in name_hints):
+            return fid
+    return ""
+
+
+def _kb_resolve_edit_type_field_id(
+    rows: List[Dict[str, Any]],
+    allowed: Set[str],
+    candidates: List[str],
+) -> str:
+    for c in candidates or []:
+        cid = (c or "").strip()
+        if cid and (not allowed or cid in allowed):
+            return cid
+    return _kb_resolve_field_id(rows, allowed, "", ("aa edit type", "edit type"))
+
+
+def _kb_resolve_field_id_candidates(
+    rows: List[Dict[str, Any]],
+    allowed: Set[str],
+    candidates: List[str],
+    name_hints: tuple[str, ...],
+) -> str:
+    for c in candidates or []:
+        cid = (str(c) or "").strip()
+        if cid and (not allowed or cid in allowed):
+            return cid
+    return _kb_resolve_field_id(rows, allowed, "", name_hints)
+
+
+def _kb_resolve_pc_account_service_checkbox_field_id(
+    rows: List[Dict[str, Any]],
+    allowed: Set[str],
+    explicit: str,
+    option_label: str,
+) -> str:
+    """
+    Чекбокс «нужен сервис: учётная запись для входа на ПК» (как почта/чат-бот на том же request type).
+    Без него Jira отвечает 400 про «не выбран ни один из необходимых сервисов».
+    """
+    exp = (explicit or "").strip()
+    if exp and (not allowed or exp in allowed):
+        return exp
+
+    opt_target = (option_label or "Нужно").strip().lower()
+    exclude_sub = (
+        "почт",
+        "браузер",
+        "owa",
+        "outlook",
+        "чат-бот",
+        "chatbot",
+        "баз знан",
+        "knowledge",
+        "mail browser",
+        "корпоративной почт",
+    )
+    keyword_sub = (
+        "пк",
+        "ldap",
+        "учетн",
+        "учётн",
+        "вход на пк",
+        "входа на пк",
+        "учетная запись",
+        "учётная запись",
+        "active directory",
+        "рабочей станц",
+        "рабочая станц",
+    )
+
+    def _row_name(r: Dict[str, Any]) -> str:
+        return ((r.get("name") or "") + " " + (r.get("label") or "")).strip()
+
+    def _name_matches_pc_service(nm: str) -> bool:
+        n = nm.lower()
+        if any(x in n for x in exclude_sub):
+            return False
+        return any(k in n for k in keyword_sub)
+
+    for r in rows:
+        fid = (r.get("fieldId") or "").strip()
+        if not fid or (allowed and fid not in allowed):
+            continue
+        nm = _row_name(r)
+        if not _name_matches_pc_service(nm):
+            continue
+        vals = _kb_collect_valid_values(r)
+        for opt in vals:
+            lab = (opt.get("label") or "").strip().lower()
+            if lab == opt_target or (opt_target and opt_target in lab):
+                logger.info("JSM PCAccount: чекбокс сервиса ПК: %s (%s)", fid, nm[:120])
+                return fid
+
+    return ""
+
+
+async def create_aa_knowledge_chatbot_issue(
+    *,
+    full_name: str,
+    position: str,
+    department: str,
+    aa_edit_type: str,
+    ad_account: str,
+    existing_phone: str,
+    description: str,
+    jira_username: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    Создаёт заявку в JSM AA для сценария «Чат-бот по базам знаний».
+    Поля подбираются по схеме request type + JIRA_AA_KB_CHATBOT_* в .env.
+    """
+    jira = CONFIG.get("JIRA", {})
+    kb = CONFIG.get("JIRA_AA_KB_CHATBOT") or {}
+    base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
+    token = (jira.get("TOKEN") or "").strip()
+    if not base_url or not token:
+        logger.error("JIRA LOGIN_URL или TOKEN не заданы")
+        return False, "Не настроено подключение к Jira."
+
+    service_desk_id = (kb.get("SERVICE_DESK_ID") or "").strip()
+    request_type_id = (kb.get("REQUEST_TYPE_ID") or "").strip()
+    if not service_desk_id or not request_type_id:
+        return False, (
+            "Заявка не настроена: задайте в .env JIRA_AA_KB_CHATBOT_REQUEST_TYPE_ID "
+            "(и при необходимости JIRA_AA_KB_CHATBOT_SERVICE_DESK_ID)."
+        )
+
+    summary = sanitize_jira_text((kb.get("SUMMARY") or "Чат-бот по базам знаний").strip(), max_len=255)
+    desc_stripped = (description or "").strip()
+    description_payload = sanitize_jira_text(desc_stripped, max_len=4000) if desc_stripped else ""
+    phone_jira = normalize_phone_for_jira(existing_phone or "")
+
+    rows = await _jsm_fetch_request_type_field_rows(base_url, token, service_desk_id, request_type_id)
+    allowed = {r.get("fieldId") for r in rows if r.get("fieldId")}
+    if allowed:
+        logger.info("JSM KB: допустимые поля requestTypeId=%s: %s", request_type_id, sorted(allowed))
+
+    dept_fid = (JIRA_AA.get("FIELD_DEPARTMENT") or FIELDS.get("DEPARTMENT") or "").strip()
+    ad_fid = (FIELDS.get("AD_ACCOUNT") or "").strip()
+    phone_fid = (FIELDS.get("EXISTING_PHONE") or "").strip()
+
+    fn_fid = _kb_resolve_field_id(
+        rows, allowed, (kb.get("FIELD_FULL_NAME") or "").strip(), ("full name", "фио", "полное имя")
+    )
+    pos_fid = _kb_resolve_field_id(
+        rows, allowed, (kb.get("FIELD_POSITION") or "").strip(), ("position", "должност")
+    )
+    edit_fid = _kb_resolve_edit_type_field_id(
+        rows, allowed, list(kb.get("FIELD_EDIT_TYPE_CANDIDATES") or [])
+    )
+    chatbot_fid = _kb_resolve_field_id(
+        rows,
+        allowed,
+        (kb.get("FIELD_AA_CHATBOT") or "").strip(),
+        ("aa chatbot", "chatbot", "чат-бот", "баз знан", "базы знан"),
+    )
+    req_fid = _kb_resolve_field_id(
+        rows,
+        allowed,
+        (kb.get("FIELD_REQUEST_TYPE_SELECT") or "").strip(),
+        ("request type", "тип запроса"),
+    )
+
+    rfv: Dict[str, Any] = {}
+
+    if fn_fid:
+        rfv[fn_fid] = sanitize_jira_text((full_name or "").strip(), max_len=255)
+    if pos_fid:
+        rfv[pos_fid] = sanitize_jira_text((position or "").strip(), max_len=255)
+
+    if edit_fid:
+        er = _kb_row_by_field_id(rows, edit_fid)
+        pl = _kb_select_option_payload(er, aa_edit_type)
+        val: Any = pl if pl is not None else {"value": aa_edit_type}
+        rfv[edit_fid] = [val] if _kb_expects_option_array(er) else val
+
+    if chatbot_fid:
+        cr = _kb_row_by_field_id(rows, chatbot_fid)
+        chatbot_label = (kb.get("AA_CHATBOT_OPTION_LABEL") or "").strip() or "Нужно"
+        _kb_put_option_in_rfv(rfv, chatbot_fid, cr, chatbot_label)
+
+    req_label = (kb.get("REQUEST_TYPE_OPTION_LABEL") or "").strip()
+    if req_fid and req_label:
+        rr = _kb_row_by_field_id(rows, req_fid)
+        _kb_put_option_in_rfv(rfv, req_fid, rr, req_label)
+
+    if dept_fid and (department or "").strip():
+        rfv[dept_fid] = {"value": (department or "").strip()}
+    if ad_fid:
+        rfv[ad_fid] = (ad_account or "").strip()
+    if phone_fid:
+        rfv[phone_fid] = phone_jira
+
+    if not allowed or "summary" in allowed:
+        rfv["summary"] = summary
+    if description_payload and (not allowed or "description" in allowed):
+        rfv["description"] = description_payload
+
+    if allowed and "labels" in allowed:
+        merge_chatbot_into_labels(rfv)
+    if allowed:
+        rfv = {k: v for k, v in rfv.items() if k in allowed}
+    else:
+        logger.debug("JSM KB: пустой список полей API — отправляем все собранные ключи")
+
+    if not rfv:
+        logger.error("JSM KB: нечего отправлять в requestFieldValues")
+        return False, "Не удалось сопоставить поля Jira для этого типа запроса. Проверьте .env."
+
+    payload = {
+        "serviceDeskId": str(service_desk_id),
+        "requestTypeId": str(request_type_id),
+        "requestFieldValues": rfv,
+    }
+    url = urljoin(base_url + "/", "rest/servicedeskapi/request")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=40)) as resp:
+                if resp.status in (200, 201):
+                    data = await resp.json()
+                    issue_key = (data.get("issueKey") or "").strip()
+                    if issue_key:
+                        logger.info("JSM KB: создана заявка %s", issue_key)
+                        assignee_username = (JIRA_AA.get("ASSIGNEE_USERNAME") or "").strip()
+                        if assignee_username and JIRA_AA.get("SET_ASSIGNEE", True):
+                            await _set_assignee(base_url, token, issue_key, assignee_username)
+                        if jira_username:
+                            try:
+                                await _set_reporter(base_url, token, issue_key, jira_username)
+                            except Exception as e:
+                                logger.warning("JSM KB: не удалось сменить автора %s: %s", issue_key, e)
+                        if not allowed or "labels" not in allowed:
+                            await _ensure_issue_has_chatbot_label(base_url, token, issue_key)
+                        return True, issue_key
+                text = await resp.text()
+                logger.warning("JSM KB create failed: %s %s", resp.status, text[:500])
+                return False, f"Ошибка Jira: {resp.status}. {(text or '')[:200]}"
+    except Exception as e:
+        logger.exception("JSM KB create: %s", e)
+        return False, str(e)
+
+
+async def create_aa_mail_browser_issue(
+    *,
+    full_name: str,
+    position: str,
+    department: str,
+    aa_edit_type: str,
+    ad_account: str,
+    existing_phone: str,
+    description: str,
+    jira_username: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    JSM AA: «Доступ к корпоративной почте через браузер» (чекбокс + те же базовые поля, что у чат-бота).
+    Конфиг JIRA_AA_MAIL_BROWSER_*; при пустых desk/request type подставляются значения из JIRA_AA_KB_CHATBOT_*.
+    """
+    jira = CONFIG.get("JIRA", {})
+    mb = CONFIG.get("JIRA_AA_MAIL_BROWSER") or {}
+    base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
+    token = (jira.get("TOKEN") or "").strip()
+    if not base_url or not token:
+        logger.error("JIRA LOGIN_URL или TOKEN не заданы")
+        return False, "Не настроено подключение к Jira."
+
+    service_desk_id = (mb.get("SERVICE_DESK_ID") or "").strip()
+    request_type_id = (mb.get("REQUEST_TYPE_ID") or "").strip()
+    if not service_desk_id or not request_type_id:
+        return False, (
+            "Заявка не настроена: задайте в .env JIRA_AA_MAIL_BROWSER_REQUEST_TYPE_ID "
+            "(или JIRA_AA_KB_CHATBOT_REQUEST_TYPE_ID) и при необходимости SERVICE_DESK_ID."
+        )
+
+    summary = sanitize_jira_text((mb.get("SUMMARY") or "Доступ к корпоративной почте через браузер").strip(), max_len=255)
+    desc_stripped = (description or "").strip()
+    description_payload = sanitize_jira_text(desc_stripped, max_len=4000) if desc_stripped else ""
+    phone_jira = normalize_phone_for_jira(existing_phone or "")
+
+    rows = await _jsm_fetch_request_type_field_rows(base_url, token, service_desk_id, request_type_id)
+    allowed = {r.get("fieldId") for r in rows if r.get("fieldId")}
+    if allowed:
+        logger.info("JSM MailBrowser: допустимые поля requestTypeId=%s: %s", request_type_id, sorted(allowed))
+
+    dept_fid = (JIRA_AA.get("FIELD_DEPARTMENT") or FIELDS.get("DEPARTMENT") or "").strip()
+    ad_fid = (FIELDS.get("AD_ACCOUNT") or "").strip()
+    phone_fid = (FIELDS.get("EXISTING_PHONE") or "").strip()
+
+    fn_fid = _kb_resolve_field_id(
+        rows, allowed, (mb.get("FIELD_FULL_NAME") or "").strip(), ("full name", "фио", "полное имя")
+    )
+    pos_fid = _kb_resolve_field_id(
+        rows, allowed, (mb.get("FIELD_POSITION") or "").strip(), ("position", "должност")
+    )
+    edit_fid = _kb_resolve_edit_type_field_id(
+        rows, allowed, list(mb.get("FIELD_EDIT_TYPE_CANDIDATES") or [])
+    )
+    mail_fid = _kb_resolve_field_id(
+        rows,
+        allowed,
+        (mb.get("FIELD_MAIL_BROWSER") or "").strip(),
+        (
+            "почт",
+            "браузер",
+            "корпоратив",
+            "owa",
+            "outlook",
+            "web",
+            "mail browser",
+            "доступ к корпоративной почте",
+        ),
+    )
+    req_fid = _kb_resolve_field_id(
+        rows,
+        allowed,
+        (mb.get("FIELD_REQUEST_TYPE_SELECT") or "").strip(),
+        ("request type", "тип запроса"),
+    )
+
+    rfv: Dict[str, Any] = {}
+
+    if fn_fid:
+        rfv[fn_fid] = sanitize_jira_text((full_name or "").strip(), max_len=255)
+    if pos_fid:
+        rfv[pos_fid] = sanitize_jira_text((position or "").strip(), max_len=255)
+
+    if edit_fid:
+        er = _kb_row_by_field_id(rows, edit_fid)
+        pl = _kb_select_option_payload(er, aa_edit_type)
+        val: Any = pl if pl is not None else {"value": aa_edit_type}
+        rfv[edit_fid] = [val] if _kb_expects_option_array(er) else val
+
+    if mail_fid:
+        mr = _kb_row_by_field_id(rows, mail_fid)
+        mail_lbl = (mb.get("MAIL_BROWSER_OPTION_LABEL") or "").strip() or "Нужно"
+        _kb_put_option_in_rfv(rfv, mail_fid, mr, mail_lbl)
+
+    req_label = (mb.get("REQUEST_TYPE_OPTION_LABEL") or "").strip()
+    if req_fid and req_label:
+        rr = _kb_row_by_field_id(rows, req_fid)
+        _kb_put_option_in_rfv(rfv, req_fid, rr, req_label)
+
+    if dept_fid and (department or "").strip():
+        rfv[dept_fid] = {"value": (department or "").strip()}
+    if ad_fid:
+        rfv[ad_fid] = (ad_account or "").strip()
+    if phone_fid:
+        rfv[phone_fid] = phone_jira
+
+    if not allowed or "summary" in allowed:
+        rfv["summary"] = summary
+    if description_payload and (not allowed or "description" in allowed):
+        rfv["description"] = description_payload
+
+    if allowed and "labels" in allowed:
+        merge_chatbot_into_labels(rfv)
+    if allowed:
+        rfv = {k: v for k, v in rfv.items() if k in allowed}
+    else:
+        logger.debug("JSM MailBrowser: пустой список полей API — отправляем все собранные ключи")
+
+    if not rfv:
+        logger.error("JSM MailBrowser: нечего отправлять в requestFieldValues")
+        return False, "Не удалось сопоставить поля Jira для этого типа запроса. Проверьте .env."
+
+    payload = {
+        "serviceDeskId": str(service_desk_id),
+        "requestTypeId": str(request_type_id),
+        "requestFieldValues": rfv,
+    }
+    url = urljoin(base_url + "/", "rest/servicedeskapi/request")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=40)) as resp:
+                if resp.status in (200, 201):
+                    data = await resp.json()
+                    issue_key = (data.get("issueKey") or "").strip()
+                    if issue_key:
+                        logger.info("JSM MailBrowser: создана заявка %s", issue_key)
+                        assignee_username = (JIRA_AA.get("ASSIGNEE_USERNAME") or "").strip()
+                        if assignee_username and JIRA_AA.get("SET_ASSIGNEE", True):
+                            await _set_assignee(base_url, token, issue_key, assignee_username)
+                        if jira_username:
+                            try:
+                                await _set_reporter(base_url, token, issue_key, jira_username)
+                            except Exception as e:
+                                logger.warning("JSM MailBrowser: не удалось сменить автора %s: %s", issue_key, e)
+                        if not allowed or "labels" not in allowed:
+                            await _ensure_issue_has_chatbot_label(base_url, token, issue_key)
+                        return True, issue_key
+                text = await resp.text()
+                logger.warning("JSM MailBrowser create failed: %s %s", resp.status, text[:500])
+                return False, f"Ошибка Jira: {resp.status}. {(text or '')[:200]}"
+    except Exception as e:
+        logger.exception("JSM MailBrowser create: %s", e)
+        return False, str(e)
+
+
+async def create_aa_pc_account_issue(
+    *,
+    full_name: str,
+    position: str,
+    department: str,
+    ad_edit_type: str,
+    ad_account: str,
+    existing_phone: str,
+    copy_rights_source: str,
+    security_group_name: str,
+    description: str,
+    jira_username: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    JSM AA: «Учетная запись для входа на ПК» — поле AA AD Edit type (select) и опционально
+    «с кого копировать» / «имя группы безопасности». Конфиг JIRA_AA_PC_ACCOUNT_*.
+    """
+    jira = CONFIG.get("JIRA", {})
+    pc = CONFIG.get("JIRA_AA_PC_ACCOUNT") or {}
+    base_url = (jira.get("LOGIN_URL") or "").strip().rstrip("/")
+    token = (jira.get("TOKEN") or "").strip()
+    if not base_url or not token:
+        logger.error("JIRA LOGIN_URL или TOKEN не заданы")
+        return False, "Не настроено подключение к Jira."
+
+    service_desk_id = (pc.get("SERVICE_DESK_ID") or "").strip()
+    request_type_id = (pc.get("REQUEST_TYPE_ID") or "").strip()
+    if not service_desk_id or not request_type_id:
+        return False, (
+            "Заявка не настроена: задайте в .env JIRA_AA_PC_ACCOUNT_REQUEST_TYPE_ID "
+            "(или JIRA_AA_MAIL_BROWSER_REQUEST_TYPE_ID / JIRA_AA_KB_CHATBOT_REQUEST_TYPE_ID) "
+            "и при необходимости SERVICE_DESK_ID."
+        )
+
+    summary = sanitize_jira_text((pc.get("SUMMARY") or "Учетная запись для входа на ПК").strip(), max_len=255)
+    desc_stripped = (description or "").strip()
+    description_payload = sanitize_jira_text(desc_stripped, max_len=4000) if desc_stripped else ""
+    phone_jira = normalize_phone_for_jira(existing_phone or "")
+
+    rows = await _jsm_fetch_request_type_field_rows(base_url, token, service_desk_id, request_type_id)
+    allowed = {r.get("fieldId") for r in rows if r.get("fieldId")}
+    if allowed:
+        logger.info("JSM PCAccount: допустимые поля requestTypeId=%s: %s", request_type_id, sorted(allowed))
+
+    dept_fid = (JIRA_AA.get("FIELD_DEPARTMENT") or FIELDS.get("DEPARTMENT") or "").strip()
+    ad_fid = (FIELDS.get("AD_ACCOUNT") or "").strip()
+    phone_fid = (FIELDS.get("EXISTING_PHONE") or "").strip()
+
+    fn_fid = _kb_resolve_field_id(
+        rows, allowed, (pc.get("FIELD_FULL_NAME") or "").strip(), ("full name", "фио", "полное имя")
+    )
+    pos_fid = _kb_resolve_field_id(
+        rows, allowed, (pc.get("FIELD_POSITION") or "").strip(), ("position", "должност")
+    )
+    ad_edit_fid = _kb_resolve_field_id_candidates(
+        rows,
+        allowed,
+        list(pc.get("FIELD_AD_EDIT_TYPE_CANDIDATES") or []),
+        ("aa ad edit", "ad edit type", "требуем действ", "требуемые действ"),
+    )
+    copy_fid = _kb_resolve_field_id(
+        rows,
+        allowed,
+        (pc.get("FIELD_COPY_SOURCE") or "").strip(),
+        ("копир", "прав", "источник", "от кого", "у кого", "copy rights", "template"),
+    )
+    group_fid = _kb_resolve_field_id(
+        rows,
+        allowed,
+        (pc.get("FIELD_SECURITY_GROUP") or "").strip(),
+        ("групп", "безопасност", "security group", "имя групп", "ad group"),
+    )
+    pc_chk_fid = _kb_resolve_pc_account_service_checkbox_field_id(
+        rows,
+        allowed,
+        (pc.get("FIELD_PC_ACCOUNT") or "").strip(),
+        (pc.get("PC_OPTION_LABEL") or "").strip() or "Нужно",
+    )
+    req_fid = _kb_resolve_field_id(
+        rows,
+        allowed,
+        (pc.get("FIELD_REQUEST_TYPE_SELECT") or "").strip(),
+        ("request type", "тип запроса"),
+    )
+
+    rfv: Dict[str, Any] = {}
+
+    if fn_fid:
+        rfv[fn_fid] = sanitize_jira_text((full_name or "").strip(), max_len=255)
+    if pos_fid:
+        rfv[pos_fid] = sanitize_jira_text((position or "").strip(), max_len=255)
+
+    if ad_edit_fid:
+        er = _kb_row_by_field_id(rows, ad_edit_fid)
+        pl = _kb_select_option_payload(er, ad_edit_type)
+        val: Any = pl if pl is not None else {"value": ad_edit_type}
+        rfv[ad_edit_fid] = [val] if _kb_expects_option_array(er) else val
+
+    if copy_fid and (copy_rights_source or "").strip():
+        rfv[copy_fid] = sanitize_jira_text((copy_rights_source or "").strip().lower(), max_len=255)
+    if group_fid and (security_group_name or "").strip():
+        rfv[group_fid] = sanitize_jira_text((security_group_name or "").strip(), max_len=255)
+
+    if allowed and not pc_chk_fid:
+        return (
+            False,
+            "Не найден чекбокс сервиса «Учетная запись для входа на ПК» в полях JSM. "
+            "Укажите в .env JIRA_AA_PC_ACCOUNT_FIELD_PC_ACCOUNT=customfield_XXXXX "
+            "(из API полей request type) и при необходимости JIRA_AA_PC_ACCOUNT_PC_OPTION_LABEL.",
+        )
+
+    if pc_chk_fid:
+        cr = _kb_row_by_field_id(rows, pc_chk_fid)
+        pc_lbl = (pc.get("PC_OPTION_LABEL") or "").strip() or "Нужно"
+        _kb_put_option_in_rfv(rfv, pc_chk_fid, cr, pc_lbl)
+
+    req_label = (pc.get("REQUEST_TYPE_OPTION_LABEL") or "").strip()
+    if req_fid and req_label:
+        rr = _kb_row_by_field_id(rows, req_fid)
+        _kb_put_option_in_rfv(rfv, req_fid, rr, req_label)
+
+    if dept_fid and (department or "").strip():
+        rfv[dept_fid] = {"value": (department or "").strip()}
+    if ad_fid:
+        rfv[ad_fid] = (ad_account or "").strip()
+    if phone_fid:
+        rfv[phone_fid] = phone_jira
+
+    if not allowed or "summary" in allowed:
+        rfv["summary"] = summary
+    if description_payload and (not allowed or "description" in allowed):
+        rfv["description"] = description_payload
+
+    if allowed and "labels" in allowed:
+        merge_chatbot_into_labels(rfv)
+    if allowed:
+        rfv = {k: v for k, v in rfv.items() if k in allowed}
+    else:
+        logger.debug("JSM PCAccount: пустой список полей API — отправляем все собранные ключи")
+
+    if not rfv:
+        logger.error("JSM PCAccount: нечего отправлять в requestFieldValues")
+        return False, "Не удалось сопоставить поля Jira для этого типа запроса. Проверьте .env."
+
+    payload = {
+        "serviceDeskId": str(service_desk_id),
+        "requestTypeId": str(request_type_id),
+        "requestFieldValues": rfv,
+    }
+    url = urljoin(base_url + "/", "rest/servicedeskapi/request")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=40)) as resp:
+                if resp.status in (200, 201):
+                    data = await resp.json()
+                    issue_key = (data.get("issueKey") or "").strip()
+                    if issue_key:
+                        logger.info("JSM PCAccount: создана заявка %s", issue_key)
+                        assignee_username = (JIRA_AA.get("ASSIGNEE_USERNAME") or "").strip()
+                        if assignee_username and JIRA_AA.get("SET_ASSIGNEE", True):
+                            await _set_assignee(base_url, token, issue_key, assignee_username)
+                        if jira_username:
+                            try:
+                                await _set_reporter(base_url, token, issue_key, jira_username)
+                            except Exception as e:
+                                logger.warning("JSM PCAccount: не удалось сменить автора %s: %s", issue_key, e)
+                        if not allowed or "labels" not in allowed:
+                            await _ensure_issue_has_chatbot_label(base_url, token, issue_key)
+                        return True, issue_key
+                text = await resp.text()
+                logger.warning("JSM PCAccount create failed: %s %s", resp.status, text[:500])
+                return False, f"Ошибка Jira: {resp.status}. {(text or '')[:200]}"
+    except Exception as e:
+        logger.exception("JSM PCAccount create: %s", e)
+        return False, str(e)

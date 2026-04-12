@@ -201,6 +201,21 @@ def wms_settings_attachments_screen(*, added_count: int = 0) -> WizardScreen:
     )
 
 
+def wms_wait_products_department_screen(departments: Sequence[str]) -> WizardScreen:
+    return WizardScreen(
+        kind="wms_wait_products_department",
+        text="📦 <b>Товары в WAIT</b>\n\nВыберите ваше подразделение WMS:",
+        departments=departments,
+    )
+
+
+def wms_wait_products_description_screen() -> WizardScreen:
+    return WizardScreen(
+        kind="wms_wait_products_description",
+        text="📦 <b>Товары в WAIT</b>\n\n📝 Введите описание:",
+    )
+
+
 # ---------------------------------------------------------------------------
 # WMS: wms_psi_user
 # ---------------------------------------------------------------------------
@@ -521,6 +536,12 @@ _STATE_SCREEN_MAP: Dict[str, Callable[[Dict[str, Any]], WizardScreen]] = {
     "WMS_SETTINGS_ATTACHMENTS": lambda d: wms_settings_attachments_screen(
         added_count=len(d.get("attachments") or [])
     ),
+
+    # --- WMS Товары в WAIT ---
+    "WMS_WAIT_PRODUCTS_DEPARTMENT": lambda d: wms_wait_products_department_screen(
+        departments=d.get("departments") or []
+    ),
+    "WMS_WAIT_PRODUCTS_DESCRIPTION": lambda _: wms_wait_products_description_screen(),
 
     # --- WMS PSI ---
     "PSI_TITLE": lambda _: psi_title_screen(),

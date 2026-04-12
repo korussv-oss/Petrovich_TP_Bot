@@ -1,6 +1,7 @@
 """Логика роли «Системный администратор СТЦ»."""
 
 import asyncio
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import is_stc_sa
@@ -10,7 +11,7 @@ from user_storage import (
     get_linked_max_user_ids,
 )
 from core.support.issue_binding_registry import get_all_issue_keys, get_bindings_by_issue
-from core.jira_aa import get_issue_admin_details
+from core.jira_aa import get_issue_admin_details, get_issues_admin_details_batch
 from core.support.api import MY_TICKETS_EXCLUDED_STATUSES
 from core.jira_status_ru import jira_status_display_ru
 
@@ -83,7 +84,7 @@ async def can_stc_user_access_issue(channel_id: str, user_id: int, issue_key: st
 async def get_stc_assignee_tasks(channel_id: str, user_id: int) -> List[Dict[str, Any]]:
     """
     Список заявок из реестра (созданы через бота), где assignee == jira_username текущего СА СТЦ.
-    Все детали запрашиваются параллельно (asyncio.gather + семафор), чтобы избежать N+1 запросов к Jira.
+    Детали запрашиваются batch-запросом (JQL search), чтобы избежать N+1 запросов к Jira.
     """
     if not is_stc_sa(channel_id, user_id):
         return []
@@ -96,20 +97,25 @@ async def get_stc_assignee_tasks(channel_id: str, user_id: int) -> List[Dict[str
     if not all_keys:
         return []
 
-    semaphore = asyncio.Semaphore(5)
+    # Small TTL cache to speed up repeated UI opens (menu/back/back).
+    ttl = float((__import__("os").getenv("STC_TASKS_CACHE_TTL_SECONDS") or "15").strip() or "15")
+    global _stc_tasks_cache
+    try:
+        _stc_tasks_cache
+    except NameError:
+        _stc_tasks_cache = {}  # (jira_username) -> (ts_mono, tasks)
+    now = time.monotonic()
+    cached = _stc_tasks_cache.get(my_jira)
+    if cached and (now - float(cached[0])) < max(1.0, ttl):
+        return list(cached[1] or [])
 
-    async def _fetch(key: str):
-        async with semaphore:
-            return key, await get_issue_admin_details(key)
-
-    results = await asyncio.gather(*[_fetch(k) for k in all_keys], return_exceptions=True)
+    # Batch query: one HTTP call per up to 50 issues (inside get_issues_admin_details_batch)
+    details_batch = await get_issues_admin_details_batch(all_keys)
 
     from core.support.api import get_ticket_type_label
     tasks: List[Dict[str, Any]] = []
-    for result in results:
-        if isinstance(result, Exception):
-            continue
-        issue_key, info = result
+    for issue_key in all_keys:
+        info = details_batch.get((issue_key or "").strip().upper())
         if not info:
             continue
         assignee = _norm(info.get("assignee_username") or "")
@@ -137,6 +143,7 @@ async def get_stc_assignee_tasks(channel_id: str, user_id: int) -> List[Dict[str
             }
         )
     tasks.sort(key=lambda x: x.get("issue_key", ""), reverse=True)
+    _stc_tasks_cache[my_jira] = (now, list(tasks))
     return tasks
 
 

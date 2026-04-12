@@ -89,6 +89,7 @@ async def admin_profile(callback: CallbackQuery, state: FSMContext):
         f"<b>Email:</b> {_v('email')}\n"
         f"<b>Табельный номер:</b> {_v('employee_id')}\n"
         f"<b>Подразделение:</b> {_v('department')}\n"
+        f"<b>Должность:</b> {_v('position')}\n"
         f"<b>Подразделение WMS:</b> {_v('department_wms')}\n"
         f"<b>Jira username:</b> {_v('jira_username')}\n"
     )

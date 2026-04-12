@@ -135,6 +135,7 @@ def get_wms_subtype_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚨 Проблема в работе WMS", callback_data="wms_type_issue")],
         [InlineKeyboardButton(text="⚙️ Изменение настроек системы WMS", callback_data="wms_type_settings")],
+        [InlineKeyboardButton(text="⏳ Товары в WAIT", callback_data="wms_type_wait_products")],
         [InlineKeyboardButton(text="👤 Создать/изменить/удалить пользователя PSIwms", callback_data="wms_type_psi_user")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="wms_type_back")],
     ])

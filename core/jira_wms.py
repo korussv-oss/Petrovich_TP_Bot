@@ -1,8 +1,8 @@
 """
 Создание заявок в Jira проект PW (WMS).
 - «Проблема в работе WMS»: JSM с REQUEST_TYPE_ID (Type: Ошибка) или REST с issuetype Ошибка.
-- «Изменение настроек системы WMS» и «Пользователь PSIwms»: только JSM; в Jira у соответствующих
-  Request Type должен быть Issue Type = Поддержка (не Ошибка). Тип задаётся настройкой Request Type в Jira.
+- «Изменение настроек системы WMS», «Товары в WAIT» и «Пользователь PSIwms»: только JSM; у соответствующих
+  Request Type в Jira Issue Type = Поддержка (не Ошибка).
 Вложения: add_attachments_to_issue после создания заявки.
 """
 import logging
@@ -13,6 +13,7 @@ from urllib.parse import urljoin
 import aiohttp
 
 from config import CONFIG
+from core.jira_labels import JIRA_LABELS_CHATBOT, merge_chatbot_into_labels
 from core.wms_constants import WMS_PROCESSES
 from validators import sanitize_jira_text, validate_issue_key
 
@@ -39,9 +40,6 @@ def _process_field_payload(process: str) -> dict:
 
 MAX_ATTACHMENT_SIZE_MB = 10
 MAX_ATTACHMENTS_PER_ISSUE = 10
-
-LABEL_CHATBOT = "поддержка"
-
 
 async def _attach_temporary_file(
     base_url: str,
@@ -96,15 +94,19 @@ async def _get_jsm_request_type_allowed_fields(
         base_url + "/",
         f"rest/servicedeskapi/servicedesk/{service_desk_id}/requesttype/{request_type_id}/field",
     )
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "X-ExperimentalApi": "opt-in",
+    }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status != 200:
                     return set()
                 data = await resp.json()
-                values = data.get("values") or []
-                return {item["fieldId"] for item in values if item.get("fieldId")}
+                rows = list(data.get("requestTypeFields") or data.get("values") or [])
+                return {item["fieldId"] for item in rows if isinstance(item, dict) and item.get("fieldId")}
     except Exception as e:
         logger.warning("JSM WMS: не удалось получить поля request type: %s", e)
         return set()
@@ -140,6 +142,8 @@ async def _create_wms_via_servicedesk(
         request_field_values["summary"] = summary[:255] if summary else "Заявка по настройке WMS"
     if "description" in allowed or not allowed:
         request_field_values["description"] = description
+    if allowed and "labels" in allowed:
+        merge_chatbot_into_labels(request_field_values)
     if allowed:
         request_field_values = {k: v for k, v in request_field_values.items() if k in allowed}
     if not request_field_values:
@@ -164,6 +168,10 @@ async def _create_wms_via_servicedesk(
                     issue_key = data.get("issueKey")
                     if issue_key:
                         logger.info("WMS заявка создана через JSM: %s (Request type = Проблема в работе WMS)", issue_key)
+                        if not allowed or "labels" not in allowed:
+                            from core.jira_aa import _ensure_issue_has_chatbot_label
+
+                            await _ensure_issue_has_chatbot_label(base_url, token, issue_key)
                         return {"key": issue_key, "id": data.get("issueId")}
                 text = await resp.text()
                 logger.warning("JSM WMS create failed: %s %s", resp.status, text[:400])
@@ -252,7 +260,7 @@ async def create_wms_issue(
             "description": description,
             "issuetype": {"name": "Ошибка"},
             "priority": {"name": "Medium"},
-            "labels": [LABEL_CHATBOT],
+            "labels": list(JIRA_LABELS_CHATBOT),
             dept_field: {"value": department},
             process_field: process_payload,
             service_field: "Проблема в работе WMS",
@@ -302,6 +310,9 @@ async def _create_wms_request_via_servicedesk(
     allowed = await _get_jsm_request_type_allowed_fields(
         base_url, token, service_desk_id, request_type_id
     )
+    request_field_values = dict(request_field_values)
+    if allowed and "labels" in allowed:
+        merge_chatbot_into_labels(request_field_values)
     if allowed:
         request_field_values = {k: v for k, v in request_field_values.items() if k in allowed}
     if not request_field_values:
@@ -325,6 +336,10 @@ async def _create_wms_request_via_servicedesk(
                     data = await resp.json()
                     issue_key = data.get("issueKey")
                     if issue_key:
+                        if not allowed or "labels" not in allowed:
+                            from core.jira_aa import _ensure_issue_has_chatbot_label
+
+                            await _ensure_issue_has_chatbot_label(base_url, token, issue_key)
                         return {"key": issue_key, "id": data.get("issueId")}
                 text = await resp.text()
                 logger.warning("JSM WMS request failed: %s %s", resp.status, text[:400])
@@ -417,6 +432,72 @@ async def create_wms_settings(
                 await _set_reporter(base_url, token, issue_key, ju)
             except Exception as e:
                 logger.warning("WMS settings: не удалось сменить reporter для %s на %s: %s", issue_key, ju, e)
+        return True, issue_key
+    return False, (result or "Не удалось создать заявку.")
+
+
+WMS_WAIT_PRODUCTS_SUMMARY = "Товары в WAIT"
+
+
+async def create_wms_wait_products(
+    department: str,
+    description: str,
+    full_name: str = "",
+    phone: str = "",
+    jira_username: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    Заявка «Товары в WAIT» (JSM, Request Type REQUEST_TYPE_ID_WAIT_PRODUCTS).
+    Summary фиксированный, description — от пользователя; WMS SD Department — customfield_18215.
+    Priority в JSM для этого request type не задаём: в форме типа «Товары в WAIT» поле недоступно.
+    """
+    jira = CONFIG.get("JIRA", {})
+    wms = CONFIG.get("JIRA_WMS", {})
+    base_url = (jira.get("LOGIN_URL") or "").rstrip("/")
+    token = (jira.get("TOKEN") or "").strip()
+    if not base_url or not token:
+        logger.error("JIRA: не заданы LOGIN_URL или TOKEN")
+        return False, "Не настроено подключение к Jira."
+
+    service_desk_id = (wms.get("SERVICE_DESK_ID") or "").strip()
+    request_type_id = (wms.get("REQUEST_TYPE_ID_WAIT_PRODUCTS") or "1136").strip()
+    if not request_type_id:
+        return False, "Тип заявки «Товары в WAIT» не настроен (JIRA_WMS_REQUEST_TYPE_ID_WAIT_PRODUCTS)."
+
+    dept_field = (wms.get("FIELD_DEPARTMENT") or "customfield_18215").strip()
+    description = sanitize_jira_text((description or "").strip() or "Описание не предоставлено", max_len=4000)
+    if full_name or phone:
+        description = sanitize_jira_text(
+            f"Контактное лицо: {full_name or '—'}, {phone or '—'}\n\n" + description,
+            max_len=4000,
+        )
+    department = (department or "").strip()
+    if not department:
+        return False, "Укажите подразделение WMS."
+
+    request_field_values: Dict[str, Any] = {
+        "summary": sanitize_jira_text(WMS_WAIT_PRODUCTS_SUMMARY, max_len=255),
+        "description": description,
+        dept_field: {"value": department},
+    }
+    result = await _create_wms_request_via_servicedesk(
+        base_url=base_url,
+        token=token,
+        service_desk_id=service_desk_id,
+        request_type_id=request_type_id,
+        request_field_values=request_field_values,
+    )
+    if result and result.get("key"):
+        issue_key = result["key"]
+        logger.info("WMS заявка создана через JSM: %s (Request type = Товары в WAIT)", issue_key)
+        ju = (jira_username or "").strip()
+        if ju:
+            try:
+                from core.jira_aa import _set_reporter  # type: ignore[attr-defined]
+
+                await _set_reporter(base_url, token, issue_key, ju)
+            except Exception as e:
+                logger.warning("WMS wait products: не удалось сменить reporter для %s на %s: %s", issue_key, ju, e)
         return True, issue_key
     return False, (result or "Не удалось создать заявку.")
 

@@ -125,18 +125,21 @@ async def cancel_message(message: Message, state: FSMContext):
     await message.answer(**kwargs)
 
 
-# Приветствие для неавторизованных: при первом сообщении (не /start) просим отправить /start
+# Приветствие для неавторизованных: при любом сообщении без FSM (кроме /start и др. команд) — подсказка про /start.
+# Важно: Telegram не присылает событие «пользователь открыл чат»; ответ возможен только после его сообщения.
 WELCOME_UNREGISTERED = (
-    "Привет! Для работы с ботом отправьте команду /start."
+    "Привет! Чтобы начать работу, используй команду /start."
 )
 
 
-@router.message(StateFilter(None), F.text)
+@router.message(StateFilter(None))
 async def welcome_unregistered(message: Message, state: FSMContext):
     if is_user_registered(message.from_user.id):
         return
     text = (message.text or "").strip()
     if text.lower() in ("/start", "/cancel"):
+        return
+    if text.startswith("/"):
         return
     await message.answer(WELCOME_UNREGISTERED)
 

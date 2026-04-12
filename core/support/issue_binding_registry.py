@@ -6,6 +6,7 @@
 import json
 import logging
 import os
+import re
 import threading
 import time as _time_module
 from pathlib import Path
@@ -25,6 +26,93 @@ _registry_lock = threading.Lock()
 _registry_cache: Optional[List[Dict[str, Any]]] = None
 _registry_cache_loaded_at: float = 0.0
 _REGISTRY_CACHE_TTL = 15.0  # секунд; при записи обновляется немедленно
+_ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
+
+
+def sanitize_registry(*, save: bool = True) -> Dict[str, int]:
+    """
+    Санитаризация JSON-реестра привязок (не SQLite):
+    - удаляет записи без обязательных полей
+    - нормализует issue_key (strip/upper)
+    - удаляет дубликаты по (issue_key, channel_id, channel_user_id)
+    - заполняет created_at, если его нет
+
+    Возвращает статистику изменений: {"before": N, "after": M, "removed": R, "deduped": D, "fixed": F}
+    """
+    if use_sqlite_storage():
+        return {"before": 0, "after": 0, "removed": 0, "deduped": 0, "fixed": 0}
+
+    records = _load()
+    before = len(records)
+    out: list[dict] = []
+    seen: set[tuple[str, str, int]] = set()
+    removed = 0
+    deduped = 0
+    fixed = 0
+
+    import time as _time
+
+    for r in records:
+        if not isinstance(r, dict):
+            removed += 1
+            continue
+
+        issue_key_raw = r.get("issue_key")
+        channel_id_raw = r.get("channel_id")
+        user_id_raw = r.get("channel_user_id")
+
+        issue_key = (str(issue_key_raw).strip().upper() if issue_key_raw is not None else "")
+        channel_id = (str(channel_id_raw).strip() if channel_id_raw is not None else "")
+
+        try:
+            channel_user_id = int(user_id_raw)
+        except Exception:
+            channel_user_id = -1
+
+        if not issue_key or not channel_id or channel_user_id < 0:
+            removed += 1
+            continue
+        if not _ISSUE_KEY_RE.match(issue_key):
+            removed += 1
+            continue
+
+        key = (issue_key, channel_id, channel_user_id)
+        if key in seen:
+            deduped += 1
+            continue
+        seen.add(key)
+
+        # Нормализация + исправления
+        new_r = dict(r)
+        if new_r.get("issue_key") != issue_key:
+            new_r["issue_key"] = issue_key
+            fixed += 1
+        if new_r.get("channel_id") != channel_id:
+            new_r["channel_id"] = channel_id
+            fixed += 1
+        if new_r.get("channel_user_id") != channel_user_id:
+            new_r["channel_user_id"] = channel_user_id
+            fixed += 1
+
+        if not new_r.get("created_at"):
+            new_r["created_at"] = round(_time.time(), 2)
+            fixed += 1
+
+        out.append(new_r)
+
+    after = len(out)
+    changed = (after != before) or removed or deduped or fixed
+    if changed and save:
+        _save(out)
+        logger.info(
+            "Реестр: санитаризация выполнена (before=%s, after=%s, removed=%s, deduped=%s, fixed=%s)",
+            before,
+            after,
+            removed,
+            deduped,
+            fixed,
+        )
+    return {"before": before, "after": after, "removed": removed, "deduped": deduped, "fixed": fixed}
 
 
 def _load() -> List[Dict[str, Any]]:

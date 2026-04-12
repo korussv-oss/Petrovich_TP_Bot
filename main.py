@@ -205,6 +205,38 @@ async def main():
         logger.critical("Rubik уже запущен (singleton lock). Остановите второй экземпляр.")
         return
 
+    # Санитаризация реестра привязок на старте: удаляем явно битые/дублирующиеся записи,
+    # чтобы не было “шума” в фоновых циклах и в «Мои заявки».
+    if _env_flag_enabled("REGISTRY_SANITIZE_ON_START", True):
+        try:
+            from core.support.issue_binding_registry import sanitize_registry
+
+            sanitize_registry()
+        except Exception as e:
+            logger.warning("Реестр: санитаризация на старте не выполнена: %s", e)
+
+    # Санитаризация issue bindings при использовании SQLite.
+    if _env_flag_enabled("SQLITE_SANITIZE_ON_START", True):
+        try:
+            from core.storage import use_sqlite_storage
+            if use_sqlite_storage():
+                from core.storage.sqlite_backend import sanitize_issue_bindings
+                st = sanitize_issue_bindings(save=True)
+                if st.get("removed") or st.get("fixed"):
+                    logger.info("SQLite: issue_bindings sanitized: %s", st)
+        except Exception as e:
+            logger.warning("SQLite: санитаризация на старте не выполнена: %s", e)
+
+    # Мягкая санитаризация file-backed FSM (удаляем только явно битые записи).
+    if _env_flag_enabled("FSM_SANITIZE_ON_START", True):
+        try:
+            from core.fsm_sanitize import sanitize_fsm_file
+            st = sanitize_fsm_file("data/fsm_state.json", save=True)
+            if st.get("removed"):
+                logger.info("FSM: sanitized: %s", st)
+        except Exception as e:
+            logger.warning("FSM: санитаризация на старте не выполнена: %s", e)
+
     telegram_token_present = bool((CONFIG.get("TELEGRAM", {}) or {}).get("TOKEN", "").strip())
     # Совместимость с the_bot_on_dute: USED_TELEGRAMM=0 принудительно отключает Telegram.
     telegram_enabled = telegram_token_present and _env_flag_enabled("USED_TELEGRAMM", True)

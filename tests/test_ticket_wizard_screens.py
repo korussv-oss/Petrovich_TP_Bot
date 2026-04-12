@@ -105,6 +105,20 @@ class TestWmsSettingsScreens(unittest.TestCase):
         self.assertIn("3", screen.text)
 
 
+class TestWmsWaitProductsScreens(unittest.TestCase):
+
+    def test_department_screen(self):
+        deps = ["Склад А", "Склад Б"]
+        screen = ticket_wizard.wms_wait_products_department_screen(deps)
+        self.assertEqual(screen.kind, "wms_wait_products_department")
+        self.assertEqual(list(screen.departments), deps)
+
+    def test_description_screen(self):
+        screen = ticket_wizard.wms_wait_products_description_screen()
+        self.assertEqual(screen.kind, "wms_wait_products_description")
+        self.assertIn("описание", screen.text.lower())
+
+
 # ---------------------------------------------------------------------------
 # PSI User
 # ---------------------------------------------------------------------------

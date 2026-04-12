@@ -15,7 +15,8 @@ from core.jira_status_ru import jira_status_display_ru
 
 logger = logging.getLogger(__name__)
 
-# Состояние polling-offset по update_id, чтобы после рестарта MAX не переобрабатывал “старые” команды.
+# Смещение long polling: в файле хранится значение, которое передаём в следующий запрос как marker/offset
+# (для Bot API это обычно max(update_id)+1 из последней принятой пачки). Иначе после рестарта MAX отдаёт очередь заново.
 _MAX_POLL_STATE_FILE = Path(__file__).resolve().parents[2] / "data" / "max_poll_state.json"
 
 
@@ -45,6 +46,7 @@ def _get_max_last_update_id(token: str) -> int | None:
     if not token_key:
         return None
     state = _load_max_poll_state()
+    # Имя ключа историческое; фактически это «следующий» marker/offset, не сырой update_id.
     last = state.get(token_key, {}).get("last_update_id")
     try:
         return int(last) if last is not None else None
@@ -651,7 +653,26 @@ async def _get_updates_raw_botapi(
 
     try:
         async with session.get(url, params=params, headers=headers) as resp:
-            data = await resp.json(content_type=None)
+            if getattr(resp, "status", 200) != 200:
+                try:
+                    text = await resp.text()
+                except Exception:
+                    text = ""
+                # Do not spam logs if endpoint is unstable
+                try:
+                    from core.log_rate_limit import log_rate_limited
+                    log_rate_limited(
+                        logger.warning,
+                        key=f"max:botapi:updates:{resp.status}",
+                        interval_seconds=60.0,
+                        msg="MAX botapi /updates: HTTP %s %s",
+                        args=(resp.status, (text or "")[:300]),
+                    )
+                except Exception:
+                    pass
+                data = {}
+            else:
+                data = await resp.json(content_type=None)
     finally:
         if temp_session:
             try:
@@ -947,8 +968,10 @@ async def _handle_open_issue_max(user_id: int, callback_id: str) -> dict | None:
     from user_storage import is_user_registered
     from core.support.api import support_api
     import asyncio
+    import time
+    import os
     from core.storage import use_sqlite_storage
-    from core.jira_aa import get_issue_info, get_issue_comments
+    from core.jira_aa import get_issue_info, get_issue_comments_tail
     CHANNEL_ID = "max"
     back_btn = [{"id": "back_to_main", "label": "🔙 В главное меню"}]
     if not is_user_registered(user_id, CHANNEL_ID):
@@ -960,9 +983,22 @@ async def _handle_open_issue_max(user_id: int, callback_id: str) -> dict | None:
         owns = support_api.user_owns_issue(CHANNEL_ID, user_id, issue_key)
     if not issue_key or not owns:
         return {"text": "Заявка не найдена.", "parse_mode": "HTML", "buttons": back_btn}
+    # Short TTL cache for open_issue view to speed up repeated opens.
+    ttl = float(os.getenv("OPEN_ISSUE_CACHE_TTL_SECONDS", "10"))
+    global _open_issue_cache_max
+    try:
+        _open_issue_cache_max
+    except NameError:
+        _open_issue_cache_max = {}  # (user_id, issue_key) -> (ts_mono, response)
+    now = time.monotonic()
+    ik = (int(user_id), (issue_key or "").strip().upper())
+    cached = _open_issue_cache_max.get(ik)
+    if cached and ttl > 0 and (now - float(cached[0])) < ttl:
+        return dict(cached[1])
+
     # Пункт 3 плана: более жёсткие таймауты для интерактивного UI (общее ожидание, включая retries).
     info = await get_issue_info(issue_key, timeout_total=3.0)
-    comments = await get_issue_comments(issue_key, timeout_total=3.0)
+    tail = await get_issue_comments_tail(issue_key, limit=10, timeout_total=3.0)
     summary = (info or {}).get("summary") or "—"
     status = jira_status_display_ru((info or {}).get("status"))
     def _fmt(comments_list, max_len=200):
@@ -974,8 +1010,9 @@ async def _handle_open_issue_max(user_id: int, callback_id: str) -> dict | None:
                 body = body[:max_len] + "..."
             out.append(f"👤 {author}: {body}")
         return out
-    comm_note = "\n\n⚠️ Не удалось загрузить комментарии из Jira." if comments is None else ""
-    lines = _fmt(comments if comments is not None else [])
+    comments_list = tail.comments if tail and tail.comments is not None else []
+    comm_note = "\n\n⚠️ Не удалось загрузить комментарии из Jira." if not tail or tail.comments is None else ""
+    lines = _fmt(comments_list)
     jira_url = support_api.get_jira_customer_request_url(issue_key)
     jira_line = f'\n🔗 <a href="{jira_url}">Открыть заявку в Jira</a>' if jira_url else ""
     text = (
@@ -989,12 +1026,14 @@ async def _handle_open_issue_max(user_id: int, callback_id: str) -> dict | None:
         {"id": "my_tickets", "label": "🔙 К списку заявок"},
         {"id": "back_to_main", "label": "🔙 В главное меню"},
     ]
-    return {"text": text, "parse_mode": "HTML", "buttons": buttons}
+    resp = {"text": text, "parse_mode": "HTML", "buttons": buttons}
+    _open_issue_cache_max[ik] = (now, dict(resp))
+    return resp
 
 
 async def _handle_stc_open_issue_max(user_id: int, issue_key: str) -> dict:
     from core.stc_tasks import can_stc_user_access_issue, get_stc_assignee_tasks
-    from core.jira_aa import get_issue_admin_details, get_issue_comments
+    from core.jira_aa import get_issue_admin_details, get_issue_comments_tail
     from core.support.api import support_api
     from config import is_stc_sa
 
@@ -1010,10 +1049,23 @@ async def _handle_stc_open_issue_max(user_id: int, issue_key: str) -> dict:
                 {"id": "back_to_main", "label": "🔙 В главное меню"},
             ],
         }
+    # Short TTL cache for card view to speed up back/forward in UI.
+    ttl = float(os.getenv("STC_OPEN_ISSUE_CACHE_TTL_SECONDS", "10"))
+    global _stc_open_issue_cache
+    try:
+        _stc_open_issue_cache
+    except NameError:
+        _stc_open_issue_cache = {}  # issue_key -> (ts_mono, response)
+    now = time.monotonic()
+    cache_key = (issue_key or "").strip().upper()
+    cached = _stc_open_issue_cache.get(cache_key)
+    if cached and ttl > 0 and (now - float(cached[0])) < ttl:
+        return dict(cached[1])
+
     info = await get_issue_admin_details(issue_key) or {}
-    comments = await get_issue_comments(issue_key)
-    comments_list = comments if comments is not None else []
-    comments_warn = "\n\n⚠️ Не удалось загрузить комментарии из Jira." if comments is None else ""
+    tail = await get_issue_comments_tail(issue_key, limit=5, timeout_total=3.0)
+    comments_list = tail.comments if tail and tail.comments is not None else []
+    comments_warn = "\n\n⚠️ Не удалось загрузить комментарии из Jira." if not tail or tail.comments is None else ""
     creator = "—"
     req_label = "—"
     for t in await get_stc_assignee_tasks("max", user_id):
@@ -1054,7 +1106,9 @@ async def _handle_stc_open_issue_max(user_id: int, issue_key: str) -> dict:
         {"id": "sa_stc_my_tasks", "label": "🔙 К моим задачам"},
         {"id": "back_to_main", "label": "🔙 В главное меню"},
     ]
-    return {"text": text, "parse_mode": "HTML", "buttons": buttons}
+    resp = {"text": text, "parse_mode": "HTML", "buttons": buttons}
+    _stc_open_issue_cache[cache_key] = (now, dict(resp))
+    return resp
 
 
 async def _handle_stc_callback_max(user_id: int, callback_id: str) -> dict:
@@ -1141,20 +1195,60 @@ async def _handle_stc_callback_max(user_id: int, callback_id: str) -> dict:
                         return t
             return None
 
+        def _done_candidates() -> list[dict]:
+            def norm(s: str) -> str:
+                return (s or "").strip().lower()
+            out: list[dict] = []
+            for t in transitions:
+                to_name = norm(t.get("to_name") or "")
+                name = norm(t.get("name") or "")
+                blob = f"{to_name} {name}".strip()
+                if any(x in blob for x in ("resolved", "resolve", "done", "close", "closed", "готов", "выполн", "закры", "решен", "решён")):
+                    tid = (t.get("id") or "").strip()
+                    if tid:
+                        out.append(t)
+            # Временно скрываем переходы, которые ведут к авто-созданию НИСП.
+            out = [
+                t for t in out
+                if "нисп" not in (((t.get("name") or "") + " " + (t.get("to_name") or "")).strip().lower())
+            ]
+            # Deterministic order for stable UI.
+            out.sort(key=lambda t: ((t.get("name") or ""), (t.get("to_name") or "")))
+            return out
+
         ordered = [
             ("in_progress", "🟢 В работе"),
             ("pause", "⏸ Пауза"),
             ("done", "✅ Готово"),
         ]
         for kind, label in ordered:
-            t = _pick_transition(kind)
-            if not t:
+            if kind != "done":
+                t = _pick_transition(kind)
+                if not t:
+                    continue
+                tid = (t.get("id") or "").strip()
+                if not tid:
+                    continue
+                cb = f"stc_ask_timespent:{issue_key}:{tid}" if _needs_timespent(t) else f"stc_apply_status:{issue_key}:{tid}"
+                buttons.append({"id": cb, "label": label})
                 continue
-            tid = (t.get("id") or "").strip()
-            if not tid:
+
+            done = _done_candidates()
+            if not done:
                 continue
-            cb = f"stc_ask_timespent:{issue_key}:{tid}" if _needs_timespent(t) else f"stc_apply_status:{issue_key}:{tid}"
-            buttons.append({"id": cb, "label": label})
+            # If multiple "Resolved" transitions exist (e.g., one creates NISP), show separate buttons.
+            if len(done) == 1:
+                t = done[0]
+                tid = (t.get("id") or "").strip()
+                cb = f"stc_ask_timespent:{issue_key}:{tid}" if _needs_timespent(t) else f"stc_apply_status:{issue_key}:{tid}"
+                buttons.append({"id": cb, "label": label})
+            else:
+                for t in done[:2]:
+                    tid = (t.get("id") or "").strip()
+                    if not tid:
+                        continue
+                    cb = f"stc_ask_timespent:{issue_key}:{tid}" if _needs_timespent(t) else f"stc_apply_status:{issue_key}:{tid}"
+                    buttons.append({"id": cb, "label": label})
         buttons.append({"id": f"stc_open_issue:{issue_key}", "label": "⬅️ Назад"})
         return {
             "text": f"🔄 <b>Установить статус</b>\n\nЗаявка: {issue_key}\nВыберите новый статус:",
@@ -1484,7 +1578,9 @@ async def run_max_bot() -> None:
     if not token:
         logger.info("MAX: MAX_BOT_TOKEN не задан, бот в MAX не запускается")
         return
-    max_cooldown = float(os.getenv("ANTISPAM_COOLDOWN", "1.5"))
+    # Separate cooldown for MAX to avoid accidental large values from shared ANTISPAM_COOLDOWN.
+    # Fallback to ANTISPAM_COOLDOWN for backward compatibility.
+    max_cooldown = float(os.getenv("MAX_ANTISPAM_COOLDOWN", os.getenv("ANTISPAM_COOLDOWN", "1.5")))
     max_updates_timeout = int(os.getenv("MAX_UPDATES_TIMEOUT_SECONDS", "5"))
     max_updates_timeout = max(1, min(30, max_updates_timeout))
     max_updates_limit = int(os.getenv("MAX_UPDATES_LIMIT", "20"))
@@ -1500,6 +1596,9 @@ async def run_max_bot() -> None:
         email_flow,
         email_forwarding_flow,
         email_groups_flow,
+        kb_chatbot_flow,
+        mail_browser_flow,
+        pc_account_flow,
         orgtech_flow,
         peripheral_flow,
         network_flow,
@@ -1516,6 +1615,13 @@ async def run_max_bot() -> None:
         # marker для /updates: защищает от повторной доставки тех же апдейтов
         persisted_marker = _get_max_last_update_id(token)
         next_marker: int | None = persisted_marker
+        logger.info(
+            "MAX: polling transport=%s, сохранённый offset/marker=%s (файл %s). "
+            "Если None — платформа отдаст все непрочитанные апдейты из очереди (в т.ч. старые нажатия кнопок).",
+            max_poll_transport,
+            persisted_marker,
+            _MAX_POLL_STATE_FILE,
+        )
         # Дедуп на случай, если апдейт пришёл без update_id (встречается у некоторых реализаций MAX API)
         recent_noid: dict[str, float] = {}
         while True:
@@ -1564,7 +1670,7 @@ async def run_max_bot() -> None:
                         max_update_id = iv if max_update_id is None else max(max_update_id, iv)
                 if max_update_id is not None:
                     next_marker = max_update_id + 1
-                    _set_max_last_update_id(token, max_update_id)
+                    _set_max_last_update_id(token, next_marker)
             for raw in raw_updates:
                 if not isinstance(raw, dict):
                     continue
@@ -1603,8 +1709,16 @@ async def run_max_bot() -> None:
                             )
                         continue
 
-                    # Антиспам для MAX: ограничиваем частоту событий от одного user_id
-                    if _is_max_rate_limited(user_id, max_cooldown):
+                    # Антиспам для MAX: ограничиваем частоту событий от одного user_id.
+                    # Важно: навигационные callbacks должны проходить всегда, иначе кнопка "залипает"
+                    # до таймаута клиента (кажется как "бот долго думает").
+                    bypass_throttle = False
+                    if isinstance(source, tuple) and source[0] == "callback":
+                        cb = str(source[1] or "")
+                        if cb in ("back_to_main", "my_tickets", "sa_stc_menu", "sa_stc_my_tasks", "cancel"):
+                            bypass_throttle = True
+                    if not bypass_throttle and _is_max_rate_limited(user_id, max_cooldown):
+                        logger.debug("MAX: throttled event user_id=%s source=%r cooldown=%.2fs", user_id, source, max_cooldown)
                         continue
 
                     if source == "start":
@@ -1672,6 +1786,18 @@ async def run_max_bot() -> None:
                                 response = handle_start(user_id)
                         elif callback_id == "tp_email_owa_outlook":
                             response = await email_flow.start_email_owa(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "tp_access_kb_chatbot":
+                            response = await kb_chatbot_flow.start_kb_chatbot(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "tp_access_mail_browser":
+                            response = await mail_browser_flow.start_mail_browser(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "tp_access_pc_account":
+                            response = await pc_account_flow.start_pc_account(user_id)
                             if response is None:
                                 response = handle_start(user_id)
                         elif callback_id == "tp_email_forwarding":
@@ -1868,7 +1994,7 @@ async def run_max_bot() -> None:
                                 callback_id.startswith("wms_dept")
                                 or callback_id.startswith("wms_process_")
                                 or callback_id == "cancel"
-                                or callback_id in ("wms_type_issue", "wms_type_settings", "wms_type_psi_user", "wms_type_back", "wms_show_subtype", "wms_skip_description", "wms_finish_ticket", "finish_wms_settings", "finish_psi_user", "skip_psi_attachment", "wms_service_topology", "wms_service_other")
+                                or callback_id in ("wms_type_issue", "wms_type_settings", "wms_type_wait_products", "wms_type_psi_user", "wms_type_back", "wms_show_subtype", "wms_skip_description", "wms_finish_ticket", "finish_wms_settings", "finish_psi_user", "skip_psi_attachment", "wms_service_topology", "wms_service_other")
                             )
                         ):
                             response = await wms_flow.handle_wms_callback(user_id, callback_id)
@@ -1881,7 +2007,7 @@ async def run_max_bot() -> None:
                                 ticket_type_id = ct.get("ticket_type_id") or "wms_issue"
                                 from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
 
-                                if ticket_type_id == "wms_settings":
+                                if ticket_type_id in ("wms_settings", "wms_wait_products"):
                                     response = await max_submit_ticket_with_profile_department(
                                         bot, user_id, ticket_type_id, form_data, attachment_tokens, wms_attach_after_create=False
                                     )
@@ -2016,6 +2142,54 @@ async def run_max_bot() -> None:
                                 success, issue_key, user_msg = await support_api.create_ticket("max", user_id, "email_groups", form_data)
                                 msg_show = user_msg if success else issue_key
                                 response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                        elif kb_chatbot_flow.is_in_kb_chatbot_flow(user_id) and (
+                            callback_id == "cancel"
+                            or callback_id == "aa_kb_restart_flow"
+                            or callback_id in ("aa_kb_edit_create", "aa_kb_edit_edit")
+                        ):
+                            response = await kb_chatbot_flow.handle_kb_chatbot_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot, user_id, "aa_kb_chatbot", form_data, [], wms_attach_after_create=False
+                                )
+                        elif mail_browser_flow.is_in_mail_browser_flow(user_id) and (
+                            callback_id == "cancel"
+                            or callback_id == "aa_mail_restart_flow"
+                            or callback_id in ("aa_mail_edit_create", "aa_mail_edit_edit")
+                        ):
+                            response = await mail_browser_flow.handle_mail_browser_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot, user_id, "aa_mail_browser", form_data, [], wms_attach_after_create=False
+                                )
+                        elif pc_account_flow.is_in_pc_account_flow(user_id) and (
+                            callback_id == "cancel"
+                            or callback_id == "aa_pc_restart_flow"
+                            or callback_id in ("aa_pc_action_copy", "aa_pc_action_unlock", "aa_pc_action_group")
+                        ):
+                            response = await pc_account_flow.handle_pc_account_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot, user_id, "aa_pc_account", form_data, [], wms_attach_after_create=False
+                                )
                         elif callback_id == "admin_detailed_report":
                             from config import is_channel_admin
                             from core.admin_ticket_report import build_admin_detailed_report
@@ -2353,10 +2527,14 @@ async def run_max_bot() -> None:
                                     ],
                                 }
                         elif not _is_user_registered_max(user_id, "max"):
+                            # Как в Telegram: подсказка после первого сообщения (в MAX нет события «открыл чат»).
                             response = {
-                                "text": "Привет! Для работы с ботом отправьте команду /start.",
+                                "text": (
+                                    "Привет! Чтобы начать работу, используй команду <b>/start</b> "
+                                    "или нажми кнопку ниже."
+                                ),
                                 "parse_mode": "HTML",
-                                "buttons": [],
+                                "buttons": [{"id": "back_to_main", "label": "▶️ Открыть меню"}],
                             }
                         else:
                             payload = raw.get("payload") or raw
@@ -2430,6 +2608,9 @@ async def run_max_bot() -> None:
                                 or email_flow.is_in_email_owa_flow(user_id)
                                 or email_forwarding_flow.is_in_email_forwarding_flow(user_id)
                                 or email_groups_flow.is_in_email_groups_flow(user_id)
+                                or kb_chatbot_flow.is_in_kb_chatbot_flow(user_id)
+                                or mail_browser_flow.is_in_mail_browser_flow(user_id)
+                                or pc_account_flow.is_in_pc_account_flow(user_id)
                             )
                             if (user_id in _pending_admin_delete_search_max) and (not in_any_flow):
                                 _pending_admin_delete_search_max.pop(user_id, None)
@@ -2591,7 +2772,7 @@ async def run_max_bot() -> None:
                                     ticket_type_id = ct.get("ticket_type_id") or "wms_issue"
                                     from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
 
-                                    if ticket_type_id == "wms_settings":
+                                    if ticket_type_id in ("wms_settings", "wms_wait_products"):
                                         response = await max_submit_ticket_with_profile_department(
                                             bot, user_id, ticket_type_id, form_data, attachment_tokens, wms_attach_after_create=False
                                         )
@@ -2697,6 +2878,42 @@ async def run_max_bot() -> None:
                                     success, issue_key, user_msg = await support_api.create_ticket("max", user_id, "email_groups", form_data)
                                     msg_show = user_msg if success else issue_key
                                     response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                            elif kb_chatbot_flow.is_in_kb_chatbot_flow(user_id):
+                                response = await kb_chatbot_flow.handle_kb_chatbot_message(user_id, text, attachment_list=attachment_list)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, "aa_kb_chatbot", form_data, [], wms_attach_after_create=False
+                                    )
+                            elif mail_browser_flow.is_in_mail_browser_flow(user_id):
+                                response = await mail_browser_flow.handle_mail_browser_message(user_id, text, attachment_list=attachment_list)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, "aa_mail_browser", form_data, [], wms_attach_after_create=False
+                                    )
+                            elif pc_account_flow.is_in_pc_account_flow(user_id):
+                                response = await pc_account_flow.handle_pc_account_message(user_id, text, attachment_list=attachment_list)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, "aa_pc_account", form_data, [], wms_attach_after_create=False
+                                    )
                             elif lupa_flow.is_in_lupa_flow(user_id):
                                 response = await lupa_flow.handle_lupa_message(user_id, text)
                                 if response is None:

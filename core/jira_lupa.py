@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 import aiohttp
 
 from config import CONFIG
+from core.jira_labels import JIRA_LABELS_CHATBOT
 from validators import sanitize_jira_text
 
 logger = logging.getLogger(__name__)
@@ -139,7 +140,7 @@ async def create_lupa_issue(
             "description": description,
             "issuetype": {"name": issue_type},
             "priority": {"name": "Medium"},
-            "labels": ["чатбот"],
+            "labels": list(JIRA_LABELS_CHATBOT),
             f_problematic: {"value": problematic_service},
             f_request_type: {"value": request_type},
             f_subdivision: {"id": subdivision_id},

@@ -3,7 +3,7 @@
 Доставка в оба канала (Telegram и MAX). При уведомлении о комментарии — кнопка «Написать комментарий».
 
 Покрываются все типы заявок, попадающие в реестр при создании:
-  wms_issue, wms_settings, wms_psi_user (PW), lupa_search (WHD), rubik_password_change (AA).
+  wms_issue, wms_settings, wms_wait_products, wms_psi_user (PW), lupa_search (WHD), rubik_password_change (AA), aa_kb_chatbot (AA), aa_mail_browser (AA), aa_pc_account (AA).
 Фильтрации по ticket_type_id нет — проверяются все issue_key из реестра.
 """
 import asyncio
@@ -520,31 +520,31 @@ async def check_registry_statuses_and_notify() -> None:
             logger.warning("Ошибка обработки статуса %s: %s", issue_key, e)
 
 
-async def check_registry_comments_and_notify() -> None:
+async def check_registry_comments_and_notify() -> dict:
     """
     Проверяет новые комментарии по заявкам из реестра. Доставка в TG и MAX.
     Кнопка «Написать комментарий» (add_comment:{issue_key}).
+
+    Возвращает статистику тика для backoff.
     """
     from core.jira_aa import get_issue_comments
 
     # Защита от “волны” уведомлений при резком росте числа комментариев
-    # (часто бывает после рестарта/изменений способа выборки комментариев).
     comments_wave_delta_threshold = int(os.getenv("COMMENTS_WAVE_DELTA_THRESHOLD", "20"))
-    # При last_comment_count==0 и несвежей привязке молчаливая синхронизация нужна против «волны»
-    # после сброшенного state; но при малых current_count это отрезает законный первый комментарий
-    # (пользователь создал заявку, подождал > окна «свежести», появился первый публичный комментарий).
     zero_baseline_skip_min = max(2, int(os.getenv("COMMENTS_ZERO_BASELINE_SKIP_MIN", "8")))
 
-    # Автоочистка реестра для issue_key, которые стабильно не читаются Jira (404/401).
     comments_cleanup_threshold = int(os.getenv("COMMENTS_CLEANUP_ERROR_STREAK_THRESHOLD", "5"))
     comments_cleanup_window_hours = float(os.getenv("COMMENTS_CLEANUP_ERROR_STREAK_WINDOW_HOURS", "12"))
-    comments_cleanup_statuses = {s.strip() for s in os.getenv("COMMENTS_CLEANUP_ERROR_STATUSES", "404,401").split(",") if s.strip()}
+    comments_cleanup_statuses = {
+        s.strip()
+        for s in os.getenv("COMMENTS_CLEANUP_ERROR_STATUSES", "404,401,410").split(",")
+        if s.strip()
+    }
 
     issue_keys = get_all_issue_keys()
     if not issue_keys:
-        return
-    # Чтобы бот не "зависал" на большом реестре, проверяем ограниченное количество заявок за тик
-    # и ходим по ним по кругу (round-robin).
+        return {"total": 0, "ok": 0, "rate_limited": 0, "server_error": 0, "auth_error": 0, "other_error": 0}
+
     per_tick = max(5, int(os.getenv("COMMENTS_ISSUES_PER_TICK", "15")))
     global _comments_rr_cursor
     try:
@@ -559,213 +559,197 @@ async def check_registry_comments_and_notify() -> None:
 
     include_internal = (os.getenv("COMMENTS_INCLUDE_INTERNAL") or "").strip().lower() in ("1", "true", "yes", "on")
 
-    for issue_key in window:
-        try:
-            recipients = get_user_ids_by_issue(issue_key)
-            recipients = _expand_recipients_to_linked_channels(recipients)
-            if not recipients:
-                continue
-            comments_resp = await get_issue_comments(issue_key, return_http_status=True, include_internal=include_internal)
-            # comments_resp: (comments_or_none, http_status_or_none)
-            comments, http_status = comments_resp if isinstance(comments_resp, tuple) and len(comments_resp) == 2 else (None, None)
-            if comments is None:
-                # Автоочистка реестра при стабильно повторяющихся HTTP ошибках.
-                if http_status is not None and str(http_status) in comments_cleanup_statuses:
-                    now_ts = time.time()
-                    key = (issue_key or "").strip().upper()
-                    if key:
-                        state = _load_state()
-                        rec = state.get(key, {})
-                        last_err = rec.get("jira_comment_error_streak") or {}
-                        last_status = last_err.get("status")
-                        last_count = int(last_err.get("count") or 0)
-                        last_ts = last_err.get("last_ts")
-                        try:
-                            last_ts_f = float(last_ts) if last_ts is not None else None
-                        except Exception:
-                            last_ts_f = None
+    # Concurrency controls + state lock to avoid file races
+    max_concurrency = max(1, int(os.getenv("COMMENTS_JIRA_CONCURRENCY", "4")))
+    sem = asyncio.Semaphore(max_concurrency)
+    global _comments_state_lock
+    try:
+        _comments_state_lock
+    except NameError:
+        _comments_state_lock = asyncio.Lock()
 
-                        # Сбрасываем streak, если статус другой или прошло слишком много времени.
-                        if last_status != str(http_status) or last_ts_f is None or (now_ts - last_ts_f) > comments_cleanup_window_hours * 3600:
-                            new_count = 1
-                        else:
-                            new_count = last_count + 1
+    stats = {"total": len(window), "ok": 0, "rate_limited": 0, "server_error": 0, "auth_error": 0, "other_error": 0}
 
-                        rec["jira_comment_error_streak"] = {"status": str(http_status), "count": new_count, "last_ts": now_ts}
-                        state[key] = rec
-                        _save_state(state)
+    async def _process_issue(issue_key: str) -> None:
+        async with sem:
+            try:
+                recipients = get_user_ids_by_issue(issue_key)
+                recipients = _expand_recipients_to_linked_channels(recipients)
+                if not recipients:
+                    return
 
-                        if (
-                            new_count >= comments_cleanup_threshold
-                            and not _is_recent_issue_binding(issue_key)
-                        ):
-                            from core.support.issue_binding_registry import remove_bindings_by_issue
+                res = await get_issue_comments(issue_key, return_http_status=True, include_internal=include_internal)
+                comments = getattr(res, "comments", None)
+                http_status = getattr(res, "http_status", None)
 
-                            removed = remove_bindings_by_issue(issue_key)
-                            logger.warning(
-                                "Комментарии %s: Jira стабильно отвечает HTTP %s (streak=%s). Удалены привязки: %s",
-                                issue_key,
-                                http_status,
-                                new_count,
-                                removed,
-                            )
-                            # Чтобы не продолжать попытки уведомлений по этому issue_key в цикле состояния.
-                            # Привязки удалятся из реестра, но базу счётчика на всякий случай обновим.
-                            _set_last_comment_count(issue_key, 0)
-                            # Сбросим streak.
-                            state2 = _load_state()
-                            k2 = (issue_key or "").strip().upper()
-                            if k2 and k2 in state2:
-                                state2[k2].pop("jira_comment_error_streak", None)
-                                _save_state(state2)
-                continue
-            current_count = len(comments)
-            last_count = _get_last_comment_count(issue_key)
-            if last_count is None:
-                # Первый опрос по заявке. Чтобы не терять «первый комментарий» на свежих заявках,
-                # отправляем уведомление, если привязка свежая и комментариев немного.
-                if current_count > 0 and _is_recent_issue_binding(issue_key) and current_count <= 5:
-                    last_count = 0
-                else:
+                if comments is None:
+                    if http_status == 410:
+                        from core.support.issue_binding_registry import remove_bindings_by_issue
+                        removed = remove_bindings_by_issue(issue_key)
+                        logger.info("Комментарии %s: issue не существует, удалены привязки: %s", issue_key, removed)
+                        _set_last_comment_count(issue_key, 0)
+                        async with _comments_state_lock:
+                            st = _load_state()
+                            k = (issue_key or "").strip().upper()
+                            if k and k in st:
+                                st[k].pop("jira_comment_error_streak", None)
+                                _save_state(st)
+                        return
+
+                    try:
+                        hs = int(http_status) if http_status is not None else None
+                    except Exception:
+                        hs = None
+                    if hs == 429:
+                        stats["rate_limited"] += 1
+                    elif hs in (401, 403):
+                        stats["auth_error"] += 1
+                    elif hs is not None and 500 <= hs <= 599:
+                        stats["server_error"] += 1
+                    else:
+                        stats["other_error"] += 1
+
+                    if http_status is not None and str(http_status) in comments_cleanup_statuses:
+                        now_ts = time.time()
+                        key = (issue_key or "").strip().upper()
+                        if key:
+                            async with _comments_state_lock:
+                                state = _load_state()
+                                rec = state.get(key, {})
+                                last_err = rec.get("jira_comment_error_streak") or {}
+                                last_status = last_err.get("status")
+                                last_count = int(last_err.get("count") or 0)
+                                last_ts = last_err.get("last_ts")
+                                try:
+                                    last_ts_f = float(last_ts) if last_ts is not None else None
+                                except Exception:
+                                    last_ts_f = None
+
+                                if last_status != str(http_status) or last_ts_f is None or (now_ts - last_ts_f) > comments_cleanup_window_hours * 3600:
+                                    new_count = 1
+                                else:
+                                    new_count = last_count + 1
+
+                                rec["jira_comment_error_streak"] = {"status": str(http_status), "count": new_count, "last_ts": now_ts}
+                                state[key] = rec
+                                _save_state(state)
+
+                            if new_count >= comments_cleanup_threshold and not _is_recent_issue_binding(issue_key):
+                                from core.support.issue_binding_registry import remove_bindings_by_issue
+                                removed = remove_bindings_by_issue(issue_key)
+                                logger.warning(
+                                    "Комментарии %s: Jira стабильно отвечает HTTP %s (streak=%s). Удалены привязки: %s",
+                                    issue_key, http_status, new_count, removed,
+                                )
+                                _set_last_comment_count(issue_key, 0)
+                                async with _comments_state_lock:
+                                    state2 = _load_state()
+                                    k2 = (issue_key or "").strip().upper()
+                                    if k2 and k2 in state2:
+                                        state2[k2].pop("jira_comment_error_streak", None)
+                                        _save_state(state2)
+                    return
+
+                current_count = len(comments)
+                last_count = _get_last_comment_count(issue_key)
+                if last_count is None:
+                    if current_count > 0 and _is_recent_issue_binding(issue_key) and current_count <= 5:
+                        last_count = 0
+                    else:
+                        _set_last_comment_count(issue_key, current_count)
+                        return
+
+                if last_count == 0 and current_count > 0 and not _is_recent_issue_binding(issue_key) and current_count >= zero_baseline_skip_min:
                     _set_last_comment_count(issue_key, current_count)
-                    continue
-            # Если бот был выключен/перезапускался, а baseline по комментариям "пустой" (0),
-            # то при старте может полететь "волна" уведомлений по старым тикетам.
-            # Для несвежих заявок с уже большим числом комментариев — только baseline; при
-            # малых current_count идём в обычную ветку и шлём уведомления (см. zero_baseline_skip_min).
-            if (
-                last_count == 0
-                and current_count > 0
-                and not _is_recent_issue_binding(issue_key)
-                and current_count >= zero_baseline_skip_min
-            ):
-                _set_last_comment_count(issue_key, current_count)
-                continue
-            # Пустой список при last_count>0 часто означает сбой Jira (раньше ошибка маскировалась под []).
-            # Не сбрасываем baseline — иначе после восстановления связи прилетит «волна» старых уведомлений.
-            if current_count == 0 and last_count > 0:
-                logger.warning(
-                    "Комментарии %s: получено 0 комментариев при сохранённом baseline=%s — не обновляем счётчик (вероятен сбой API)",
-                    issue_key,
-                    last_count,
-                )
-                continue
-            # После включения фильтра internal-комментариев счётчик может уменьшиться (но не до нуля «из N» выше).
-            # Сбрасываем baseline, чтобы цикл уведомлений не "залипал".
-            if current_count < last_count:
-                _set_last_comment_count(issue_key, current_count)
-                continue
-            new_count = current_count - last_count
-            # Если “новых” комментариев слишком много за один цикл, это почти наверняка не
-            # реальные новые комментарии пользователя, а расхождение baseline (например из-за
-            # пагинации/сортировки/фильтра internal). В этом случае просто обновим baseline.
-            if new_count > comments_wave_delta_threshold and not _is_recent_issue_binding(issue_key):
-                logger.warning(
-                    "Комментарии: подозрительный всплеск для %s (last=%s current=%s delta=%s). "
-                    "Уведомления не отправляем, baseline обновляем.",
-                    issue_key,
-                    last_count,
-                    current_count,
-                    new_count,
-                )
-                _set_last_comment_count(issue_key, current_count)
-                continue
-            if current_count <= last_count:
-                continue
-            new_comments = comments[-new_count:]
-            already_notified = _get_notified_comment_ids(issue_key)
-            # Премикас: комментарии, отправленные через бота, имеют тело формата "[ФИО] текст".
-            # Мы не должны уведомлять только автора (того получателя, чьё ФИО совпадает), но
-            # должны уведомлять остальных получателей.
-            from user_storage import get_user_profile
+                    return
 
-            recipient_prefixes: List[tuple[str | None, str, int]] = []
-            for ch, uid in recipients:
-                profile = get_user_profile(uid, ch) or {}
-                full_name = (profile.get("full_name") or "").strip()
-                prefix = f"[{full_name}]" if full_name else None
-                recipient_prefixes.append((ch, prefix, int(uid)))
+                if current_count == 0 and last_count > 0:
+                    logger.warning(
+                        "Комментарии %s: получено 0 комментариев при сохранённом baseline=%s — не обновляем счётчик (вероятен сбой API)",
+                        issue_key, last_count,
+                    )
+                    return
 
-            comment_entries: List[Dict[str, Any]] = []
-            for c in new_comments:
-                cid = c.get("id")
-                cid_str = str(cid).strip() if cid is not None else ""
-                if cid is not None and cid_str and cid_str in already_notified:
-                    continue
+                if current_count < last_count:
+                    _set_last_comment_count(issue_key, current_count)
+                    return
 
-                plain = _comment_body_plain(c)
-                plain_stripped = (plain or "").strip()
+                new_count = current_count - last_count
+                if new_count > comments_wave_delta_threshold and not _is_recent_issue_binding(issue_key):
+                    logger.warning(
+                        "Комментарии: подозрительный всплеск для %s (last=%s current=%s delta=%s). Уведомления не отправляем, baseline обновляем.",
+                        issue_key, last_count, current_count, new_count,
+                    )
+                    _set_last_comment_count(issue_key, current_count)
+                    return
 
-                # Выделяем авторский префикс из "[ФИО] ...", чтобы понять, кто является автором по формату бота.
-                prefix = None
-                if plain_stripped:
-                    # Без regex, чтобы не ловить ошибки экранирования/формата от Jira.
+                if current_count <= last_count:
+                    return
+
+                new_comments = comments[-new_count:]
+                already_notified = _get_notified_comment_ids(issue_key)
+                from user_storage import get_user_profile
+
+                recipient_prefixes: List[tuple[str | None, str, int]] = []
+                for ch, uid in recipients:
+                    profile = get_user_profile(uid, ch) or {}
+                    full_name = (profile.get("full_name") or "").strip()
+                    prefix = f"[{full_name}]" if full_name else None
+                    recipient_prefixes.append((ch, prefix, int(uid)))
+
+                comment_entries: List[Dict[str, Any]] = []
+                for c in new_comments:
+                    cid = c.get("id")
+                    cid_str = str(cid).strip() if cid is not None else ""
+                    if cid is not None and cid_str and cid_str in already_notified:
+                        continue
+                    plain = _comment_body_plain(c)
+                    plain_stripped = (plain or "").strip()
+                    prefix = None
                     if plain_stripped.startswith("["):
                         end = plain_stripped.find("]")
                         if end > 1:
                             prefix = f"[{plain_stripped[1:end]}]"
+                    author = (c.get("author") or {}).get("displayName", "—")
+                    line = f"👤 {author}:\n{plain}" if plain else f"👤 {author}: (без текста)"
+                    comment_entries.append({"cid": cid_str if cid_str else None, "prefix": prefix, "line": line})
 
-                author = (c.get("author") or {}).get("displayName", "—")
-                if plain:
-                    line = f"👤 {author}:\n{plain}"
-                else:
-                    line = f"👤 {author}: (без текста)"
+                if not comment_entries:
+                    _set_last_comment_count(issue_key, current_count)
+                    return
 
-                comment_entries.append(
-                    {
-                        "cid": cid_str if cid_str else None,
-                        "prefix": prefix,
-                        "line": line,
-                    }
-                )
+                reply_markup = [[{"text": "✏️ Написать комментарий", "callback_data": f"add_comment:{issue_key}"}]]
+                delivered_any = False
+                delivered_ids: set[str] = set()
 
-            if not comment_entries:
-                _set_last_comment_count(issue_key, current_count)
-                continue
-
-            reply_markup = [
-                [{"text": "✏️ Написать комментарий", "callback_data": f"add_comment:{issue_key}"}],
-            ]
-
-            delivered_any = False
-            delivered_ids: set[str] = set()
-
-            # Отправляем один и тот же набор комментариев, но отфильтровываем автора на уровне получателя.
-            for channel_id, prefix, user_id in recipient_prefixes:
-                lines_to_send = [e["line"] for e in comment_entries if not (prefix and e.get("prefix") == prefix)]
-                if not lines_to_send:
-                    continue
-
-                comment_block = "\n\n".join(lines_to_send)
-                title = (
-                    f"💬 Новый комментарий в заявке {issue_key}:"
-                    if len(lines_to_send) == 1
-                    else f"💬 Новые комментарии в заявке {issue_key}:"
-                )
-                text = f"{title}\n\n{comment_block}"
-
-                try:
-                    await delivery_module.deliver(channel_id, user_id, text, reply_markup=reply_markup)
-                    delivered_any = True
-                    for e in comment_entries:
-                        if not (prefix and e.get("prefix") == prefix):
-                            if e.get("cid"):
+                for channel_id, prefix, user_id in recipient_prefixes:
+                    lines_to_send = [e["line"] for e in comment_entries if not (prefix and e.get("prefix") == prefix)]
+                    if not lines_to_send:
+                        continue
+                    comment_block = "\n\n".join(lines_to_send)
+                    title = f"💬 Новый комментарий в заявке {issue_key}:" if len(lines_to_send) == 1 else f"💬 Новые комментарии в заявке {issue_key}:"
+                    text = f"{title}\n\n{comment_block}"
+                    try:
+                        await delivery_module.deliver(channel_id, user_id, text, reply_markup=reply_markup)
+                        delivered_any = True
+                        for e in comment_entries:
+                            if not (prefix and e.get("prefix") == prefix) and e.get("cid"):
                                 delivered_ids.add(str(e["cid"]))
-                except Exception as e:
-                    logger.warning(
-                        "Не удалось отправить уведомление о комментарии %s -> %s/%s: %s",
-                        issue_key,
-                        channel_id,
-                        user_id,
-                        e,
-                    )
+                    except Exception as e:
+                        logger.warning("Не удалось отправить уведомление о комментарии %s -> %s/%s: %s", issue_key, channel_id, user_id, e)
 
-            if delivered_any and delivered_ids:
-                _add_notified_comment_ids(issue_key, list(delivered_ids))
-            _set_last_comment_count(issue_key, current_count)
-        except Exception as e:
-            logger.warning("Ошибка проверки комментариев %s: %s", issue_key, e)
-        await asyncio.sleep(0)
+                if delivered_any and delivered_ids:
+                    _add_notified_comment_ids(issue_key, list(delivered_ids))
+                _set_last_comment_count(issue_key, current_count)
+                stats["ok"] += 1
+            except Exception as e:
+                stats["other_error"] += 1
+                logger.warning("Ошибка проверки комментариев %s: %s", issue_key, e)
+            finally:
+                await asyncio.sleep(0)
+
+    await asyncio.gather(*[_process_issue(k) for k in window])
+    return stats
 
 
 async def check_assignee_tasks_and_notify() -> None:
@@ -875,6 +859,10 @@ async def check_assignee_tasks_and_notify() -> None:
 async def run_registry_status_loop(interval_seconds: int = 90) -> None:
     """Цикл проверки статусов по реестру."""
     logger.info("Запущен проверщик статусов по реестру (интервал %s с)", interval_seconds)
+    backoff_mult = 1.0
+    backoff_max = float(os.getenv("STATUS_BACKOFF_MAX_MULT", "8"))
+    backoff_step_up = float(os.getenv("STATUS_BACKOFF_STEP_UP", "2"))
+    backoff_step_down = float(os.getenv("STATUS_BACKOFF_STEP_DOWN", "0.5"))
     while True:
         try:
             await check_registry_statuses_and_notify()
@@ -883,17 +871,32 @@ async def run_registry_status_loop(interval_seconds: int = 90) -> None:
             break
         except Exception as e:
             logger.exception("Ошибка в проверщике статусов по реестру: %s", e)
-        await asyncio.sleep(interval_seconds)
+            backoff_mult = min(backoff_max, max(1.0, backoff_mult * backoff_step_up))
+        else:
+            backoff_mult = max(1.0, backoff_mult + backoff_step_down) if backoff_step_down < 0 else max(1.0, backoff_mult * float(backoff_step_down))
+            # If step_down is 0.5 (default), this halves backoff on successful tick.
+        await asyncio.sleep(float(interval_seconds) * float(backoff_mult))
 
 
 async def run_registry_comments_loop(interval_seconds: int = 30) -> None:
     """Цикл проверки комментариев по реестру."""
     logger.info("Запущен проверщик комментариев по реестру (интервал %s с)", interval_seconds)
+    backoff_mult = 1.0
+    backoff_max = float(os.getenv("COMMENTS_BACKOFF_MAX_MULT", "8"))
+    backoff_step_up = float(os.getenv("COMMENTS_BACKOFF_STEP_UP", "2"))
+    backoff_step_down = float(os.getenv("COMMENTS_BACKOFF_STEP_DOWN", "0.5"))
     while True:
         try:
-            await check_registry_comments_and_notify()
+            st = await check_registry_comments_and_notify()
+            # Trigger backoff when Jira is rate-limiting or failing hard.
+            hard_errors = int(st.get("rate_limited") or 0) + int(st.get("server_error") or 0)
+            if hard_errors > 0:
+                backoff_mult = min(backoff_max, max(1.0, backoff_mult * backoff_step_up))
+            else:
+                backoff_mult = max(1.0, backoff_mult * float(backoff_step_down))
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.exception("Ошибка в проверщике комментариев по реестру: %s", e)
-        await asyncio.sleep(interval_seconds)
+            backoff_mult = min(backoff_max, max(1.0, backoff_mult * backoff_step_up))
+        await asyncio.sleep(float(interval_seconds) * float(backoff_mult))

@@ -220,6 +220,10 @@ def _build_wizard_keyboard(screen: WizardScreen, data: dict) -> InlineKeyboardMa
             [("finish_wms_settings", "✅ Завершить создание задачи")],
             [("cancel", "❌ Отмена")],
         )
+    if kind == "wms_wait_products_department":
+        return get_wms_department_keyboard(depts, page)
+    if kind == "wms_wait_products_description":
+        return get_cancel_keyboard()
     if kind == "wms_issue_attachments":
         return _make_inline_kb(
             [("wms_finish_ticket", "✅ Создать заявку")],
@@ -592,6 +596,7 @@ async def create_ticket_tp(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💻 Программы и сайт", callback_data="tp_group_programs")],
+            [InlineKeyboardButton(text="🔐 Доступы и учетные записи", callback_data="tp_group_access")],
             [InlineKeyboardButton(text="🛠️ Оборудование", callback_data="tp_group_equipment")],
             [InlineKeyboardButton(text="🧰 Услуги", callback_data="tp_group_services")],
             [InlineKeyboardButton(text="🔑 Смена пароля", callback_data="tp_section_password")],
@@ -618,6 +623,818 @@ async def tp_group_programs(callback: CallbackQuery, state: FSMContext):
         ]),
     )
     await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "tp_group_access")
+async def tp_group_access(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "🔐 <b>Доступы и учетные записи</b>\n\nВыберите направление:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🖥️ Учетная запись для входа на ПК", callback_data="tp_access_pc_account")],
+            [InlineKeyboardButton(text="📚 Чат-бот по базам знаний", callback_data="tp_access_kb_chatbot")],
+            [InlineKeyboardButton(text="🔐 Доступ к корпоративной почте через браузер", callback_data="tp_access_mail_browser")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="create_ticket_tp")],
+        ]),
+    )
+    await callback.answer()
+
+
+def _aa_kb_edit_type_markup() -> InlineKeyboardMarkup:
+    from config import CONFIG
+
+    kb = CONFIG.get("JIRA_AA_KB_CHATBOT") or {}
+    create_l = (kb.get("EDIT_OPTION_CREATE") or "Создать").strip()
+    edit_l = (kb.get("EDIT_OPTION_EDIT") or "Редактировать").strip()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=create_l, callback_data="aa_kb_edit_create")],
+            [InlineKeyboardButton(text=edit_l, callback_data="aa_kb_edit_edit")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")],
+        ]
+    )
+
+
+async def _aa_kb_submit_from_state(
+    state: FSMContext,
+    user_id: int,
+    *,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+) -> None:
+    data = await state.get_data()
+    form_data = {
+        "aa_edit_type": (data.get("aa_kb_edit_type") or "").strip(),
+        "position": (data.get("aa_kb_position") or "").strip(),
+    }
+    if (data.get("aa_kb_phone") or "").strip():
+        form_data["existing_phone"] = (data.get("aa_kb_phone") or "").strip()
+    try:
+        success, issue_key, disp = await support_api.create_ticket(
+            CHANNEL_ID, user_id, "aa_kb_chatbot", form_data, attachment_paths=None
+        )
+        display_text = disp or issue_key
+        if not success and issue_key == NEED_PROFILE_DEPARTMENT:
+            reply_msg = callback.message if callback else message
+            assert reply_msg is not None
+            await _start_profile_department_prompt_telegram(
+                state,
+                user_id,
+                ticket_type_id="aa_kb_chatbot",
+                form_data=form_data,
+                attachment_file_ids=[],
+                reply_message=reply_msg,
+                edit=False,
+            )
+            if callback:
+                await callback.answer()
+            return
+    except Exception as e:
+        logger.exception("TG aa_kb_chatbot: %s", e)
+        success, display_text = False, "Ошибка при создании заявки."
+    await state.clear()
+    text = f"✅ {display_text}" if success else f"❌ {display_text}"
+    kb = get_main_menu_keyboard(user_id)
+    if callback:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        await callback.answer()
+    else:
+        assert message is not None
+        await message.reply(text, parse_mode="HTML", reply_markup=kb)
+
+
+def _aa_mail_edit_type_markup() -> InlineKeyboardMarkup:
+    from config import CONFIG
+
+    mb = CONFIG.get("JIRA_AA_MAIL_BROWSER") or {}
+    create_l = (mb.get("EDIT_OPTION_CREATE") or "Создать").strip()
+    edit_l = (mb.get("EDIT_OPTION_EDIT") or "Редактировать").strip()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=create_l, callback_data="aa_mail_edit_create")],
+            [InlineKeyboardButton(text=edit_l, callback_data="aa_mail_edit_edit")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")],
+        ]
+    )
+
+
+async def _aa_mail_submit_from_state(
+    state: FSMContext,
+    user_id: int,
+    *,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+) -> None:
+    data = await state.get_data()
+    form_data = {
+        "aa_edit_type": (data.get("aa_mail_edit_type") or "").strip(),
+        "position": (data.get("aa_mail_position") or "").strip(),
+    }
+    if (data.get("aa_mail_phone") or "").strip():
+        form_data["existing_phone"] = (data.get("aa_mail_phone") or "").strip()
+    try:
+        success, issue_key, disp = await support_api.create_ticket(
+            CHANNEL_ID, user_id, "aa_mail_browser", form_data, attachment_paths=None
+        )
+        display_text = disp or issue_key
+        if not success and issue_key == NEED_PROFILE_DEPARTMENT:
+            reply_msg = callback.message if callback else message
+            assert reply_msg is not None
+            await _start_profile_department_prompt_telegram(
+                state,
+                user_id,
+                ticket_type_id="aa_mail_browser",
+                form_data=form_data,
+                attachment_file_ids=[],
+                reply_message=reply_msg,
+                edit=False,
+            )
+            if callback:
+                await callback.answer()
+            return
+    except Exception as e:
+        logger.exception("TG aa_mail_browser: %s", e)
+        success, display_text = False, "Ошибка при создании заявки."
+    await state.clear()
+    text = f"✅ {display_text}" if success else f"❌ {display_text}"
+    kb = get_main_menu_keyboard(user_id)
+    if callback:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        await callback.answer()
+    else:
+        assert message is not None
+        await message.reply(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(lambda c: c.data == "tp_access_mail_browser")
+async def aa_mail_browser_start(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    from config import CONFIG
+
+    mb = CONFIG.get("JIRA_AA_MAIL_BROWSER") or {}
+    if not (mb.get("REQUEST_TYPE_ID") or "").strip():
+        await callback.message.edit_text(
+            "🔐 <b>Доступ к корпоративной почте через браузер</b>\n\n"
+            "Сценарий не настроен: укажите в .env <code>JIRA_AA_MAIL_BROWSER_REQUEST_TYPE_ID</code> "
+            "(или <code>JIRA_AA_KB_CHATBOT_REQUEST_TYPE_ID</code>) и при необходимости поля, см. <code>.env.example</code>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")],
+                ]
+            ),
+        )
+        await callback.answer()
+        return
+
+    profile = get_user_profile(callback.from_user.id) or {}
+    if not (profile.get("department") or "").strip():
+        await callback.message.edit_text(
+            "🔐 <b>Доступ к корпоративной почте через браузер</b>\n\n"
+            "В профиле не указано <b>подразделение (Department)</b>. "
+            "Выберите его в другом сценарии или в админ-панели.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")],
+                ]
+            ),
+        )
+        await callback.answer()
+        return
+    if not (profile.get("login") or "").strip():
+        await callback.message.edit_text(
+            "🔐 <b>Доступ к корпоративной почте через браузер</b>\n\nВ профиле не указан рабочий логин (AD account).",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")]]
+            ),
+        )
+        await callback.answer()
+        return
+    if not (profile.get("full_name") or "").strip():
+        await callback.message.edit_text(
+            "🔐 <b>Доступ к корпоративной почте через браузер</b>\n\nВ профиле не указано ФИО.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")]]
+            ),
+        )
+        await callback.answer()
+        return
+
+    await state.clear()
+    await state.set_state(TicketWizardStates.AA_MAIL_BROWSER_EDIT_TYPE)
+    await callback.message.edit_text(
+        "🔐 <b>Доступ к корпоративной почте через браузер</b>\n\n"
+        "Выберите значение поля <b>AA Edit Type</b> (Создать или Редактировать):",
+        parse_mode="HTML",
+        reply_markup=_aa_mail_edit_type_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(TicketWizardStates.AA_MAIL_BROWSER_EDIT_TYPE, F.data.in_(("aa_mail_edit_create", "aa_mail_edit_edit")))
+async def aa_mail_browser_pick_action(callback: CallbackQuery, state: FSMContext):
+    from config import CONFIG
+
+    mb = CONFIG.get("JIRA_AA_MAIL_BROWSER") or {}
+    kb = CONFIG.get("JIRA_AA_KB_CHATBOT") or {}
+    create_l = (mb.get("EDIT_OPTION_CREATE") or kb.get("EDIT_OPTION_CREATE") or "Создать").strip()
+    edit_l = (mb.get("EDIT_OPTION_EDIT") or kb.get("EDIT_OPTION_EDIT") or "Редактировать").strip()
+    label = create_l if callback.data == "aa_mail_edit_create" else edit_l
+    await state.update_data(aa_mail_edit_type=label)
+    profile = get_user_profile(callback.from_user.id) or {}
+    pos = (profile.get("position") or "").strip()
+    if pos:
+        await state.update_data(aa_mail_position=pos)
+        phone = (profile.get("phone") or "").strip()
+        if phone:
+            await _aa_mail_submit_from_state(state, callback.from_user.id, callback=callback)
+            return
+        else:
+            await state.set_state(TicketWizardStates.AA_MAIL_BROWSER_PHONE)
+            await callback.message.edit_text(
+                "🔐 <b>Доступ к корпоративной почте через браузер</b>\n\n"
+                f"✅ Действие: <b>{label}</b>\n\n"
+                "Укажите <b>номер телефона</b> (Existing phone number). "
+                "Он будет сохранён в профиле для следующих заявок:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="aa_mail_restart_flow")],
+                    ]
+                ),
+            )
+    else:
+        await state.set_state(TicketWizardStates.AA_MAIL_BROWSER_POSITION)
+        await callback.message.edit_text(
+            "🔐 <b>Доступ к корпоративной почте через браузер</b>\n\n"
+            f"✅ Действие: <b>{label}</b>\n\n"
+            "Укажите <b>должность (Position)</b>. Значение сохранится в профиле после создания заявки:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="aa_mail_restart_flow")],
+                ]
+            ),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "aa_mail_restart_flow")
+async def aa_mail_browser_restart(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(TicketWizardStates.AA_MAIL_BROWSER_EDIT_TYPE)
+    await callback.message.edit_text(
+        "🔐 <b>Доступ к корпоративной почте через браузер</b>\n\n"
+        "Выберите значение поля <b>AA Edit Type</b> (Создать или Редактировать):",
+        parse_mode="HTML",
+        reply_markup=_aa_mail_edit_type_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(TicketWizardStates.AA_MAIL_BROWSER_POSITION, F.text)
+async def aa_mail_browser_position(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    pos = (message.text or "").strip()
+    if len(pos) < 2:
+        await message.reply("Введите должность (не короче 2 символов).")
+        return
+    await state.update_data(aa_mail_position=pos)
+    profile = get_user_profile(message.from_user.id) or {}
+    phone = (profile.get("phone") or "").strip()
+    if phone:
+        await _aa_mail_submit_from_state(state, message.from_user.id, message=message)
+        return
+    else:
+        await state.set_state(TicketWizardStates.AA_MAIL_BROWSER_PHONE)
+        await message.reply(
+            "🔐 <b>Доступ к корпоративной почте через браузер</b>\n\n"
+            "Укажите <b>номер телефона</b> (Existing phone number). "
+            "Он будет сохранён в профиле после создания заявки:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="aa_mail_restart_flow")]]
+            ),
+        )
+
+
+@router.message(TicketWizardStates.AA_MAIL_BROWSER_PHONE, F.text)
+async def aa_mail_browser_phone(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    from validators import validate_phone
+
+    raw = (message.text or "").strip()
+    ok, err = validate_phone(raw)
+    if not ok:
+        await message.reply(f"❗ {err}")
+        return
+    await state.update_data(aa_mail_phone=raw)
+    await _aa_mail_submit_from_state(state, message.from_user.id, message=message)
+
+
+@router.callback_query(lambda c: c.data == "tp_access_kb_chatbot")
+async def aa_kb_chatbot_start(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    from config import CONFIG
+
+    kb = CONFIG.get("JIRA_AA_KB_CHATBOT") or {}
+    if not (kb.get("REQUEST_TYPE_ID") or "").strip():
+        await callback.message.edit_text(
+            "📚 <b>Чат-бот по базам знаний</b>\n\n"
+            "Сценарий не настроен: укажите в .env <code>JIRA_AA_KB_CHATBOT_REQUEST_TYPE_ID</code> "
+            "и при необходимости id полей (см. <code>.env.example</code>).",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")],
+                ]
+            ),
+        )
+        await callback.answer()
+        return
+
+    profile = get_user_profile(callback.from_user.id) or {}
+    if not (profile.get("department") or "").strip():
+        await callback.message.edit_text(
+            "📚 <b>Чат-бот по базам знаний</b>\n\n"
+            "В профиле не указано <b>подразделение (Department)</b>. "
+            "Выберите его в другом сценарии (например, ПК или Лупа) или в админ-панели.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")],
+                ]
+            ),
+        )
+        await callback.answer()
+        return
+    if not (profile.get("login") or "").strip():
+        await callback.message.edit_text(
+            "📚 <b>Чат-бот по базам знаний</b>\n\nВ профиле не указан рабочий логин (AD account).",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")]]
+            ),
+        )
+        await callback.answer()
+        return
+    if not (profile.get("full_name") or "").strip():
+        await callback.message.edit_text(
+            "📚 <b>Чат-бот по базам знаний</b>\n\nВ профиле не указано ФИО.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")]]
+            ),
+        )
+        await callback.answer()
+        return
+
+    await state.clear()
+    await state.set_state(TicketWizardStates.AA_KB_CHATBOT_EDIT_TYPE)
+    await callback.message.edit_text(
+        "📚 <b>Чат-бот по базам знаний</b>\n\n"
+        "Выберите значение поля <b>AA Edit Type</b> (Создать или Редактировать):",
+        parse_mode="HTML",
+        reply_markup=_aa_kb_edit_type_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(TicketWizardStates.AA_KB_CHATBOT_EDIT_TYPE, F.data.in_(("aa_kb_edit_create", "aa_kb_edit_edit")))
+async def aa_kb_chatbot_pick_action(callback: CallbackQuery, state: FSMContext):
+    from config import CONFIG
+
+    kb = CONFIG.get("JIRA_AA_KB_CHATBOT") or {}
+    create_l = (kb.get("EDIT_OPTION_CREATE") or "Создать").strip()
+    edit_l = (kb.get("EDIT_OPTION_EDIT") or "Редактировать").strip()
+    label = create_l if callback.data == "aa_kb_edit_create" else edit_l
+    await state.update_data(aa_kb_edit_type=label)
+    profile = get_user_profile(callback.from_user.id) or {}
+    pos = (profile.get("position") or "").strip()
+    if pos:
+        await state.update_data(aa_kb_position=pos)
+        phone = (profile.get("phone") or "").strip()
+        if phone:
+            await _aa_kb_submit_from_state(state, callback.from_user.id, callback=callback)
+            return
+        else:
+            await state.set_state(TicketWizardStates.AA_KB_CHATBOT_PHONE)
+            await callback.message.edit_text(
+                "📚 <b>Чат-бот по базам знаний</b>\n\n"
+                f"✅ Действие: <b>{label}</b>\n\n"
+                "Укажите <b>номер телефона</b> (Existing phone number). "
+                "Он будет сохранён в профиле для следующих заявок:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="aa_kb_restart_flow")],
+                    ]
+                ),
+            )
+    else:
+        await state.set_state(TicketWizardStates.AA_KB_CHATBOT_POSITION)
+        await callback.message.edit_text(
+            "📚 <b>Чат-бот по базам знаний</b>\n\n"
+            f"✅ Действие: <b>{label}</b>\n\n"
+            "Укажите <b>должность (Position)</b>. Значение сохранится в профиле после создания заявки:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="aa_kb_restart_flow")],
+                ]
+            ),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "aa_kb_restart_flow")
+async def aa_kb_chatbot_restart(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(TicketWizardStates.AA_KB_CHATBOT_EDIT_TYPE)
+    await callback.message.edit_text(
+        "📚 <b>Чат-бот по базам знаний</b>\n\n"
+        "Выберите значение поля <b>AA Edit Type</b> (Создать или Редактировать):",
+        parse_mode="HTML",
+        reply_markup=_aa_kb_edit_type_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(TicketWizardStates.AA_KB_CHATBOT_POSITION, F.text)
+async def aa_kb_chatbot_position(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    pos = (message.text or "").strip()
+    if len(pos) < 2:
+        await message.reply("Введите должность (не короче 2 символов).")
+        return
+    await state.update_data(aa_kb_position=pos)
+    profile = get_user_profile(message.from_user.id) or {}
+    phone = (profile.get("phone") or "").strip()
+    if phone:
+        await _aa_kb_submit_from_state(state, message.from_user.id, message=message)
+        return
+    else:
+        await state.set_state(TicketWizardStates.AA_KB_CHATBOT_PHONE)
+        await message.reply(
+            "📚 <b>Чат-бот по базам знаний</b>\n\n"
+            "Укажите <b>номер телефона</b> (Existing phone number). "
+            "Он будет сохранён в профиле после создания заявки:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="aa_kb_restart_flow")]]
+            ),
+        )
+
+
+@router.message(TicketWizardStates.AA_KB_CHATBOT_PHONE, F.text)
+async def aa_kb_chatbot_phone(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    from validators import validate_phone
+
+    raw = (message.text or "").strip()
+    ok, err = validate_phone(raw)
+    if not ok:
+        await message.reply(f"❗ {err}")
+        return
+    await state.update_data(aa_kb_phone=raw)
+    await _aa_kb_submit_from_state(state, message.from_user.id, message=message)
+
+
+def _aa_pc_actions_markup() -> InlineKeyboardMarkup:
+    from config import CONFIG
+
+    pc = CONFIG.get("JIRA_AA_PC_ACCOUNT") or {}
+    copy_l = (pc.get("ACTION_COPY") or "Копировать права").strip()
+    unlock_l = (pc.get("ACTION_UNLOCK") or "Разблокировать учетную запись").strip()
+    group_l = (pc.get("ACTION_GROUP") or "Дать доступ к группе безопасности").strip()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=copy_l[:64], callback_data="aa_pc_action_copy")],
+            [InlineKeyboardButton(text=unlock_l[:64], callback_data="aa_pc_action_unlock")],
+            [InlineKeyboardButton(text=group_l[:64], callback_data="aa_pc_action_group")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")],
+        ]
+    )
+
+
+async def _aa_pc_submit_from_state(
+    state: FSMContext,
+    user_id: int,
+    *,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+) -> None:
+    data = await state.get_data()
+    form_data = {
+        "aa_ad_edit_type": (data.get("aa_pc_ad_edit_type") or "").strip(),
+        "position": (data.get("aa_pc_position") or "").strip(),
+        "copy_rights_source": (data.get("aa_pc_copy_source") or "").strip(),
+        "security_group_name": (data.get("aa_pc_security_group") or "").strip(),
+    }
+    if (data.get("aa_pc_phone") or "").strip():
+        form_data["existing_phone"] = (data.get("aa_pc_phone") or "").strip()
+    try:
+        success, issue_key, disp = await support_api.create_ticket(
+            CHANNEL_ID, user_id, "aa_pc_account", form_data, attachment_paths=None
+        )
+        display_text = disp or issue_key
+        if not success and issue_key == NEED_PROFILE_DEPARTMENT:
+            reply_msg = callback.message if callback else message
+            assert reply_msg is not None
+            await _start_profile_department_prompt_telegram(
+                state,
+                user_id,
+                ticket_type_id="aa_pc_account",
+                form_data=form_data,
+                attachment_file_ids=[],
+                reply_message=reply_msg,
+                edit=False,
+            )
+            if callback:
+                await callback.answer()
+            return
+    except Exception as e:
+        logger.exception("TG aa_pc_account: %s", e)
+        success, display_text = False, "Ошибка при создании заявки."
+    await state.clear()
+    text = f"✅ {display_text}" if success else f"❌ {display_text}"
+    kb = get_main_menu_keyboard(user_id)
+    if callback:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        await callback.answer()
+    else:
+        assert message is not None
+        await message.reply(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def _aa_pc_prompt_position_or_phone(
+    state: FSMContext,
+    user_id: int,
+    *,
+    callback: CallbackQuery | None = None,
+    message: Message | None = None,
+) -> None:
+    data = await state.get_data()
+    act_label = (data.get("aa_pc_ad_edit_type") or "").strip()
+    profile = get_user_profile(user_id) or {}
+    pos = (profile.get("position") or "").strip()
+    reply_markup_back = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="aa_pc_restart_flow")]]
+    )
+    if pos:
+        await state.update_data(aa_pc_position=pos)
+        phone = (profile.get("phone") or "").strip()
+        if phone:
+            await _aa_pc_submit_from_state(state, user_id, callback=callback, message=message)
+            return
+        await state.set_state(TicketWizardStates.AA_PC_ACCOUNT_PHONE)
+        text = (
+            "🖥️ <b>Учетная запись для входа на ПК</b>\n\n"
+            f"✅ Требуемое действие: <b>{act_label}</b>\n\n"
+            "Укажите <b>номер телефона</b> (Existing phone number). "
+            "Он будет сохранён в профиле для следующих заявок:"
+        )
+    else:
+        await state.set_state(TicketWizardStates.AA_PC_ACCOUNT_POSITION)
+        text = (
+            "🖥️ <b>Учетная запись для входа на ПК</b>\n\n"
+            f"✅ Требуемое действие: <b>{act_label}</b>\n\n"
+            "Укажите <b>должность (Position)</b>. Значение сохранится в профиле после создания заявки:"
+        )
+    if callback:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup_back)
+        await callback.answer()
+    else:
+        assert message is not None
+        await message.reply(text, parse_mode="HTML", reply_markup=reply_markup_back)
+
+
+@router.callback_query(lambda c: c.data == "tp_access_pc_account")
+async def aa_pc_account_start(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    from config import CONFIG
+
+    pc = CONFIG.get("JIRA_AA_PC_ACCOUNT") or {}
+    if not (pc.get("REQUEST_TYPE_ID") or "").strip():
+        await callback.message.edit_text(
+            "🖥️ <b>Учетная запись для входа на ПК</b>\n\n"
+            "Сценарий не настроен: укажите в .env <code>JIRA_AA_PC_ACCOUNT_REQUEST_TYPE_ID</code> "
+            "(или настройте тип запроса для почты/чат-бота как запасной вариант), см. <code>.env.example</code>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")]]
+            ),
+        )
+        await callback.answer()
+        return
+
+    profile = get_user_profile(callback.from_user.id) or {}
+    if not (profile.get("department") or "").strip():
+        await callback.message.edit_text(
+            "🖥️ <b>Учетная запись для входа на ПК</b>\n\n"
+            "В профиле не указано <b>подразделение (Department)</b>. "
+            "Выберите его в другом сценарии или в админ-панели.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")]]
+            ),
+        )
+        await callback.answer()
+        return
+    if not (profile.get("login") or "").strip():
+        await callback.message.edit_text(
+            "🖥️ <b>Учетная запись для входа на ПК</b>\n\nВ профиле не указан рабочий логин (AD account).",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")]]
+            ),
+        )
+        await callback.answer()
+        return
+    if not (profile.get("full_name") or "").strip():
+        await callback.message.edit_text(
+            "🖥️ <b>Учетная запись для входа на ПК</b>\n\nВ профиле не указано ФИО.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="tp_group_access")]]
+            ),
+        )
+        await callback.answer()
+        return
+
+    await state.clear()
+    await state.set_state(TicketWizardStates.AA_PC_ACCOUNT_ACTION)
+    await callback.message.edit_text(
+        "🖥️ <b>Учетная запись для входа на ПК</b>\n\n"
+        "Выберите <b>требуемое действие</b> (поле AA AD Edit type):",
+        parse_mode="HTML",
+        reply_markup=_aa_pc_actions_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    TicketWizardStates.AA_PC_ACCOUNT_ACTION,
+    F.data.in_(("aa_pc_action_copy", "aa_pc_action_unlock", "aa_pc_action_group")),
+)
+async def aa_pc_account_pick_action(callback: CallbackQuery, state: FSMContext):
+    from config import CONFIG
+
+    pc = CONFIG.get("JIRA_AA_PC_ACCOUNT") or {}
+    copy_l = (pc.get("ACTION_COPY") or "Копировать права").strip()
+    unlock_l = (pc.get("ACTION_UNLOCK") or "Разблокировать учетную запись").strip()
+    group_l = (pc.get("ACTION_GROUP") or "Дать доступ к группе безопасности").strip()
+    mapping = {
+        "aa_pc_action_copy": copy_l,
+        "aa_pc_action_unlock": unlock_l,
+        "aa_pc_action_group": group_l,
+    }
+    label = mapping.get(callback.data or "", "")
+    await state.update_data(aa_pc_ad_edit_type=label)
+
+    if callback.data == "aa_pc_action_unlock":
+        await _aa_pc_prompt_position_or_phone(state, callback.from_user.id, callback=callback)
+        return
+
+    if callback.data == "aa_pc_action_copy":
+        await state.set_state(TicketWizardStates.AA_PC_ACCOUNT_COPY_SOURCE)
+        await callback.message.edit_text(
+            f"🖥️ <b>Учетная запись для входа на ПК</b>\n\n"
+            f"✅ Требуемое действие: <b>{label}</b>\n\n"
+            "Укажите <b>логин пользователя, с кого копировать права</b>, в формате <code>i.ivanov</code>:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="aa_pc_restart_flow")]]
+            ),
+        )
+        await callback.answer()
+        return
+
+    await state.set_state(TicketWizardStates.AA_PC_ACCOUNT_SECURITY_GROUP)
+    await callback.message.edit_text(
+        f"🖥️ <b>Учетная запись для входа на ПК</b>\n\n"
+        f"✅ Требуемое действие: <b>{label}</b>\n\n"
+        "Укажите <b>имя группы безопасности AD</b> одним сообщением:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="aa_pc_restart_flow")]]
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "aa_pc_restart_flow")
+async def aa_pc_account_restart(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(TicketWizardStates.AA_PC_ACCOUNT_ACTION)
+    await callback.message.edit_text(
+        "🖥️ <b>Учетная запись для входа на ПК</b>\n\n"
+        "Выберите <b>требуемое действие</b> (поле AA AD Edit type):",
+        parse_mode="HTML",
+        reply_markup=_aa_pc_actions_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(TicketWizardStates.AA_PC_ACCOUNT_COPY_SOURCE, F.text)
+async def aa_pc_account_copy_source(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    from validators import validate_work_login
+
+    raw = (message.text or "").strip().lower()
+    ok, err = validate_work_login(raw)
+    if not ok:
+        await message.reply(f"❗ {err}")
+        return
+    await state.update_data(aa_pc_copy_source=raw)
+    await _aa_pc_prompt_position_or_phone(state, message.from_user.id, message=message)
+
+
+@router.message(TicketWizardStates.AA_PC_ACCOUNT_SECURITY_GROUP, F.text)
+async def aa_pc_account_security_group(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    name = (message.text or "").strip()
+    if len(name) < 2:
+        await message.reply("Введите имя группы (не короче 2 символов).")
+        return
+    await state.update_data(aa_pc_security_group=name)
+    await _aa_pc_prompt_position_or_phone(state, message.from_user.id, message=message)
+
+
+@router.message(TicketWizardStates.AA_PC_ACCOUNT_POSITION, F.text)
+async def aa_pc_account_position(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    pos = (message.text or "").strip()
+    if len(pos) < 2:
+        await message.reply("Введите должность (не короче 2 символов).")
+        return
+    await state.update_data(aa_pc_position=pos)
+    profile = get_user_profile(message.from_user.id) or {}
+    phone = (profile.get("phone") or "").strip()
+    if phone:
+        await _aa_pc_submit_from_state(state, message.from_user.id, message=message)
+        return
+    await state.set_state(TicketWizardStates.AA_PC_ACCOUNT_PHONE)
+    await message.reply(
+        "🖥️ <b>Учетная запись для входа на ПК</b>\n\n"
+        "Укажите <b>номер телефона</b> (Existing phone number). "
+        "Он будет сохранён в профиле после создания заявки:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="aa_pc_restart_flow")]]
+        ),
+    )
+
+
+@router.message(TicketWizardStates.AA_PC_ACCOUNT_PHONE, F.text)
+async def aa_pc_account_phone(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    from validators import validate_phone
+
+    raw = (message.text or "").strip()
+    ok, err = validate_phone(raw)
+    if not ok:
+        await message.reply(f"❗ {err}")
+        return
+    await state.update_data(aa_pc_phone=raw)
+    await _aa_pc_submit_from_state(state, message.from_user.id, message=message)
 
 
 @router.callback_query(lambda c: c.data == "tp_group_equipment")
@@ -1340,7 +2157,7 @@ async def tp_section_password(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.in_({"tp_section_wms", "ticket_wms_issue"}))
 async def tp_section_wms(callback: CallbackQuery, state: FSMContext):
-    """WMS: меню из 4 кнопок (проблема / настройки / пользователь PSIwms / назад).
+    """WMS: меню типов заявок (проблема / настройки / товары в WAIT / PSIwms / назад).
     Срабатывает и на кнопку из раздела (tp_section_wms), и на кнопку из каталога типов (ticket_wms_issue)."""
     await callback.answer()
     if not is_user_registered(callback.from_user.id):
@@ -2027,6 +2844,125 @@ async def finish_wms_settings(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_menu_keyboard(callback.from_user.id),
     )
     await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "wms_type_wait_products", WmsTicketStates.WAITING_WMS_SUBTYPE)
+async def wms_type_wait_products(callback: CallbackQuery, state: FSMContext):
+    """Товары в WAIT: подразделение WMS (если нет в профиле) → описание → создание в JSM."""
+    await callback.answer()
+    profile = get_user_profile(callback.from_user.id) or {}
+    dept_wms = (profile.get("department_wms") or "").strip()
+    if dept_wms:
+        session = WizardSession("wms_wait_products", "WMS_WAIT_PRODUCTS_DESCRIPTION", {"department": dept_wms})
+        await state.set_state(TicketWizardStates.WMS_WAIT_PRODUCTS_DESCRIPTION)
+        await state.update_data(department=dept_wms, **save_wizard_session(session))
+        await callback.message.edit_text(
+            ticket_wizard.wms_wait_products_description_screen().text,
+            parse_mode="HTML",
+            reply_markup=get_cancel_keyboard(),
+        )
+        return
+    from core.jira_wms_departments import get_wms_departments_async
+    depts = await get_wms_departments_async() or []
+    session = WizardSession("wms_wait_products", "WMS_WAIT_PRODUCTS_DEPARTMENT", {"departments": depts, "dept_page": 0})
+    await state.set_state(TicketWizardStates.WMS_WAIT_PRODUCTS_DEPARTMENT)
+    await state.update_data(
+        **save_wizard_session(session),
+        departments=depts,
+        dept_page=0,
+        tp_wms_departments_list=depts,
+    )
+    if not depts:
+        await callback.message.edit_text(
+            "Список подразделений WMS недоступен. Попробуйте позже или обратитесь в поддержку.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="wms_show_subtype_menu")],
+            ]),
+        )
+    else:
+        await callback.message.edit_text(
+            ticket_wizard.wms_wait_products_department_screen(depts).text,
+            parse_mode="HTML",
+            reply_markup=get_wms_department_keyboard(depts),
+        )
+
+
+@router.callback_query(TicketWizardStates.WMS_WAIT_PRODUCTS_DEPARTMENT, F.data.startswith("wms_dept_page_"))
+async def wms_wait_products_department_page(callback: CallbackQuery, state: FSMContext):
+    try:
+        page = int(callback.data.replace("wms_dept_page_", ""))
+    except ValueError:
+        await callback.answer()
+        return
+    data = await state.get_data()
+    depts = data.get("tp_wms_departments_list") or data.get("departments") or []
+    await callback.message.edit_reply_markup(reply_markup=get_wms_department_keyboard(depts, page=page))
+    await callback.answer()
+
+
+@router.callback_query(TicketWizardStates.WMS_WAIT_PRODUCTS_DEPARTMENT, F.data.regexp(r"^wms_dept_\d+$"))
+async def wms_wait_products_department_select(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    depts = data.get("tp_wms_departments_list") or data.get("departments") or []
+    try:
+        idx = int(callback.data.replace("wms_dept_", ""))
+    except ValueError:
+        await callback.answer()
+        return
+    if idx < 0 or idx >= len(depts):
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    value = depts[idx]
+    profile = get_user_profile(callback.from_user.id) or {}
+    profile["department_wms"] = value
+    save_user_profile(callback.from_user.id, profile)
+    await state.update_data(
+        department=value,
+        **save_wizard_session(ticket_wizard.WizardSession("wms_wait_products", "WMS_WAIT_PRODUCTS_DESCRIPTION")),
+    )
+    await state.set_state(TicketWizardStates.WMS_WAIT_PRODUCTS_DESCRIPTION)
+    await callback.message.edit_text(
+        ticket_wizard.wms_wait_products_description_screen().text,
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(TicketWizardStates.WMS_WAIT_PRODUCTS_DESCRIPTION, F.text)
+async def wms_wait_products_description(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    desc = (message.text or "").strip()
+    if not desc:
+        await message.reply("Введите описание.", reply_markup=get_cancel_keyboard())
+        return
+    data = await state.get_data()
+    department = (data.get("department") or "").strip()
+    profile = get_user_profile(message.from_user.id) or {}
+    if not department:
+        department = (profile.get("department_wms") or profile.get("department") or "").strip()
+    if not department:
+        await state.clear()
+        await message.reply("Не указано подразделение WMS.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    form_data = {"department": department, "description": desc}
+    try:
+        success, issue_key, msg = await support_api.create_ticket(
+            CHANNEL_ID, message.from_user.id, "wms_wait_products", form_data, attachment_paths=None
+        )
+        display_text = msg or issue_key
+    except Exception as e:
+        logger.exception("TG wms_wait_products: %s", e)
+        success, display_text = False, "Ошибка при создании заявки."
+    await state.clear()
+    await message.reply(
+        f"✅ {display_text}" if success else f"❌ {display_text}",
+        parse_mode="HTML",
+        reply_markup=get_main_menu_keyboard(message.from_user.id),
+    )
 
 
 # --- Пользователь PSIwms ---

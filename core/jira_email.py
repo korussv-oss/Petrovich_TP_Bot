@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 import aiohttp
 
 from config import CONFIG
+from core.jira_labels import merge_chatbot_into_labels
 from validators import sanitize_jira_text, normalize_phone_for_jira
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,8 @@ async def create_owa_outlook_issue(
         request_field_values[f_workplace] = workplace
     if not allowed_fields or "description" in allowed_fields:
         request_field_values["description"] = description
+    if allowed_fields and "labels" in allowed_fields:
+        merge_chatbot_into_labels(request_field_values)
 
     files = list(attachment_paths or [])[:MAX_ATTACHMENTS_PER_ISSUE]
     if files and (not allowed_fields or "attachment" in allowed_fields):
@@ -212,6 +215,10 @@ async def create_owa_outlook_issue(
                             await _set_reporter(base_url, token, issue_key, jira_username)
                         except Exception as e:
                             logger.warning("Email OWA: set reporter failed for %s (%s): %s", issue_key, jira_username, e)
+                    if not allowed_fields or "labels" not in allowed_fields:
+                        from core.jira_aa import _ensure_issue_has_chatbot_label  # type: ignore[attr-defined]
+
+                        await _ensure_issue_has_chatbot_label(base_url, token, issue_key)
                     return True, issue_key
                 text = await resp.text()
                 logger.warning("Email OWA create failed: %s %s", resp.status, text[:500])

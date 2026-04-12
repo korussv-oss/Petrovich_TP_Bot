@@ -16,11 +16,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import re
 
 
 _DB_LOCK = threading.Lock()
 _DB_INITIALIZED = False
 _DB_THREAD_LOCAL = threading.local()
+_ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 
 
 def _db_path() -> Path:
@@ -103,6 +105,7 @@ def init_db() -> None:
                     department        TEXT,
                     department_wms    TEXT,
                     jira_username     TEXT,
+                    position          TEXT,
                     phone_needs_verification INTEGER DEFAULT 0,
                     registered_at     REAL
                 )
@@ -166,6 +169,12 @@ def init_db() -> None:
 
             # Lightweight migrations for existing DBs.
             try:
+                ucols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+                if "position" not in ucols:
+                    conn.execute("ALTER TABLE users ADD COLUMN position TEXT")
+            except Exception:
+                pass
+            try:
                 cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(issue_notification_state)").fetchall()}
                 if "last_assignee" not in cols:
                     conn.execute("ALTER TABLE issue_notification_state ADD COLUMN last_assignee TEXT")
@@ -189,6 +198,70 @@ def init_db() -> None:
         finally:
             conn.close()
         _DB_INITIALIZED = True
+
+
+def sanitize_issue_bindings(*, save: bool = True) -> Dict[str, int]:
+    """
+    Sanitize issue bindings storage.
+    - For SQLite: normalize issue_key to UPPER(TRIM), remove obviously invalid records.
+    - For JSON: handled by core.support.issue_binding_registry.sanitize_registry().
+    """
+    init_db()
+    if not save:
+        # still run read-only validation but avoid writes
+        pass
+    conn = _connect()
+    before = int(conn.execute("SELECT COUNT(*) AS c FROM issue_bindings").fetchone()["c"])
+    removed = 0
+    fixed = 0
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            conn.execute("BEGIN")
+            # Normalize issue_key and channel_id
+            cur = conn.execute("SELECT id, issue_key, channel_id, channel_user_id, created_at FROM issue_bindings")
+            rows = cur.fetchall()
+            for r in rows:
+                rid = int(r["id"])
+                issue_key = (str(r["issue_key"] or "").strip().upper())
+                channel_id = (str(r["channel_id"] or "").strip())
+                try:
+                    channel_user_id = int(r["channel_user_id"])
+                except Exception:
+                    channel_user_id = -1
+
+                if not issue_key or not channel_id or channel_user_id < 0 or not _ISSUE_KEY_RE.match(issue_key):
+                    if save:
+                        conn.execute("DELETE FROM issue_bindings WHERE id=?", (rid,))
+                    removed += 1
+                    continue
+
+                created_at = r["created_at"]
+                if not created_at:
+                    created_at = float(time.time())
+                    fixed += 1
+
+                # Update if changed
+                if issue_key != (r["issue_key"] or "") or channel_id != (r["channel_id"] or "") or created_at != r["created_at"]:
+                    fixed += 1
+                    if save:
+                        conn.execute(
+                            "UPDATE issue_bindings SET issue_key=?, channel_id=?, channel_user_id=?, created_at=? WHERE id=?",
+                            (issue_key, channel_id, channel_user_id, float(created_at), rid),
+                        )
+            if save:
+                conn.execute("COMMIT")
+            else:
+                conn.execute("ROLLBACK")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    after = int(conn.execute("SELECT COUNT(*) AS c FROM issue_bindings").fetchone()["c"])
+    return {"before": before, "after": after, "removed": removed, "fixed": fixed}
 
 
 # ---------------------------------------------------------------------------
@@ -230,17 +303,25 @@ def get_max_chat_id(max_user_id: int) -> Optional[str]:
 def upsert_user(telegram_id: int, profile: Dict[str, Any]) -> None:
     init_db()
     now = time.time()
+    tid = int(telegram_id)
     with _DB_LOCK:
         conn = _connect()
         try:
             conn.execute("BEGIN")
+            row = conn.execute("SELECT * FROM users WHERE telegram_id=?", (tid,)).fetchone()
+            base = dict(row) if row else {}
+            merged = dict(base)
+            merged.update(profile)
+            reg = merged.get("registered_at")
+            registered_at = float(reg) if reg is not None else now
             conn.execute(
                 """
                 INSERT INTO users(
                     telegram_id, full_name, login, email, phone, phone_norm,
                     employee_id, department, department_wms, jira_username,
+                    position,
                     phone_needs_verification, registered_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(telegram_id) DO UPDATE SET
                     full_name=excluded.full_name,
                     login=excluded.login,
@@ -251,21 +332,23 @@ def upsert_user(telegram_id: int, profile: Dict[str, Any]) -> None:
                     department=excluded.department,
                     department_wms=excluded.department_wms,
                     jira_username=excluded.jira_username,
+                    position=excluded.position,
                     phone_needs_verification=excluded.phone_needs_verification
                 """,
                 (
-                    int(telegram_id),
-                    profile.get("full_name"),
-                    profile.get("login"),
-                    profile.get("email"),
-                    profile.get("phone"),
-                    profile.get("phone_norm"),
-                    profile.get("employee_id"),
-                    profile.get("department"),
-                    profile.get("department_wms"),
-                    profile.get("jira_username"),
-                    1 if profile.get("phone_needs_verification") else 0,
-                    float(profile.get("registered_at") or now),
+                    tid,
+                    merged.get("full_name"),
+                    merged.get("login"),
+                    merged.get("email"),
+                    merged.get("phone"),
+                    merged.get("phone_norm"),
+                    merged.get("employee_id"),
+                    merged.get("department"),
+                    merged.get("department_wms"),
+                    merged.get("jira_username"),
+                    merged.get("position"),
+                    1 if merged.get("phone_needs_verification") else 0,
+                    registered_at,
                 ),
             )
             conn.execute("COMMIT")
