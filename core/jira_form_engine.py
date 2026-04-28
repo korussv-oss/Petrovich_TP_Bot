@@ -340,6 +340,22 @@ async def create_issue_from_form(
         return ok, result, project_key
     issue_key = result
 
+    # REST mode: attach files after creating the issue (Jira REST /attachments API).
+    if mode == "rest_issue" and all_paths:
+        try:
+            from core.jira_wms import add_attachments_to_issue
+
+            added, err = await add_attachments_to_issue(issue_key, all_paths)
+            logger.info(
+                "FormEngine REST attachments: issue=%s, requested=%s, added=%s, err=%s",
+                issue_key,
+                len(all_paths),
+                added,
+                err,
+            )
+        except Exception as e:
+            logger.warning("FormEngine REST attachments failed: %s", e)
+
     reporter_profile_key = (jira_def.get("reporter_profile_key") or "").strip()
     if reporter_profile_key:
         reporter_value = (profile.get(reporter_profile_key) or "").strip()

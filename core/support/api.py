@@ -319,9 +319,8 @@ async def create_ticket(
         from core.jira_lupa import create_lupa_issue
         from core.support.issue_binding_registry import add_binding
         profile = get_user_profile(user_id, channel_id) or {}
-        description = (form_data.get("description") or "").strip()
-        if not description:
-            return False, "Укажите описание проблемы.", None
+        # В Лупе комментарий может быть пропущен (описание опционально).
+        description = (form_data.get("description") or "").strip() or "Описание не предоставлено"
         employee_id = (profile.get("employee_id") or "").strip()
         if employee_id:
             description = f"Табельный номер: {employee_id}\n\n{description}"
@@ -345,7 +344,7 @@ async def create_ticket(
             "lupa_search",
             form_data=engine_form_data,
             profile=profile,
-            attachment_paths=[],
+            attachment_paths=list(attachment_paths or []),
         )
         if not ok:
             # Фолбэк на legacy-реализацию Лупы
