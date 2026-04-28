@@ -72,6 +72,7 @@ class TicketWizardStates(StatesGroup):
     WMS_ISSUE_PROCESS = State()
     WMS_ISSUE_SUMMARY = State()
     WMS_ISSUE_DESCRIPTION = State()
+    WMS_ISSUE_ATTACHMENTS = State()
 
     # Lupa (lupa_search)
     LUPA_DEPARTMENT = State()

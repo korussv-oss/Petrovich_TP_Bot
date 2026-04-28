@@ -1985,9 +1985,12 @@ async def run_max_bot() -> None:
                                 ct = response["create_ticket"]
                                 form_data = ct.get("form_data", {})
                                 ticket_type_id = ct.get("ticket_type_id") or "lupa_search"
-                                success, issue_key, user_msg = await support_api.create_ticket("max", user_id, ticket_type_id, form_data)
-                                msg_show = user_msg if success else issue_key
-                                response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                attachment_tokens = ct.get("attachment_tokens") or []
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot, user_id, ticket_type_id, form_data, attachment_tokens, wms_attach_after_create=False
+                                )
                         elif (
                             wms_flow.is_in_wms_flow(user_id)
                             and (
@@ -2915,16 +2918,25 @@ async def run_max_bot() -> None:
                                         bot, user_id, "aa_pc_account", form_data, [], wms_attach_after_create=False
                                     )
                             elif lupa_flow.is_in_lupa_flow(user_id):
-                                response = await lupa_flow.handle_lupa_message(user_id, text)
+                                if attachment_list:
+                                    logger.info(
+                                        "MAX lupa attachments: incoming len=%s (user_id=%s)",
+                                        len(attachment_list),
+                                        user_id,
+                                    )
+                                response = await lupa_flow.handle_lupa_message(user_id, text, attachment_list=attachment_list)
                                 if response is None:
                                     response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
                                 elif response.get("create_ticket"):
                                     ct = response["create_ticket"]
                                     form_data = ct.get("form_data", {})
                                     ticket_type_id = ct.get("ticket_type_id") or "lupa_search"
-                                    success, issue_key, user_msg = await support_api.create_ticket("max", user_id, ticket_type_id, form_data)
-                                    msg_show = user_msg if success else issue_key
-                                    response = {"text": f"✅ {msg_show}" if success else f"❌ {msg_show}", "parse_mode": "HTML", "buttons": [{"id": "back_to_main", "label": "🔙 В главное меню"}]}
+                                    attachment_tokens = ct.get("attachment_tokens") or []
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot, user_id, ticket_type_id, form_data, attachment_tokens, wms_attach_after_create=False
+                                    )
                             else:
                                 response = {"text": "Используйте /start для начала.", "parse_mode": "HTML", "buttons": []}
                     else:

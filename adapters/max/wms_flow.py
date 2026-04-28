@@ -198,11 +198,11 @@ async def handle_wms_callback(user_id: int, callback_id: str) -> Optional[dict]:
             "buttons": CANCEL_BTN,
         }
 
-    # --- wms_issue: пропуск описания ---
+    # --- wms_issue: пропуск описания → тот же экран вложений, что и после ввода текста ---
     if session.step == "description" and callback_id == "wms_skip_description":
         _store.set_step(user_id, "attachments", data={"description": "", "wms_attachment_tokens": []})
         return {
-            "text": ticket_wizard.wms_issue_description_screen().text,
+            "text": ticket_wizard.wms_issue_attachments_screen(added_count=0).text,
             "parse_mode": "HTML",
             "buttons": [{"id": "wms_finish_ticket", "label": "✅ Завершить создание задачи"}, {"id": "cancel", "label": "❌ Отмена"}],
         }
@@ -404,7 +404,7 @@ async def handle_wms_message(user_id: int, text: str, attachment_list: Optional[
     if session.step == "description":
         _store.set_step(user_id, "attachments", data={"description": text, "wms_attachment_tokens": []})
         return {
-            "text": "📎 Приложите фото, видео или документы (до 10 файлов) или нажмите «✅ Завершить создание задачи».",
+            "text": ticket_wizard.wms_issue_attachments_screen(added_count=0).text,
             "parse_mode": "HTML",
             "buttons": [{"id": "wms_finish_ticket", "label": "✅ Завершить создание задачи"}, {"id": "cancel", "label": "❌ Отмена"}],
         }

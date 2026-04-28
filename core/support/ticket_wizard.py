@@ -108,6 +108,17 @@ def wms_issue_description_screen() -> WizardScreen:
     )
 
 
+def wms_issue_attachments_screen(*, added_count: int = 0) -> WizardScreen:
+    return WizardScreen(
+        kind="wms_issue_attachments",
+        text=(
+            "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый).\n\n"
+            f"Добавлено: {added_count} из 10.\n\n"
+            "Или нажмите «✅ Завершить создание задачи»."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Lupa: lupa_search
 # ---------------------------------------------------------------------------
@@ -515,6 +526,9 @@ _STATE_SCREEN_MAP: Dict[str, Callable[[Dict[str, Any]], WizardScreen]] = {
     "WMS_ISSUE_PROCESS": lambda _: wms_issue_process_screen(),
     "WMS_ISSUE_SUMMARY": lambda _: wms_issue_summary_screen(),
     "WMS_ISSUE_DESCRIPTION": lambda _: wms_issue_description_screen(),
+    "WMS_ISSUE_ATTACHMENTS": lambda d: wms_issue_attachments_screen(
+        added_count=len(d.get("wms_attachment_file_ids") or d.get("attachments") or []),
+    ),
 
     # --- Lupa ---
     "LUPA_SERVICE": lambda _: lupa_service_screen(),
@@ -756,15 +770,14 @@ async def _wstep_wms_issue(
         if skip or (event.kind == "text" and event.text.strip()):
             desc = "" if skip else event.text.strip()
             ns = _next(session, "WMS_ISSUE_ATTACHMENTS", description=desc, attachments=[])
-            return ns, WizardScreen(kind="wms_issue_attachments", text="📎 Приложите файлы или нажмите «✅ Создать заявку».")
+            return ns, wms_issue_attachments_screen(added_count=0)
 
     if step == "WMS_ISSUE_ATTACHMENTS":
         if event.kind == "attachment":
             cur = list(d.get("attachments") or [])
             cur.extend(event.attachments)
             ns = _same(session, attachments=cur)
-            return ns, WizardScreen(kind="wms_issue_attachments",
-                                    text=f"📎 Добавлено: {len(cur)} из 10. Приложите ещё или «✅ Создать заявку».")
+            return ns, wms_issue_attachments_screen(added_count=len(cur))
         if event.kind == "callback" and event.callback_id == "wms_finish_ticket":
             dept = d.get("department") or d.get("department_wms") or profile.get("department_wms", "")
             return _done(session, {

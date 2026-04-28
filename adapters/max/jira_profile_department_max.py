@@ -59,14 +59,25 @@ async def _download_tokens_to_paths(bot, attachment_tokens: List[Any]) -> List[s
     for att in (attachment_tokens or [])[:10]:
         if not isinstance(att, dict) or not att.get("url"):
             continue
-        downloaded = await _mm._download_attachment_max(bot, att)
+        try:
+            logger.info("MAX attachments: download requested (url=%s)", (att.get("url") or "")[:128])
+            downloaded = await _mm._download_attachment_max(bot, att)
+        except Exception as e:
+            logger.warning("MAX attachments: download failed: %s", e)
+            continue
         if not downloaded:
+            logger.warning("MAX attachments: download returned empty (url=%s)", (att.get("url") or "")[:128])
             continue
         content, name = downloaded
+        logger.info("MAX attachments: download ok (name=%s, bytes=%s)", name, len(content) if content else 0)
         ext = os.path.splitext(name)[1] if name and "." in name else ".bin"
         f = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="mxatt_")
         f.write(content)
         f.close()
+        try:
+            logger.info("MAX attachments: saved temp file (path=%s, bytes=%s)", f.name, os.path.getsize(f.name))
+        except Exception:
+            logger.info("MAX attachments: saved temp file (path=%s)", f.name)
         temp_paths.append(f.name)
     return temp_paths
 
@@ -91,7 +102,15 @@ async def max_submit_ticket_with_profile_department(
     temp_paths: List[str] = []
     try:
         if not wms_attach_after_create:
+            logger.info(
+                "MAX ticket create: preparing attachments (ticket_type_id=%s, tokens=%s, user_id=%s)",
+                ticket_type_id, len(tokens), uid,
+            )
             temp_paths = await _download_tokens_to_paths(bot, tokens)
+            logger.info(
+                "MAX ticket create: attachments prepared (paths=%s, user_id=%s)",
+                len(temp_paths), uid,
+            )
             success, issue_key, user_msg = await support_api.create_ticket(
                 "max", uid, ticket_type_id, form_data, attachment_paths=temp_paths or None
             )
@@ -109,6 +128,14 @@ async def max_submit_ticket_with_profile_department(
                         user_msg = (user_msg or "") + f"\n\n📎 Приложено файлов: {added}."
                 except Exception as e:
                     logger.warning("MAX WMS: вложения после создания: %s", e)
+        logger.info(
+            "MAX ticket create: result (success=%s, issue_key=%s, ticket_type_id=%s, user_id=%s, attached_paths=%s)",
+            success,
+            issue_key,
+            ticket_type_id,
+            uid,
+            len(temp_paths),
+        )
 
         if not success and issue_key == NEED_PROFILE_DEPARTMENT:
             from core.jira_departments import get_departments_async

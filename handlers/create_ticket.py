@@ -226,7 +226,7 @@ def _build_wizard_keyboard(screen: WizardScreen, data: dict) -> InlineKeyboardMa
         return get_cancel_keyboard()
     if kind == "wms_issue_attachments":
         return _make_inline_kb(
-            [("wms_finish_ticket", "✅ Создать заявку")],
+            [("wms_finish_ticket", "✅ Завершить создание задачи")],
             [("cancel", "❌ Отмена")],
         )
 
@@ -3261,17 +3261,31 @@ async def wms_summary(message: Message, state: FSMContext):
     )
 
 
+async def _wms_issue_enter_attachments(callback_or_message, state: FSMContext, is_callback: bool):
+    """Описание введено или пропущено — тот же шаг вложений, что и при вводе текста."""
+    await state.set_state(TicketWizardStates.WMS_ISSUE_ATTACHMENTS)
+    await state.update_data(
+        wms_attachment_file_ids=[],
+        **save_wizard_session(ticket_wizard.WizardSession("wms_issue", "WMS_ISSUE_ATTACHMENTS")),
+    )
+    text = (
+        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый). "
+        "Или нажмите «Завершить создание тикета»."
+    )
+    if is_callback:
+        await callback_or_message.message.edit_text(
+            text, parse_mode="HTML", reply_markup=_wms_attachments_keyboard()
+        )
+        await callback_or_message.answer()
+    else:
+        await callback_or_message.reply(text, parse_mode="HTML", reply_markup=_wms_attachments_keyboard())
+
+
 @router.callback_query(TicketWizardStates.WMS_ISSUE_DESCRIPTION, F.data == "wms_skip_description")
 async def wms_skip_description(callback: CallbackQuery, state: FSMContext):
-    """Пропуск описания → шаг вложений."""
-    await callback.answer()
-    await state.update_data(description="", wms_attachment_file_ids=[])
-    await state.set_state(TicketWizardStates.WMS_ISSUE_DESCRIPTION)
-    text = (
-        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый).\n\n"
-        "Добавлено: 0 из 10.\n\nИли нажмите «Завершить создание тикета»."
-    )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=_wms_attachments_keyboard())
+    """Пропуск описания → шаг вложений (как при вводе описания)."""
+    await state.update_data(description="")
+    await _wms_issue_enter_attachments(callback, state, is_callback=True)
 
 
 def _wms_attachments_keyboard():
@@ -4262,16 +4276,10 @@ async def wms_description(message: Message, state: FSMContext):
         await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
         return
     await state.update_data(description=(message.text or "").strip())
-    await state.set_state(TicketWizardStates.WMS_ISSUE_DESCRIPTION)
-    await state.update_data(wms_attachment_file_ids=[])
-    await message.reply(
-        "📎 Приложите фото, видео или документы (до 10 файлов, до 10 МБ каждый). Или нажмите «Завершить создание тикета».",
-        parse_mode="HTML",
-        reply_markup=_wms_attachments_keyboard(),
-    )
+    await _wms_issue_enter_attachments(message, state, is_callback=False)
 
 
-@router.message(TicketWizardStates.WMS_ISSUE_DESCRIPTION, F.photo | F.document | F.video)
+@router.message(TicketWizardStates.WMS_ISSUE_ATTACHMENTS, F.photo | F.document | F.video)
 async def wms_attachment_add(message: Message, state: FSMContext):
     """Добавление вложения (до 10, до 10 МБ)."""
     data = await state.get_data()
@@ -4302,7 +4310,7 @@ async def wms_attachment_add(message: Message, state: FSMContext):
         await message.reply(f"📎 Добавлено {len(file_ids)} из 10. Можно приложить ещё или нажмите «Завершить создание тикета».", reply_markup=_wms_attachments_keyboard())
 
 
-@router.callback_query(TicketWizardStates.WMS_ISSUE_DESCRIPTION, F.data == "wms_finish_ticket")
+@router.callback_query(TicketWizardStates.WMS_ISSUE_ATTACHMENTS, F.data == "wms_finish_ticket")
 async def wms_finish_ticket(callback: CallbackQuery, state: FSMContext):
     """Завершение: создание тикета и загрузка вложений в Jira."""
     await callback.answer()

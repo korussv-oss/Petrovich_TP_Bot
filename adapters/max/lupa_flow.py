@@ -6,6 +6,7 @@ import logging
 from typing import Optional
 
 from core.support import ticket_wizard
+from adapters.max._utils import collect_attachments
 from user_storage import (
     is_user_registered,
     get_user_profile,
@@ -22,6 +23,11 @@ CHANNEL_ID = "max"
 _store = WizardFlowStore()
 
 CANCEL_BTN = [{"id": "cancel", "label": "❌ Отмена"}]
+LUPA_ATTACHMENTS_BTNS = [
+    {"id": "lupa_finish_ticket", "label": "✅ Завершить создание задачи"},
+    {"id": "lupa_skip_attachments", "label": "⏭ Пропустить вложения"},
+    {"id": "cancel", "label": "❌ Отмена"},
+]
 
 LUPA_SERVICE_VALUES = {"lupa_service_app": "Приложение", "lupa_service_site": "Сайт (petrovich.ru)"}
 LUPA_REQUEST_TYPE_VALUES = {
@@ -209,22 +215,49 @@ def handle_lupa_callback(user_id: int, callback_id: str) -> Optional[dict]:
     # Шаг 4: пропуск комментария → создание
     if session.step == "description" and callback_id == "lupa_skip_comment":
         data = session.data
+        _store.set_step(
+            user_id,
+            "attachments",
+            data={
+                "description": "",
+                "lupa_attachment_tokens": list(data.get("lupa_attachment_tokens") or []),
+            },
+        )
+        return {
+            "text": (
+                "📎 Приложите фото, видео или документы (до 10 файлов) "
+                "или нажмите «✅ Завершить создание задачи»."
+            ),
+            "parse_mode": "HTML",
+            "buttons": LUPA_ATTACHMENTS_BTNS,
+        }
+
+    # Шаг 5: завершение (вложения)
+    if session.step == "attachments" and callback_id in ("lupa_finish_ticket", "lupa_skip_attachments"):
+        data = session.data
         profile = get_user_profile(user_id, CHANNEL_ID) or {}
         subdivision = (data.get("subdivision") or profile.get("department") or "").strip()
         form_data = {
-            "description": "",
+            "description": (data.get("description") or "").strip(),
             "problematic_service": data.get("problematic_service", ""),
             "request_type": data.get("request_type", ""),
             "subdivision": subdivision,
             "city": data.get("city", ""),
         }
+        attachment_tokens = [] if callback_id == "lupa_skip_attachments" else (data.get("lupa_attachment_tokens") or [])
         _store.clear(user_id)
-        return {"create_ticket": {"ticket_type_id": "lupa_search", "form_data": form_data}}
+        return {
+            "create_ticket": {
+                "ticket_type_id": "lupa_search",
+                "form_data": form_data,
+                "attachment_tokens": list(attachment_tokens),
+            }
+        }
 
     return None
 
 
-async def handle_lupa_message(user_id: int, text: str) -> Optional[dict]:
+async def handle_lupa_message(user_id: int, text: str, attachment_list: Optional[list] = None) -> Optional[dict]:
     session = _store.get(user_id)
     if not session:
         return None
@@ -278,18 +311,62 @@ async def handle_lupa_message(user_id: int, text: str) -> Optional[dict]:
             "buttons": [{"id": "lupa_skip_comment", "label": "⏭ Пропустить комментарий"}, {"id": "cancel", "label": "❌ Отмена"}],
         }
 
-    if session.step == "description":
-        data = session.data
-        profile = get_user_profile(user_id, CHANNEL_ID) or {}
-        subdivision = (data.get("subdivision") or profile.get("department") or "").strip()
-        form_data = {
-            "description": text_val,
-            "problematic_service": data.get("problematic_service", ""),
-            "request_type": data.get("request_type", ""),
-            "subdivision": subdivision,
-            "city": data.get("city", ""),
+    if session.step == "attachments":
+        if attachment_list:
+            tokens = collect_attachments(session.data.get("lupa_attachment_tokens") or [], attachment_list)
+            _store.update_data(user_id, lupa_attachment_tokens=tokens)
+            n = len(tokens)
+            logger.info("MAX lupa attachments: collected=%s (user_id=%s)", n, user_id)
+            return {
+                "text": (
+                    f"📎 Добавлено вложений: {n} из 10.\n\n"
+                    "Приложите ещё или нажмите «✅ Завершить создание задачи» / «⏭ Пропустить вложения»."
+                ),
+                "parse_mode": "HTML",
+                "buttons": LUPA_ATTACHMENTS_BTNS,
+            }
+        # Игнорируем текст на шаге вложений: пользователь должен нажать кнопку
+        return {
+            "text": "📎 Приложите файлы или нажмите «✅ Завершить создание задачи» / «⏭ Пропустить вложения».",
+            "parse_mode": "HTML",
+            "buttons": LUPA_ATTACHMENTS_BTNS,
         }
-        _store.clear(user_id)
-        return {"create_ticket": {"ticket_type_id": "lupa_search", "form_data": form_data}}
+
+    if session.step == "description":
+        # MAX: пользователь может прислать файлы отдельным сообщением на шаге комментария.
+        if attachment_list:
+            tokens = collect_attachments(session.data.get("lupa_attachment_tokens") or [], attachment_list)
+            _store.update_data(user_id, lupa_attachment_tokens=tokens)
+            n = len(tokens)
+            logger.info("MAX lupa attachments: collected=%s (user_id=%s)", n, user_id)
+            return {
+                "text": (
+                    f"📎 Добавлено вложений: {n} из 10.\n\n"
+                    "Отправьте комментарий текстом или нажмите «⏭ Пропустить комментарий»."
+                ),
+                "parse_mode": "HTML",
+                "buttons": [
+                    {"id": "lupa_skip_comment", "label": "⏭ Пропустить комментарий"},
+                    {"id": "cancel", "label": "❌ Отмена"},
+                ],
+            }
+        # Текст комментария введён → переходим на шаг вложений (как в WMS).
+        data = session.data
+        _store.set_step(
+            user_id,
+            "attachments",
+            data={
+                "description": text_val,
+                "lupa_attachment_tokens": list(data.get("lupa_attachment_tokens") or []),
+            },
+        )
+        return {
+            "text": (
+                "📎 Приложите фото, видео или документы (до 10 файлов) "
+                "или нажмите «✅ Завершить создание задачи»."
+            ),
+            "parse_mode": "HTML",
+            "buttons": LUPA_ATTACHMENTS_BTNS,
+        }
 
     return None
