@@ -182,6 +182,12 @@ network_problem:
     request_type_id: "407"
     reporter_profile_key: "jira_username"
     fields:
+      summary:
+        source: "form.description"
+        type: "text"
+        required: true
+        default: "Проблемы в работе сети"
+        max_len: 255
       customfield_11406:
         source: "profile.department"
         type: "option"

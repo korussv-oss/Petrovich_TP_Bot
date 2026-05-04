@@ -1,4 +1,5 @@
 """Универсальный движок отправки JSM-форм по каталогу."""
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +27,42 @@ def _resolve_source(source: str, form_data: Dict[str, Any], profile: Dict[str, A
     if s.startswith("profile."):
         return profile.get(s[8:])
     return None
+
+
+def _format_jira_create_error(status: int, body: str) -> str:
+    body = (body or "").strip()
+    if not body:
+        return f"Ошибка Jira: {status}."
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        snippet = body[:2000] + ("…" if len(body) > 2000 else "")
+        return f"Ошибка Jira: {status}. {snippet}"
+    parts: list[str] = []
+    em = (data.get("errorMessage") or "").strip()
+    if em:
+        parts.append(em)
+    ems = data.get("errorMessages")
+    if isinstance(ems, list):
+        for item in ems:
+            s = str(item or "").strip()
+            if s:
+                parts.append(s)
+    err = data.get("errors")
+    if isinstance(err, dict) and err:
+        for k, v in err.items():
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                parts.append(f"{k}: {s}" if k else s)
+    if parts:
+        text = " ".join(parts)
+        if len(text) > 2000:
+            text = text[:2000] + "…"
+        return f"Ошибка Jira: {status}. {text}"
+    snippet = body[:2000] + ("…" if len(body) > 2000 else "")
+    return f"Ошибка Jira: {status}. {snippet}"
 
 
 def _friendly_required_field_message(field_id: str) -> str:
@@ -231,7 +268,8 @@ async def _create_jsm_issue(
             async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=40)) as resp:
                 if resp.status not in (200, 201):
                     txt = await resp.text()
-                    return False, f"Ошибка Jira: {resp.status}. {txt[:200]}", project_key
+                    logger.warning("JSM create failed: status=%s body=%s", resp.status, txt)
+                    return False, _format_jira_create_error(resp.status, txt), project_key
                 data = await resp.json()
         issue_key = (data.get("issueKey") or "").strip()
         if not issue_key:
@@ -301,7 +339,8 @@ async def _create_rest_issue(
             async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=40)) as resp:
                 if resp.status != 201:
                     txt = await resp.text()
-                    return False, f"Ошибка Jira: {resp.status}. {txt[:200]}", project_key
+                    logger.warning("Jira REST create failed: status=%s body=%s", resp.status, txt)
+                    return False, _format_jira_create_error(resp.status, txt), project_key
                 data = await resp.json()
         issue_key = (data.get("key") or "").strip()
         if not issue_key:
