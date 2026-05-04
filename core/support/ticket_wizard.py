@@ -1160,7 +1160,8 @@ async def _wstep_network(
         o_id = event.callback_id.replace("network_wifi_owner_", "", 1).strip()
         o_label = NETWORK_WIFI_OWNER_BY_ID.get(o_id)
         if o_label:
-            return _next(session, "NETWORK_RMS", wifi_problem_owner=o_label), network_rms_screen()
+            nt = d.get("network_type", "")
+            return _next(session, "NETWORK_PROVIDER", wifi_problem_owner=o_label), network_provider_screen(network_type=nt)
 
     if step == "NETWORK_PC_TYPE" and event.kind == "callback" and event.callback_id.startswith("network_pc_type_"):
         p_id = event.callback_id.replace("network_pc_type_", "", 1).strip()

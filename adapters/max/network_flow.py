@@ -100,11 +100,12 @@ async def handle_network_callback(user_id: int, callback_id: str) -> Optional[di
         o_label = NETWORK_WIFI_OWNER_BY_ID.get(o_id)
         if not o_label:
             return {"text": "Неверный выбор.", "parse_mode": "HTML", "buttons": _buttons(NETWORK_WIFI_OWNERS, "network_wifi_owner_")}
-        _store.set_step(user_id, "rms", data={"wifi_problem_owner": o_label})
+        _store.set_step(user_id, "provider", data={"wifi_problem_owner": o_label})
+        session = _store.get(user_id)
         return {
-            "text": ticket_wizard.network_rms_screen().text,
+            "text": ticket_wizard.network_provider_screen(network_type=session.data.get("network_type", "")).text,
             "parse_mode": "HTML",
-            "buttons": _rms_buttons(),
+            "buttons": _buttons(NETWORK_PROVIDERS, "network_provider_"),
         }
 
     if session.step == "pc_type" and callback_id.startswith("network_pc_type_"):

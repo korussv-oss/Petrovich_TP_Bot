@@ -3914,14 +3914,16 @@ async def network_select_wifi_owner(callback: CallbackQuery, state: FSMContext):
     if not owner_label:
         await callback.answer("Неверный выбор.", show_alert=True)
         return
+    data = await state.get_data()
     await state.update_data(
         wifi_problem_owner=owner_label,
-        **save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_RMS")),
+        **save_wizard_session(ticket_wizard.WizardSession("network_issue", "NETWORK_PROVIDER")),
     )
-    await state.set_state(TicketWizardStates.NETWORK_RMS)
+    await state.set_state(TicketWizardStates.NETWORK_PROVIDER)
     await callback.message.edit_text(
-        ticket_wizard.network_rms_screen().text,
-        reply_markup=_network_rms_keyboard(),
+        ticket_wizard.network_provider_screen(network_type=data.get("network_type", "")).text,
+        parse_mode="HTML",
+        reply_markup=_network_select_keyboard(NETWORK_PROVIDERS, "network_provider_"),
     )
     await callback.answer()
 
@@ -4135,8 +4137,8 @@ async def _finish_network_common(callback: CallbackQuery, state: FSMContext, fil
     provider_other = (data.get("provider_other") or "").strip()
     wifi_owner = (data.get("wifi_problem_owner") or "").strip()
     pc_type = (data.get("pc_type") or "").strip()
-    if network_type == "Локальная сеть (проводная)" and not provider:
-        await callback.answer("Укажите провайдера.", show_alert=True)
+    if network_type in ("Локальная сеть (проводная)", "Wi-Fi (беспроводная)") and not provider:
+        await callback.answer("Выберите провайдера.", show_alert=True)
         return
     if network_type == "Wi-Fi (беспроводная)" and not wifi_owner:
         await callback.answer("Укажите, у кого проблемы.", show_alert=True)

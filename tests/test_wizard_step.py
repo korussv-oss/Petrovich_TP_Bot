@@ -165,6 +165,16 @@ class TestWizardStepNetwork(unittest.TestCase):
         new_s, screen = run(wizard_step(session, event))
         self.assertEqual(new_s.step, "NETWORK_WIFI_OWNER")
 
+    def test_wifi_owner_leads_to_provider(self):
+        session = self._session(
+            "NETWORK_WIFI_OWNER",
+            network_type="Wi-Fi (беспроводная)",
+        )
+        event = WizardEvent(kind="callback", callback_id="network_wifi_owner_wifi_owner_employee")
+        new_s, screen = run(wizard_step(session, event))
+        self.assertEqual(new_s.step, "NETWORK_PROVIDER")
+        self.assertEqual(new_s.data.get("wifi_problem_owner"), "Сотрудник Петрович")
+
     def test_unknown_type_returns_error(self):
         session = self._session("NETWORK_TYPE")
         event = WizardEvent(kind="callback", callback_id="network_type_zzz_unknown")
@@ -172,8 +182,12 @@ class TestWizardStepNetwork(unittest.TestCase):
         self.assertEqual(screen.kind, "error")
 
     def test_rms_skip_leads_to_description(self):
-        session = self._session("NETWORK_RMS", network_type="Wi-Fi (беспроводная)",
-                                wifi_problem_owner="Мне одному")
+        session = self._session(
+            "NETWORK_RMS",
+            network_type="Wi-Fi (беспроводная)",
+            wifi_problem_owner="Мне одному",
+            provider="Сеть Петрович",
+        )
         event = WizardEvent(kind="callback", callback_id="network_skip_rms")
         new_s, screen = run(wizard_step(session, event))
         self.assertEqual(new_s.step, "NETWORK_DESCRIPTION")

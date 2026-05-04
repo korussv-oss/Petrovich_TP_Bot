@@ -211,7 +211,7 @@ network_problem:
       customfield_18145:
         source: "form.provider"
         type: "option"
-        required: false
+        required: true
       customfield_13804:
         source: "form.provider_other"
         type: "text"
