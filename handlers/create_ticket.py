@@ -65,6 +65,7 @@ from core.electronic_queue import (
 )
 from core.email_forwarding import EMAIL_FORWARDING_ON_OFF, EMAIL_FORWARDING_ON_OFF_BY_ID
 from core.email_groups import EMAIL_GROUPS_WHAT_TO_DO, EMAIL_GROUPS_WHAT_TO_DO_BY_ID
+from core.atlassian_support import ATLASSIAN_SERVICE_TYPES, ATLASSIAN_SERVICE_BY_ID
 
 import os
 import tempfile
@@ -595,7 +596,7 @@ async def create_ticket_tp(callback: CallbackQuery, state: FSMContext):
         "📋 <b>Создать заявку в ТП</b>\n\nВ каком разделе создаём заявку?",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💻 Программы и сайт", callback_data="tp_group_programs")],
+            [InlineKeyboardButton(text="💻 Программы и сайты", callback_data="tp_group_programs")],
             [InlineKeyboardButton(text="🔐 Доступы и учетные записи", callback_data="tp_group_access")],
             [InlineKeyboardButton(text="🛠️ Оборудование", callback_data="tp_group_equipment")],
             [InlineKeyboardButton(text="🧰 Услуги", callback_data="tp_group_services")],
@@ -613,10 +614,11 @@ async def tp_group_programs(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await callback.message.edit_text(
-        "💻 <b>Программы и сайт</b>\n\nВыберите направление:",
+        "💻 <b>Программы и сайты</b>\n\nВыберите направление:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🌐 Поиск/Сайт", callback_data="tp_section_site")],
+            [InlineKeyboardButton(text="🧩 Jira / Confluence", callback_data="tp_atlassian_start")],
             [InlineKeyboardButton(text="📦 WMS", callback_data="tp_section_wms")],
             [InlineKeyboardButton(text="📧 Электронная почта", callback_data="tp_section_email")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="create_ticket_tp")],
@@ -640,6 +642,66 @@ async def tp_group_access(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🔐 Доступ к корпоративной почте через браузер", callback_data="tp_access_mail_browser")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="create_ticket_tp")],
         ]),
+    )
+    await callback.answer()
+
+
+def _atlassian_service_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"atlassian_service:{sid}")] for sid, label in ATLASSIAN_SERVICE_TYPES]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="atlassian_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _atlassian_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="atlassian_cancel")]])
+
+
+def _atlassian_attachments_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Создать заявку", callback_data="atlassian_finish_ticket")],
+            [InlineKeyboardButton(text="⏭ Пропустить вложения", callback_data="atlassian_skip_attachments")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="atlassian_cancel")],
+        ]
+    )
+
+
+@router.callback_query(lambda c: c.data == "tp_atlassian_start")
+async def tp_atlassian_start(callback: CallbackQuery, state: FSMContext):
+    if not is_user_registered(callback.from_user.id):
+        await callback.answer("Сначала пройдите регистрацию.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(TicketWizardStates.ATLASSIAN_SERVICE)
+    await callback.message.edit_text(
+        "🧩 <b>Техническая поддержка Atlassian</b>\n\nС каким сервисом проблема?",
+        parse_mode="HTML",
+        reply_markup=_atlassian_service_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "atlassian_cancel")
+async def atlassian_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await tp_group_programs(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(TicketWizardStates.ATLASSIAN_SERVICE, F.data.startswith("atlassian_service:"))
+async def atlassian_service_selected(callback: CallbackQuery, state: FSMContext):
+    sid = (callback.data.split(":", 1)[1] if callback.data else "").strip()
+    service_label = ATLASSIAN_SERVICE_BY_ID.get(sid)
+    if not service_label:
+        await callback.answer("Неверный выбор.", show_alert=True)
+        return
+    await state.update_data(atlassian_service_name=service_label)
+    await state.set_state(TicketWizardStates.ATLASSIAN_DESCRIPTION)
+    await callback.message.edit_text(
+        f"🧩 <b>Техническая поддержка Atlassian</b>\n\n✅ Сервис: {service_label}\n\n"
+        "Опишите подробно, в чём именно Вам нужна помощь:",
+        parse_mode="HTML",
+        reply_markup=_atlassian_cancel_keyboard(),
     )
     await callback.answer()
 
@@ -1872,6 +1934,84 @@ async def email_forwarding_date(message: Message, state: FSMContext):
         await message.answer(f"❌ Ошибка Jira: {issue_key}")
         return
     await message.answer(msg, disable_web_page_preview=True)
+
+
+@router.message(TicketWizardStates.ATLASSIAN_DESCRIPTION, F.text)
+async def atlassian_description(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() == "/cancel":
+        await state.clear()
+        await message.reply("Отменено.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    if not text:
+        await message.answer("❌ Описание не может быть пустым. Опишите, в чём нужна помощь.")
+        return
+    data = await state.get_data()
+    service_name = (data.get("atlassian_service_name") or "").strip()
+    if not service_name:
+        await state.clear()
+        await message.reply("Сессия истекла. Запустите сценарий заново.", reply_markup=get_main_menu_keyboard(message.from_user.id))
+        return
+    form_data = {
+        "summary": "Запрос созданный через Бот ТП",
+        "service_name": service_name,
+        "description": text,
+    }
+    await state.update_data(atlassian_form_data=form_data, atlassian_attachment_file_ids=[])
+    await state.set_state(TicketWizardStates.ATLASSIAN_ATTACHMENTS)
+    await message.answer(
+        "📎 Прикрепите вложения (опционально), затем нажмите «Создать заявку».\n\n"
+        "Если вложения не нужны, нажмите «Пропустить вложения».",
+        reply_markup=_atlassian_attachments_keyboard(),
+    )
+
+
+@router.callback_query(
+    TicketWizardStates.ATLASSIAN_ATTACHMENTS,
+    F.data.in_({"atlassian_finish_ticket", "atlassian_skip_attachments"}),
+)
+async def atlassian_finish_or_skip_attachments(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    form_data = data.get("atlassian_form_data") or {}
+    if not isinstance(form_data, dict) or not form_data:
+        await state.clear()
+        await callback.message.edit_text("Сессия истекла. Запустите сценарий заново.", reply_markup=get_main_menu_keyboard(callback.from_user.id))
+        await callback.answer()
+        return
+    file_ids = list(data.get("atlassian_attachment_file_ids") or [])
+    if callback.data == "atlassian_skip_attachments":
+        file_ids = []
+    await _telegram_submit_ticket_or_prompt_department(
+        state=state,
+        user_id=callback.from_user.id,
+        ticket_type_id="atlassian_support",
+        form_data=form_data,
+        attachment_file_ids=file_ids,
+        bot=callback.bot,
+        reply_message=callback.message,
+        edit_on_success=True,
+    )
+    await callback.answer()
+
+
+@router.message(TicketWizardStates.ATLASSIAN_ATTACHMENTS, F.photo | F.document | F.video)
+async def atlassian_collect_attachments(message: Message, state: FSMContext):
+    data = await state.get_data()
+    files = list(data.get("atlassian_attachment_file_ids") or [])
+    file_id = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document:
+        file_id = message.document.file_id
+    elif message.video:
+        file_id = message.video.file_id
+    if file_id:
+        files.append(file_id)
+    await state.update_data(atlassian_attachment_file_ids=files)
+    await message.answer(
+        f"✅ Вложение добавлено ({len(files)}). Можно отправить ещё или завершить.",
+        reply_markup=_atlassian_attachments_keyboard(),
+    )
 
 
 def _email_owa_request_kind_keyboard() -> InlineKeyboardMarkup:

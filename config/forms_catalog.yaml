@@ -463,6 +463,43 @@ email_owa_outlook:
           - id: "email_owa_req_consult"
             label: "Консультация"
 
+atlassian_support:
+  label: "Техническая поддержка Atlassian"
+  project_key: "ISR"
+  portal_id: "38"
+  jira:
+    service_desk_id: "38"
+    request_type_id: "771"
+    reporter_profile_key: "jira_username"
+    fields:
+      summary:
+        source: "form.summary"
+        type: "text"
+        required: true
+        default: "Запрос созданный через Бот ТП"
+        max_len: 255
+      customfield_12431:
+        source: "form.service_name"
+        type: "option"
+        required: true
+      description:
+        source: "form.description"
+        type: "text"
+        required: true
+        max_len: 4000
+      attachment:
+        source: "attachments"
+        type: "attachment"
+        required: false
+  ui:
+    selects:
+      service_name:
+        options:
+          - id: "jira"
+            label: "Jira"
+          - id: "confluence"
+            label: "Confluence"
+
 rubik_password_change:
   label: "Смена пароля"
   project_key: "AA"

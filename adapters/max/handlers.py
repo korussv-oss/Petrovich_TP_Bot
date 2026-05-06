@@ -149,7 +149,16 @@ def _tp_root_menu(user_id: int) -> dict:
 def _tp_programs_menu(user_id: int) -> dict:
     result = support_api.get_tp_programs_menu(CHANNEL_ID, user_id)
     if isinstance(result, Menu):
-        return menu_to_max(result)
+        rendered = menu_to_max(result)
+        try:
+            logger.info(
+                "MAX tp_programs_menu buttons for user_id=%s: %s",
+                user_id,
+                [b.get("id") for b in (rendered.get("buttons") or [])],
+            )
+        except Exception:
+            pass
+        return rendered
     if isinstance(result, Error):
         return error_to_max(result)
     return {"text": str(result)}
@@ -259,6 +268,8 @@ def handle_callback(callback_id: str, user_id: int, my_tickets: Optional[list] =
     if callback_id == "tp_section_wms":
         return None
     if callback_id == "tp_section_site":
+        return None
+    if callback_id == "tp_atlassian_start":
         return None
     if callback_id == "tp_section_email":
         return {

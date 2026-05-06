@@ -139,6 +139,11 @@ class TicketWizardStates(StatesGroup):
     EMAIL_OWA_DESCRIPTION = State()
     EMAIL_OWA_ATTACHMENTS = State()
 
+    # Atlassian support
+    ATLASSIAN_SERVICE = State()
+    ATLASSIAN_DESCRIPTION = State()
+    ATLASSIAN_ATTACHMENTS = State()
+
     # Email forwarding
     EMAIL_FORWARDING_ON_OFF = State()
     EMAIL_FORWARDING_FROM = State()

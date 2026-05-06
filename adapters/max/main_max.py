@@ -997,8 +997,9 @@ async def _handle_open_issue_max(user_id: int, callback_id: str) -> dict | None:
         return dict(cached[1])
 
     # Пункт 3 плана: более жёсткие таймауты для интерактивного UI (общее ожидание, включая retries).
-    info = await get_issue_info(issue_key, timeout_total=3.0)
-    tail = await get_issue_comments_tail(issue_key, limit=10, timeout_total=3.0)
+    open_issue_timeout = float(os.getenv("MAX_OPEN_ISSUE_TIMEOUT_SECONDS", "8.0"))
+    info = await get_issue_info(issue_key, timeout_total=open_issue_timeout)
+    tail = await get_issue_comments_tail(issue_key, limit=10, timeout_total=open_issue_timeout)
     summary = (info or {}).get("summary") or "—"
     status = jira_status_display_ru((info or {}).get("status"))
     def _fmt(comments_list, max_len=200):
@@ -1013,7 +1014,7 @@ async def _handle_open_issue_max(user_id: int, callback_id: str) -> dict | None:
     comments_list = tail.comments if tail and tail.comments is not None else []
     comm_note = "\n\n⚠️ Не удалось загрузить комментарии из Jira." if not tail or tail.comments is None else ""
     lines = _fmt(comments_list)
-    jira_url = support_api.get_jira_customer_request_url(issue_key)
+    jira_url = support_api.get_jira_customer_request_url(issue_key, (info or {}).get("project_key"))
     jira_line = f'\n🔗 <a href="{jira_url}">Открыть заявку в Jira</a>' if jira_url else ""
     text = (
         f"💬 <b>Заявка {issue_key}</b>\n"
@@ -1603,6 +1604,7 @@ async def run_max_bot() -> None:
         peripheral_flow,
         network_flow,
         electronic_queue_flow,
+        atlassian_flow,
     )
     from core.support.api import support_api
     from user_storage import bind_account_by_phone
@@ -1814,6 +1816,10 @@ async def run_max_bot() -> None:
                                 response = handle_start(user_id)
                         elif callback_id in ("ticket_lupa_search", "tp_section_site"):
                             response = await lupa_flow.start_lupa(user_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                        elif callback_id == "tp_atlassian_start":
+                            response = await atlassian_flow.start_atlassian(user_id)
                             if response is None:
                                 response = handle_start(user_id)
                         elif callback_id in ("sa_stc_menu", "sa_stc_my_tasks") or (
@@ -2103,6 +2109,28 @@ async def run_max_bot() -> None:
 
                                 response = await max_submit_ticket_with_profile_department(
                                     bot, user_id, ticket_type_id, form_data, [], wms_attach_after_create=False
+                                )
+                        elif atlassian_flow.is_in_atlassian_flow(user_id) and (
+                            callback_id == "cancel"
+                            or callback_id.startswith("atlassian_service_")
+                            or callback_id in ("atlassian_finish_ticket", "atlassian_skip_attachments")
+                        ):
+                            response = await atlassian_flow.handle_atlassian_callback(user_id, callback_id)
+                            if response is None:
+                                response = handle_start(user_id)
+                            elif response.get("create_ticket"):
+                                ct = response["create_ticket"]
+                                form_data = ct.get("form_data", {})
+                                attachment_tokens = ct.get("attachment_tokens") or []
+                                from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                response = await max_submit_ticket_with_profile_department(
+                                    bot,
+                                    user_id,
+                                    "atlassian_support",
+                                    form_data,
+                                    attachment_tokens,
+                                    wms_attach_after_create=False,
                                 )
                         elif email_flow.is_in_email_owa_flow(user_id) and (
                             callback_id == "cancel"
@@ -2608,6 +2636,7 @@ async def run_max_bot() -> None:
                                 or peripheral_flow.is_in_peripheral_flow(user_id)
                                 or network_flow.is_in_network_flow(user_id)
                                 or electronic_queue_flow.is_in_electronic_queue_flow(user_id)
+                                or atlassian_flow.is_in_atlassian_flow(user_id)
                                 or email_flow.is_in_email_owa_flow(user_id)
                                 or email_forwarding_flow.is_in_email_forwarding_flow(user_id)
                                 or email_groups_flow.is_in_email_groups_flow(user_id)
@@ -2847,6 +2876,24 @@ async def run_max_bot() -> None:
 
                                     response = await max_submit_ticket_with_profile_department(
                                         bot, user_id, ticket_type_id, form_data, [], wms_attach_after_create=False
+                                    )
+                            elif atlassian_flow.is_in_atlassian_flow(user_id):
+                                response = await atlassian_flow.handle_atlassian_message(user_id, text, attachment_list=attachment_list)
+                                if response is None:
+                                    response = {"text": "Используйте кнопки или /start.", "parse_mode": "HTML", "buttons": [{"id": "cancel", "label": "❌ Отмена"}]}
+                                elif response.get("create_ticket"):
+                                    ct = response["create_ticket"]
+                                    form_data = ct.get("form_data", {})
+                                    attachment_tokens = ct.get("attachment_tokens") or []
+                                    from adapters.max.jira_profile_department_max import max_submit_ticket_with_profile_department
+
+                                    response = await max_submit_ticket_with_profile_department(
+                                        bot,
+                                        user_id,
+                                        "atlassian_support",
+                                        form_data,
+                                        attachment_tokens,
+                                        wms_attach_after_create=False,
                                     )
                             elif email_flow.is_in_email_owa_flow(user_id):
                                 response = await email_flow.handle_email_owa_message(user_id, text, attachment_list=attachment_list)

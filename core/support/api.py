@@ -88,7 +88,7 @@ def get_tp_root_menu(channel_id: str, user_id: int) -> Menu | Error:
     return Menu(
         text="📋 <b>Создать заявку в ТП</b>\n\nВ каком разделе создаём заявку?",
         buttons=[
-            MenuButton(id="tp_group_programs", label="💻 Программы и сайт"),
+            MenuButton(id="tp_group_programs", label="💻 Программы и сайты"),
             MenuButton(id="tp_group_access", label="🔐 Доступы и учетные записи"),
             MenuButton(id="tp_group_equipment", label="🛠️ Оборудование"),
             MenuButton(id="tp_group_services", label="🧰 Услуги"),
@@ -104,9 +104,10 @@ def get_tp_programs_menu(channel_id: str, user_id: int) -> Menu | Error:
     if not is_user_registered(user_id, channel_id or "telegram"):
         return Error(message="Сначала пройдите регистрацию.")
     return Menu(
-        text="💻 <b>Программы и сайт</b>\n\nВыберите направление:",
+        text="💻 <b>Программы и сайты</b>\n\nВыберите направление:",
         buttons=[
             MenuButton(id="tp_section_site", label="🌐 Поиск/Сайт"),
+            MenuButton(id="tp_atlassian_start", label="🧩 Jira / Confluence"),
             MenuButton(id="tp_section_wms", label="📦 WMS"),
             MenuButton(id="tp_section_email", label="📧 Электронная почта"),
             MenuButton(id="create_ticket_tp", label="⬅️ Назад"),
@@ -525,6 +526,36 @@ async def create_ticket(
         if jira_url:
             from core.forms_catalog import get_form_definition
             portal_id = ((get_form_definition("email_owa_outlook") or {}).get("portal_id") or "22")
+            link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
+            msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
+        else:
+            msg = f"Заявка {result} создана. Отслеживать статус можно в разделе «Мои заявки»."
+        return True, result, msg
+
+    if ticket_type_id == "atlassian_support":
+        from user_storage import get_user_profile
+        from core.jira_form_engine import create_issue_from_form
+        from core.support.issue_binding_registry import add_binding
+        profile = get_user_profile(user_id, channel_id) or {}
+        engine_form_data = {
+            "summary": "Запрос созданный через Бот ТП",
+            "service_name": (form_data.get("service_name") or "").strip(),
+            "description": (form_data.get("description") or "").strip(),
+        }
+        ok, result, project_key = await create_issue_from_form(
+            "atlassian_support",
+            form_data=engine_form_data,
+            profile=profile,
+            attachment_paths=list(attachment_paths or []),
+        )
+        if not ok:
+            return False, result, None
+        proj = (project_key or "ISR").strip().upper()
+        add_binding(channel_id, user_id, result, proj, "atlassian_support")
+        jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
+        if jira_url:
+            from core.forms_catalog import get_form_definition
+            portal_id = ((get_form_definition("atlassian_support") or {}).get("portal_id") or "22")
             link = f"{jira_url}/plugins/servlet/desk/portal/{portal_id}/{result}"
             msg = f'Заявка <a href="{link}">{result}</a> создана. Отслеживать статус можно в разделе «Мои заявки».'
         else:
@@ -964,6 +995,7 @@ def get_ticket_type_label(ticket_type_id: Optional[str], project_key: Optional[s
         "network_problem": "Проблемы в работе сети",
         "electronic_queue": "Электронная очередь",
         "email_owa_outlook": "Электронная почта (Owa/Outlook)",
+        "atlassian_support": "Техническая поддержка Atlassian",
         "email_forwarding": "Настройка переадресации",
         "email_groups": "Группы рассылки",
         "aa_kb_chatbot": "Чат-бот по базам знаний",
@@ -985,7 +1017,11 @@ def get_ticket_type_label(ticket_type_id: Optional[str], project_key: Optional[s
     return tid
 
 
-def get_jira_customer_request_url(issue_key: str, project_key: Optional[str] = None) -> str:
+def get_jira_customer_request_url(
+    issue_key: str,
+    project_key: Optional[str] = None,
+    ticket_type_id: Optional[str] = None,
+) -> str:
     """
     Ссылка на заявку в Jira.
     PW (WMS): /browse/PW-xxx; WHD (Lupa): portal/5; HD (PC): portal/1; ISR (Email): portal/1.
@@ -998,6 +1034,16 @@ def get_jira_customer_request_url(issue_key: str, project_key: Optional[str] = N
     if not base:
         return ""
     proj = (project_key or "").strip().upper()
+    tid = (ticket_type_id or "").strip()
+    if tid:
+        try:
+            from core.forms_catalog import get_form_definition
+            fdef = get_form_definition(tid) or {}
+            portal_id = (fdef.get("portal_id") or "").strip()
+            if portal_id:
+                return f"{base}/plugins/servlet/desk/portal/{portal_id}/{key}"
+        except Exception:
+            pass
     # WMS (PW): ссылка вида https://jira.petrovich.tech/browse/PW-25800
     if proj == "PW":
         return f"{base}/browse/{key}"
@@ -1071,7 +1117,11 @@ def get_my_tickets(channel_id: str, user_id: int) -> List[dict]:
                 "project_key": b.get("project_key"),
                 "ticket_type_id": b.get("ticket_type_id"),
                 "request_type_label": get_ticket_type_label(b.get("ticket_type_id"), b.get("project_key")),
-                "customer_request_url": get_jira_customer_request_url(b.get("issue_key"), b.get("project_key")),
+                "customer_request_url": get_jira_customer_request_url(
+                    b.get("issue_key"),
+                    b.get("project_key"),
+                    b.get("ticket_type_id"),
+                ),
             })
     return result
 
@@ -1230,8 +1280,13 @@ class SupportAPI:
     def user_owns_issue(self, channel_id: str, user_id: int, issue_key: str) -> bool:
         return user_owns_issue(channel_id, user_id, issue_key)
 
-    def get_jira_customer_request_url(self, issue_key: str) -> str:
-        return get_jira_customer_request_url(issue_key)
+    def get_jira_customer_request_url(
+        self,
+        issue_key: str,
+        project_key: Optional[str] = None,
+        ticket_type_id: Optional[str] = None,
+    ) -> str:
+        return get_jira_customer_request_url(issue_key, project_key, ticket_type_id)
 
     def get_jira_browse_url(self, issue_key: str) -> str:
         return get_jira_browse_url(issue_key)
