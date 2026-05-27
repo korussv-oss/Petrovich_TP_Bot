@@ -95,6 +95,33 @@ async def max_submit_ticket_with_profile_department(
     Создаёт заявку в MAX или переводит пользователя к выбору подразделения Jira.
     wms_attach_after_create: для wms_issue — вложения добавляются после создания ключа.
     """
+    from adapters.max.ticket_create_guard import get_max_ticket_create_guard
+
+    guard = get_max_ticket_create_guard()
+    return await guard.run(
+        user_id,
+        ticket_type_id,
+        form_data,
+        lambda: _max_submit_ticket_with_profile_department_impl(
+            bot,
+            user_id,
+            ticket_type_id,
+            form_data,
+            attachment_tokens,
+            wms_attach_after_create=wms_attach_after_create,
+        ),
+    )
+
+
+async def _max_submit_ticket_with_profile_department_impl(
+    bot,
+    user_id: int,
+    ticket_type_id: str,
+    form_data: dict,
+    attachment_tokens: Optional[List[Any]] = None,
+    *,
+    wms_attach_after_create: bool = False,
+) -> dict:
     from core.support.api import NEED_PROFILE_DEPARTMENT, support_api
 
     uid = int(user_id)

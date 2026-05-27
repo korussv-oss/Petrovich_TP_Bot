@@ -33,6 +33,11 @@ _users_cache: Optional[Dict[str, Dict[str, Any]]] = None
 _cache_loaded_at: float = 0.0
 _CACHE_TTL = 30.0  # секунд; при записи кэш обновляется мгновенно
 
+# Кэш get_user_profile (канал + primary id) — снижает повторные SELECT в wizard MAX/TG.
+_profile_cache_lock = threading.Lock()
+_profile_cache: Dict[Tuple[str, int], Tuple[float, Dict[str, Any]]] = {}
+_PROFILE_CACHE_TTL = float(os.getenv("USER_PROFILE_CACHE_TTL_SECONDS", "45"))
+
 
 def _encryption_enabled() -> bool:
     return os.getenv("ENCRYPT_USER_DATA", "").strip().lower() in ("1", "true", "yes")
@@ -228,10 +233,29 @@ def update_phone_and_mark_verified_channel(channel_id: str, user_id: int, phone:
     save_user_db(db)
 
 
+def _invalidate_profile_cache(primary_id: int, channel_id: str = "") -> None:
+    pid = int(primary_id)
+    ch = (channel_id or "").strip().lower()
+    with _profile_cache_lock:
+        if ch:
+            _profile_cache.pop((ch, pid), None)
+        else:
+            for key in list(_profile_cache.keys()):
+                if key[1] == pid:
+                    _profile_cache.pop(key, None)
+
+
 def get_user_profile(user_id: int, channel_id: str = "telegram") -> Optional[Dict[str, Any]]:
     """Профиль пользователя. Для MAX: user_id — это max_user_id, при необходимости разрешается в telegram_id."""
+    ch = (channel_id or "telegram").strip().lower()
     primary = resolve_channel_user_id(channel_id, user_id)
+    cache_key = (ch, int(primary))
     if use_sqlite_storage():
+        now = _time_module.monotonic()
+        with _profile_cache_lock:
+            hit = _profile_cache.get(cache_key)
+            if hit and (now - hit[0]) < _PROFILE_CACHE_TTL:
+                return dict(hit[1])
         row = _sqlite.get_user(int(primary))
         if not row:
             return None
@@ -243,6 +267,8 @@ def get_user_profile(user_id: int, channel_id: str = "telegram") -> Optional[Dic
             row["phone_needs_verification"] = True
         # registered_at хранится как float timestamp; оставляем как есть (используется редко)
         row.pop("telegram_id", None)
+        with _profile_cache_lock:
+            _profile_cache[cache_key] = (now, dict(row))
         return row
     db = load_user_db()
     return db.get(str(primary))
@@ -256,6 +282,7 @@ def save_user_profile(user_id: int, profile: Dict[str, Any], old_profile: Option
         if phone:
             p["phone_norm"] = _normalize_phone_key(str(phone))
         _sqlite.upsert_user(int(user_id), p)
+        _invalidate_profile_cache(int(user_id))
         return
     db = load_user_db()
     db[str(user_id)] = profile

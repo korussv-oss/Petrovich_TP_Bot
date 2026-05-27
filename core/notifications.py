@@ -18,7 +18,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from core.support import delivery as delivery_module
-from core.support.issue_binding_registry import get_all_issue_keys, get_user_ids_by_issue, get_bindings_by_issue
+from core.support.issue_binding_registry import (
+    get_all_issue_keys,
+    get_user_ids_by_issue,
+    get_bindings_by_issue,
+    remove_bindings_by_issue,
+)
 from core.jira_status_ru import jira_status_display_ru
 
 logger = logging.getLogger(__name__)
@@ -259,14 +264,69 @@ def _load_state() -> Dict[str, Dict[str, Any]]:
         return {}
 
 
-def _save_state(data: Dict[str, Dict[str, Any]]) -> None:
+def _save_state_delta(delta: Dict[str, Dict[str, Any]]) -> None:
+    """Сохраняет только изменённые ключи (не перезаписывает всю таблицу состояния)."""
+    if not delta:
+        return
     if use_sqlite_storage():
-        # SQLite: bulk-upsert за один проход (меньше блокирует event-loop)
         t0 = time.monotonic()
+        _sqlite.upsert_notification_states_bulk(delta)
+        dt = time.monotonic() - t0
+        if dt > 0.2:
+            logger.warning(
+                "SQLite: upsert_notification_states_bulk (delta) занял %.3fs (keys=%s)",
+                dt,
+                len(delta),
+            )
+        return
+    data = _load_state()
+    for key, row in delta.items():
+        k = (key or "").strip().upper()
+        if not k or not isinstance(row, dict):
+            continue
+        merged = dict(data.get(k) or {})
+        merged.update(row)
+        data[k] = merged
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+async def _save_state_delta_async(delta: Dict[str, Dict[str, Any]]) -> None:
+    if delta:
+        await asyncio.to_thread(_save_state_delta, delta)
+
+
+def _load_state_for_keys(issue_keys: List[str]) -> Dict[str, Dict[str, Any]]:
+    if use_sqlite_storage():
+        return _sqlite.get_notification_states_for_keys(issue_keys)
+    full = _load_state()
+    keys = {(k or "").strip().upper() for k in issue_keys if (k or "").strip()}
+    return {k: dict(full[k]) for k in keys if k in full}
+
+
+async def _load_state_for_keys_async(issue_keys: List[str]) -> Dict[str, Dict[str, Any]]:
+    return await asyncio.to_thread(_load_state_for_keys, issue_keys)
+
+
+async def _load_state_async() -> Dict[str, Dict[str, Any]]:
+    return await asyncio.to_thread(_load_state)
+
+
+def _save_state(data: Dict[str, Dict[str, Any]]) -> None:
+    """Полная перезапись состояния (legacy). Для SQLite предпочтителен _save_state_delta."""
+    if use_sqlite_storage():
+        t0 = time.monotonic()
+        n = len(data or {})
+        if n > 200:
+            logger.warning(
+                "SQLite: полный _save_state для %s ключей — используйте _save_state_delta",
+                n,
+            )
         _sqlite.upsert_notification_states_bulk(data or {})
         dt = time.monotonic() - t0
         if dt > 0.2:
-            logger.warning("SQLite: upsert_notification_states_bulk занял %.3fs (keys=%s)", dt, len(data or {}))
+            logger.warning("SQLite: upsert_notification_states_bulk занял %.3fs (keys=%s)", dt, n)
         return
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -281,15 +341,24 @@ def _get_last_comment_count(issue_key: str) -> Optional[int]:
     return data.get(key, {}).get("last_comment_count")
 
 
-def _set_last_comment_count(issue_key: str, count: int) -> None:
+def _patch_notification_state(issue_key: str, patch: Dict[str, Any]) -> None:
     key = (issue_key or "").strip().upper()
-    if not key:
+    if not key or not patch:
+        return
+    if use_sqlite_storage():
+        row = dict(_sqlite.get_notification_state(key) or {})
+        row.update(patch)
+        _save_state_delta({key: row})
         return
     data = _load_state()
     if key not in data:
         data[key] = {}
-    data[key]["last_comment_count"] = count
+    data[key].update(patch)
     _save_state(data)
+
+
+def _set_last_comment_count(issue_key: str, count: int) -> None:
+    _patch_notification_state(issue_key, {"last_comment_count": int(count)})
 
 
 _NOTIFIED_COMMENT_IDS_CAP = 400
@@ -310,10 +379,12 @@ def _add_notified_comment_ids(issue_key: str, ids: List[str]) -> None:
     key = (issue_key or "").strip().upper()
     if not key or not ids:
         return
-    data = _load_state()
-    if key not in data:
-        data[key] = {}
-    seen = data[key].get("notified_comment_ids")
+    if use_sqlite_storage():
+        row = dict(_sqlite.get_notification_state(key) or {})
+    else:
+        data = _load_state()
+        row = dict(data.get(key) or {})
+    seen = row.get("notified_comment_ids")
     if not isinstance(seen, list):
         seen = []
     for i in ids:
@@ -323,8 +394,8 @@ def _add_notified_comment_ids(issue_key: str, ids: List[str]) -> None:
     cap = max(50, int(os.getenv("COMMENTS_NOTIFIED_IDS_CAP", str(_NOTIFIED_COMMENT_IDS_CAP))))
     while len(seen) > cap:
         seen.pop(0)
-    data[key]["notified_comment_ids"] = seen
-    _save_state(data)
+    row["notified_comment_ids"] = seen
+    _patch_notification_state(key, row)
 
 
 def _get_last_status(issue_key: str) -> Optional[str]:
@@ -344,25 +415,11 @@ def _get_last_assignee(issue_key: str) -> Optional[str]:
 
 
 def _set_last_status(issue_key: str, status: str) -> None:
-    key = (issue_key or "").strip().upper()
-    if not key:
-        return
-    data = _load_state()
-    if key not in data:
-        data[key] = {}
-    data[key]["last_status"] = (status or "").strip()
-    _save_state(data)
+    _patch_notification_state(issue_key, {"last_status": (status or "").strip()})
 
 
 def _set_last_assignee(issue_key: str, assignee_username: str) -> None:
-    key = (issue_key or "").strip().upper()
-    if not key:
-        return
-    data = _load_state()
-    if key not in data:
-        data[key] = {}
-    data[key]["last_assignee"] = (assignee_username or "").strip().lower()
-    _save_state(data)
+    _patch_notification_state(issue_key, {"last_assignee": (assignee_username or "").strip().lower()})
 
 
 def set_issue_last_assignee_baseline(issue_key: str, assignee_username: str) -> None:
@@ -450,9 +507,34 @@ async def check_registry_statuses_and_notify() -> None:
     from core.jira_aa import get_issue_status
     from core.password_requests import remove_pending
 
-    issue_keys = get_all_issue_keys()
+    issue_keys = await asyncio.to_thread(get_all_issue_keys)
     if not issue_keys:
         return
+    per_tick = max(10, int(os.getenv("STATUS_ISSUES_PER_TICK", "120")))
+    global _status_rr_cursor
+    try:
+        _status_rr_cursor
+    except NameError:
+        _status_rr_cursor = 0
+    start = int(_status_rr_cursor) % max(1, len(issue_keys))
+    window = issue_keys[start : start + per_tick]
+    if len(window) < min(per_tick, len(issue_keys)):
+        window = window + issue_keys[: max(0, per_tick - len(window))]
+    _status_rr_cursor = (start + len(window)) % max(1, len(issue_keys))
+
+    state = await _load_state_for_keys_async(window)
+    dirty_keys: set[str] = set()
+
+    def _state_get_last_status(key: str) -> Optional[str]:
+        return (state.get((key or "").strip().upper()) or {}).get("last_status")
+
+    def _state_set_last_status(key: str, status: str) -> None:
+        k = (key or "").strip().upper()
+        if not k:
+            return
+        row = state.setdefault(k, {})
+        row["last_status"] = (status or "").strip()
+        dirty_keys.add(k)
 
     _semaphore = asyncio.Semaphore(5)
 
@@ -460,7 +542,18 @@ async def check_registry_statuses_and_notify() -> None:
         async with _semaphore:
             return key, await get_issue_status(key)
 
-    raw_results = await asyncio.gather(*[_fetch_status(k) for k in issue_keys], return_exceptions=True)
+    raw_results = await asyncio.gather(*[_fetch_status(k) for k in window], return_exceptions=True)
+
+    prune_closed_enabled = (os.getenv("STATUS_PRUNE_CLOSED_BINDINGS") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    prune_closed_after_hours = max(
+        1,
+        int(os.getenv("STATUS_PRUNE_CLOSED_AFTER_HOURS", "72")),
+    )
 
     for result in raw_results:
         if isinstance(result, Exception):
@@ -476,10 +569,10 @@ async def check_registry_statuses_and_notify() -> None:
                 continue
             status_lower = status.lower().strip()
             status_ru = jira_status_display_ru(status)
-            last = _get_last_status(issue_key)
+            last = _state_get_last_status(issue_key)
             text = None
             if last is None:
-                _set_last_status(issue_key, status)
+                _state_set_last_status(issue_key, status)
                 # Первый опрос: уведомляем только если статус уже финальный (заявку успели закрыть до первого опроса)
                 if status_lower in STATUS_RESOLVED:
                     remove_pending(issue_key)
@@ -492,23 +585,23 @@ async def check_registry_statuses_and_notify() -> None:
                 if status_lower in STATUS_RESOLVED:
                     remove_pending(issue_key)
                     if last_lower in STATUS_RESOLVED:
-                        _set_last_status(issue_key, status)
+                        _state_set_last_status(issue_key, status)
                         continue
                     text = f"✅ <b>Заявка {issue_key}</b> выполнена.\n\nСтатус: {status_ru}"
                 elif status_lower in STATUS_REJECTED:
                     remove_pending(issue_key)
                     if last_lower in STATUS_REJECTED:
-                        _set_last_status(issue_key, status)
+                        _state_set_last_status(issue_key, status)
                         continue
                     text = f"❌ <b>Заявка {issue_key}</b> отклонена.\n\nСтатус: {status_ru}"
                 else:
                     if last and last_lower == status_lower:
                         continue
                     if status_lower in STATUS_SILENT:
-                        _set_last_status(issue_key, status)
+                        _state_set_last_status(issue_key, status)
                         continue
                     text = f"📋 <b>Заявка {issue_key}</b>\n\nНовый статус: {status_ru}"
-                _set_last_status(issue_key, status)
+                _state_set_last_status(issue_key, status)
 
             if text:
                 for channel_id, user_id in recipients:
@@ -516,8 +609,26 @@ async def check_registry_statuses_and_notify() -> None:
                         await delivery_module.deliver(channel_id, user_id, text, reply_markup=None)
                     except Exception as e:
                         logger.warning("Не удалось отправить уведомление о статусе %s -> %s/%s: %s", issue_key, channel_id, user_id, e)
+
+            # Держим в активном реестре только «живые» заявки:
+            # если заявка давно в финальном статусе, убираем её привязки,
+            # чтобы не опрашивать бесконечно в фоновых циклах.
+            if prune_closed_enabled and status_lower in (STATUS_RESOLVED | STATUS_REJECTED):
+                old_enough = not _is_recent_issue_binding(issue_key, window_seconds=prune_closed_after_hours * 3600)
+                if old_enough:
+                    removed = await asyncio.to_thread(remove_bindings_by_issue, issue_key)
+                    if removed:
+                        logger.info(
+                            "Статусы: удалены старые закрытые привязки %s (status=%s, removed=%s, age>=%sh)",
+                            issue_key,
+                            status,
+                            removed,
+                            prune_closed_after_hours,
+                        )
         except Exception as e:
             logger.warning("Ошибка обработки статуса %s: %s", issue_key, e)
+    if dirty_keys:
+        await _save_state_delta_async({k: state[k] for k in dirty_keys if k in state})
 
 
 async def check_registry_comments_and_notify() -> dict:
@@ -541,7 +652,7 @@ async def check_registry_comments_and_notify() -> dict:
         if s.strip()
     }
 
-    issue_keys = get_all_issue_keys()
+    issue_keys = await asyncio.to_thread(get_all_issue_keys)
     if not issue_keys:
         return {"total": 0, "ok": 0, "rate_limited": 0, "server_error": 0, "auth_error": 0, "other_error": 0}
 
@@ -558,15 +669,87 @@ async def check_registry_comments_and_notify() -> dict:
     _comments_rr_cursor = (start + len(window)) % max(1, len(issue_keys))
 
     include_internal = (os.getenv("COMMENTS_INCLUDE_INTERNAL") or "").strip().lower() in ("1", "true", "yes", "on")
+    state = await _load_state_for_keys_async(window)
+    dirty_keys: set[str] = set()
+    recent_binding_cache: Dict[str, bool] = {}
 
-    # Concurrency controls + state lock to avoid file races
+    # Concurrency controls
     max_concurrency = max(1, int(os.getenv("COMMENTS_JIRA_CONCURRENCY", "4")))
     sem = asyncio.Semaphore(max_concurrency)
-    global _comments_state_lock
-    try:
-        _comments_state_lock
-    except NameError:
-        _comments_state_lock = asyncio.Lock()
+
+    def _state_row(key: str) -> Dict[str, Any]:
+        return state.setdefault((key or "").strip().upper(), {})
+
+    def _state_get_last_comment_count(key: str) -> Optional[int]:
+        return (_state_row(key) or {}).get("last_comment_count")
+
+    def _state_set_last_comment_count(key: str, count: int) -> None:
+        k = (key or "").strip().upper()
+        if not k:
+            return
+        _state_row(key)["last_comment_count"] = int(count)
+        dirty_keys.add(k)
+
+    def _state_get_notified_comment_ids(key: str) -> set[str]:
+        raw = (_state_row(key) or {}).get("notified_comment_ids")
+        if not isinstance(raw, list):
+            return set()
+        return {str(x) for x in raw if x is not None and str(x).strip()}
+
+    def _state_add_notified_comment_ids(key: str, ids: List[str]) -> None:
+        if not ids:
+            return
+        k = (key or "").strip().upper()
+        row = _state_row(key)
+        seen = row.get("notified_comment_ids")
+        if not isinstance(seen, list):
+            seen = []
+        for i in ids:
+            si = str(i).strip()
+            if si and si not in seen:
+                seen.append(si)
+        cap = max(50, int(os.getenv("COMMENTS_NOTIFIED_IDS_CAP", str(_NOTIFIED_COMMENT_IDS_CAP))))
+        while len(seen) > cap:
+            seen.pop(0)
+        row["notified_comment_ids"] = seen
+        dirty_keys.add(k)
+
+    def _state_clear_comment_error_streak(key: str) -> None:
+        k = (key or "").strip().upper()
+        row = state.get(k)
+        if row and "jira_comment_error_streak" in row:
+            row.pop("jira_comment_error_streak", None)
+            dirty_keys.add(k)
+
+    def _state_update_comment_error_streak(key: str, status_code: str, now_ts: float) -> int:
+        k = (key or "").strip().upper()
+        row = _state_row(key)
+        last_err = row.get("jira_comment_error_streak") or {}
+        last_status = last_err.get("status")
+        last_count = int(last_err.get("count") or 0)
+        last_ts = last_err.get("last_ts")
+        try:
+            last_ts_f = float(last_ts) if last_ts is not None else None
+        except Exception:
+            last_ts_f = None
+        if last_status != status_code or last_ts_f is None or (now_ts - last_ts_f) > comments_cleanup_window_hours * 3600:
+            new_count = 1
+        else:
+            new_count = last_count + 1
+        row["jira_comment_error_streak"] = {"status": status_code, "count": new_count, "last_ts": now_ts}
+        dirty_keys.add(k)
+        return new_count
+
+    def _is_recent_binding_cached(key: str) -> bool:
+        k = (key or "").strip().upper()
+        if not k:
+            return False
+        cached = recent_binding_cache.get(k)
+        if cached is not None:
+            return cached
+        val = _is_recent_issue_binding(k)
+        recent_binding_cache[k] = val
+        return val
 
     stats = {"total": len(window), "ok": 0, "rate_limited": 0, "server_error": 0, "auth_error": 0, "other_error": 0}
 
@@ -587,13 +770,8 @@ async def check_registry_comments_and_notify() -> dict:
                         from core.support.issue_binding_registry import remove_bindings_by_issue
                         removed = remove_bindings_by_issue(issue_key)
                         logger.info("Комментарии %s: issue не существует, удалены привязки: %s", issue_key, removed)
-                        _set_last_comment_count(issue_key, 0)
-                        async with _comments_state_lock:
-                            st = _load_state()
-                            k = (issue_key or "").strip().upper()
-                            if k and k in st:
-                                st[k].pop("jira_comment_error_streak", None)
-                                _save_state(st)
+                        _state_set_last_comment_count(issue_key, 0)
+                        _state_clear_comment_error_streak(issue_key)
                         return
 
                     try:
@@ -613,54 +791,30 @@ async def check_registry_comments_and_notify() -> dict:
                         now_ts = time.time()
                         key = (issue_key or "").strip().upper()
                         if key:
-                            async with _comments_state_lock:
-                                state = _load_state()
-                                rec = state.get(key, {})
-                                last_err = rec.get("jira_comment_error_streak") or {}
-                                last_status = last_err.get("status")
-                                last_count = int(last_err.get("count") or 0)
-                                last_ts = last_err.get("last_ts")
-                                try:
-                                    last_ts_f = float(last_ts) if last_ts is not None else None
-                                except Exception:
-                                    last_ts_f = None
+                            new_count = _state_update_comment_error_streak(key, str(http_status), now_ts)
 
-                                if last_status != str(http_status) or last_ts_f is None or (now_ts - last_ts_f) > comments_cleanup_window_hours * 3600:
-                                    new_count = 1
-                                else:
-                                    new_count = last_count + 1
-
-                                rec["jira_comment_error_streak"] = {"status": str(http_status), "count": new_count, "last_ts": now_ts}
-                                state[key] = rec
-                                _save_state(state)
-
-                            if new_count >= comments_cleanup_threshold and not _is_recent_issue_binding(issue_key):
+                            if new_count >= comments_cleanup_threshold and not _is_recent_binding_cached(issue_key):
                                 from core.support.issue_binding_registry import remove_bindings_by_issue
                                 removed = remove_bindings_by_issue(issue_key)
                                 logger.warning(
                                     "Комментарии %s: Jira стабильно отвечает HTTP %s (streak=%s). Удалены привязки: %s",
                                     issue_key, http_status, new_count, removed,
                                 )
-                                _set_last_comment_count(issue_key, 0)
-                                async with _comments_state_lock:
-                                    state2 = _load_state()
-                                    k2 = (issue_key or "").strip().upper()
-                                    if k2 and k2 in state2:
-                                        state2[k2].pop("jira_comment_error_streak", None)
-                                        _save_state(state2)
+                                _state_set_last_comment_count(issue_key, 0)
+                                _state_clear_comment_error_streak(issue_key)
                     return
 
                 current_count = len(comments)
-                last_count = _get_last_comment_count(issue_key)
+                last_count = _state_get_last_comment_count(issue_key)
                 if last_count is None:
-                    if current_count > 0 and _is_recent_issue_binding(issue_key) and current_count <= 5:
+                    if current_count > 0 and _is_recent_binding_cached(issue_key) and current_count <= 5:
                         last_count = 0
                     else:
-                        _set_last_comment_count(issue_key, current_count)
+                        _state_set_last_comment_count(issue_key, current_count)
                         return
 
-                if last_count == 0 and current_count > 0 and not _is_recent_issue_binding(issue_key) and current_count >= zero_baseline_skip_min:
-                    _set_last_comment_count(issue_key, current_count)
+                if last_count == 0 and current_count > 0 and not _is_recent_binding_cached(issue_key) and current_count >= zero_baseline_skip_min:
+                    _state_set_last_comment_count(issue_key, current_count)
                     return
 
                 if current_count == 0 and last_count > 0:
@@ -671,23 +825,23 @@ async def check_registry_comments_and_notify() -> dict:
                     return
 
                 if current_count < last_count:
-                    _set_last_comment_count(issue_key, current_count)
+                    _state_set_last_comment_count(issue_key, current_count)
                     return
 
                 new_count = current_count - last_count
-                if new_count > comments_wave_delta_threshold and not _is_recent_issue_binding(issue_key):
+                if new_count > comments_wave_delta_threshold and not _is_recent_binding_cached(issue_key):
                     logger.warning(
                         "Комментарии: подозрительный всплеск для %s (last=%s current=%s delta=%s). Уведомления не отправляем, baseline обновляем.",
                         issue_key, last_count, current_count, new_count,
                     )
-                    _set_last_comment_count(issue_key, current_count)
+                    _state_set_last_comment_count(issue_key, current_count)
                     return
 
                 if current_count <= last_count:
                     return
 
                 new_comments = comments[-new_count:]
-                already_notified = _get_notified_comment_ids(issue_key)
+                already_notified = _state_get_notified_comment_ids(issue_key)
                 from user_storage import get_user_profile
 
                 recipient_prefixes: List[tuple[str | None, str, int]] = []
@@ -715,7 +869,7 @@ async def check_registry_comments_and_notify() -> dict:
                     comment_entries.append({"cid": cid_str if cid_str else None, "prefix": prefix, "line": line})
 
                 if not comment_entries:
-                    _set_last_comment_count(issue_key, current_count)
+                    _state_set_last_comment_count(issue_key, current_count)
                     return
 
                 reply_markup = [[{"text": "✏️ Написать комментарий", "callback_data": f"add_comment:{issue_key}"}]]
@@ -739,8 +893,8 @@ async def check_registry_comments_and_notify() -> dict:
                         logger.warning("Не удалось отправить уведомление о комментарии %s -> %s/%s: %s", issue_key, channel_id, user_id, e)
 
                 if delivered_any and delivered_ids:
-                    _add_notified_comment_ids(issue_key, list(delivered_ids))
-                _set_last_comment_count(issue_key, current_count)
+                    _state_add_notified_comment_ids(issue_key, list(delivered_ids))
+                _state_set_last_comment_count(issue_key, current_count)
                 stats["ok"] += 1
             except Exception as e:
                 stats["other_error"] += 1
@@ -749,6 +903,8 @@ async def check_registry_comments_and_notify() -> dict:
                 await asyncio.sleep(0)
 
     await asyncio.gather(*[_process_issue(k) for k in window])
+    if dirty_keys:
+        await _save_state_delta_async({k: state[k] for k in dirty_keys if k in state})
     return stats
 
 
@@ -764,9 +920,23 @@ async def check_assignee_tasks_and_notify() -> None:
 
     await flush_stc_assign_notification_queue()
 
-    issue_keys = get_all_issue_keys()
+    issue_keys = await asyncio.to_thread(get_all_issue_keys)
     if not issue_keys:
         return
+    state = await _load_state_async()
+    dirty_keys: set[str] = set()
+
+    def _state_get_last_assignee(key: str) -> Optional[str]:
+        return (state.get((key or "").strip().upper()) or {}).get("last_assignee")
+
+    def _state_set_last_assignee(key: str, assignee_username: str) -> None:
+        k = (key or "").strip().upper()
+        if not k:
+            return
+        row = state.setdefault(k, {})
+        row["last_assignee"] = (assignee_username or "").strip().lower()
+        dirty_keys.add(k)
+
     # Batch-запрос: все заявки за один HTTP-вызов вместо N
     details_batch = await get_issues_admin_details_batch(issue_keys)
     for issue_key in issue_keys:
@@ -778,7 +948,7 @@ async def check_assignee_tasks_and_notify() -> None:
             if not assignee_username:
                 continue
             recipients = get_stc_recipients_by_jira_username(assignee_username)
-            last_assignee = (_get_last_assignee(issue_key) or "").strip().lower()
+            last_assignee = (_state_get_last_assignee(issue_key) or "").strip().lower()
             if not recipients:
                 continue
             # should_send управляет именно рассылкой «Новая задача…».
@@ -786,11 +956,11 @@ async def check_assignee_tasks_and_notify() -> None:
             # комментарии/статусы дальше доходили до них из issue_bindings.
             should_send = False
             if not last_assignee:
-                _set_last_assignee(issue_key, assignee_username)
+                _state_set_last_assignee(issue_key, assignee_username)
                 # Для новых заявок шлём уведомление сразу; для исторических — только baseline.
                 should_send = _is_recent_issue_binding(issue_key)
             elif last_assignee != assignee_username:
-                _set_last_assignee(issue_key, assignee_username)
+                _state_set_last_assignee(issue_key, assignee_username)
                 should_send = True
 
             recipients = _expand_recipients_to_linked_channels(recipients)
@@ -854,6 +1024,8 @@ async def check_assignee_tasks_and_notify() -> None:
         except Exception as e:
             logger.warning("Ошибка уведомления assignee %s: %s", issue_key, e)
         await asyncio.sleep(0)
+    if dirty_keys:
+        await _save_state_delta_async({k: state[k] for k in dirty_keys if k in state})
 
 
 async def run_registry_status_loop(interval_seconds: int = 90) -> None:

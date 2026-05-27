@@ -646,6 +646,21 @@ def upsert_notification_states_bulk(data: Dict[str, Dict[str, Any]]) -> None:
             raise
 
 
+def _normalize_notification_state_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    raw = row.get("notified_comment_ids")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            import json as _json
+
+            parsed = _json.loads(raw)
+            row["notified_comment_ids"] = parsed if isinstance(parsed, list) else []
+        except Exception:
+            row["notified_comment_ids"] = []
+    elif raw is None:
+        row["notified_comment_ids"] = []
+    return row
+
+
 def list_notification_states() -> Dict[str, Dict[str, Any]]:
     """
     Возвращает все строки issue_notification_state как dict[ISSUE_KEY] -> row_dict.
@@ -658,19 +673,30 @@ def list_notification_states() -> Dict[str, Dict[str, Any]]:
     for r in rows:
         key = (str(r["issue_key"]) if r["issue_key"] is not None else "").strip().upper()
         if key:
-            row = dict(r)
-            # Normalize notified_comment_ids JSON back to list for callers.
-            raw = row.get("notified_comment_ids")
-            if isinstance(raw, str) and raw.strip():
-                try:
-                    import json as _json
-                    parsed = _json.loads(raw)
-                    row["notified_comment_ids"] = parsed if isinstance(parsed, list) else []
-                except Exception:
-                    row["notified_comment_ids"] = []
-            elif raw is None:
-                row["notified_comment_ids"] = []
-            out[key] = row
+            out[key] = _normalize_notification_state_row(dict(r))
+    return out
+
+
+def get_notification_states_for_keys(issue_keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    """Читает состояние уведомлений только для указанных issue_key (для фоновых тиков с окном ключей)."""
+    keys = sorted({(k or "").strip().upper() for k in issue_keys if (k or "").strip()})
+    if not keys:
+        return {}
+    init_db()
+    conn = _connect()
+    out: Dict[str, Dict[str, Any]] = {}
+    chunk_size = max(1, int(os.getenv("SQLITE_IN_CLAUSE_CHUNK", "400")))
+    for i in range(0, len(keys), chunk_size):
+        chunk = keys[i : i + chunk_size]
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT * FROM issue_notification_state WHERE issue_key IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        for r in rows:
+            key = (str(r["issue_key"]) if r["issue_key"] is not None else "").strip().upper()
+            if key:
+                out[key] = _normalize_notification_state_row(dict(r))
     return out
 
 

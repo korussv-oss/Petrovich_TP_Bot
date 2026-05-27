@@ -2,6 +2,7 @@
 Единый API Support Core для адаптеров (Telegram, MAX).
 Методы возвращают DTO (Text, Menu, Form, Error); адаптер рендерит их в канал.
 """
+import asyncio
 import logging
 import os
 from typing import List, Optional
@@ -14,6 +15,39 @@ logger = logging.getLogger(__name__)
 
 # Возврат create_ticket при отсутствии profile.department для форм с обязательным Jira-полем подразделения.
 NEED_PROFILE_DEPARTMENT = "__NEED_PROFILE_DEPARTMENT__"
+
+
+async def _profile_for_ticket(channel_id: str, user_id: int) -> dict:
+    """Профиль пользователя; при SQLite — в отдельном потоке, чтобы не блокировать MAX/TG loop."""
+    from user_storage import get_user_profile
+    from core.storage import use_sqlite_storage
+
+    if use_sqlite_storage():
+        return (await asyncio.to_thread(get_user_profile, user_id, channel_id)) or {}
+    return get_user_profile(user_id, channel_id) or {}
+
+
+async def _register_ticket_binding(
+    channel_id: str,
+    user_id: int,
+    issue_key: str,
+    project_key: str,
+    ticket_type_id: str,
+) -> None:
+    from core.support.issue_binding_registry import add_binding
+    from core.storage import use_sqlite_storage
+
+    if use_sqlite_storage():
+        await asyncio.to_thread(
+            add_binding,
+            channel_id,
+            user_id,
+            issue_key,
+            project_key,
+            ticket_type_id,
+        )
+    else:
+        add_binding(channel_id, user_id, issue_key, project_key, ticket_type_id)
 
 
 def _channel_user_id(channel_id: str, user_id: int) -> tuple:
@@ -255,7 +289,7 @@ async def create_ticket(
     from core.forms_catalog import form_requires_profile_department
 
     if form_requires_profile_department(ticket_type_id):
-        _prof = get_user_profile(user_id, channel_id) or {}
+        _prof = await _profile_for_ticket(channel_id, user_id)
         if not ((_prof.get("department") or "").strip()):
             return False, NEED_PROFILE_DEPARTMENT, None
 
@@ -264,7 +298,7 @@ async def create_ticket(
         from core.jira_form_engine import create_issue_from_form
         from core.jira_wms import create_wms_issue
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         summary = (form_data.get("summary") or "").strip() or "Заявка по настройке WMS"
         description = (form_data.get("description") or "").strip()
         # Процесс: в MAX приходит значение из WMS_PROCESSES, в TG тоже (кнопки). Допускаем ключ proc_* → значение.
@@ -305,7 +339,7 @@ async def create_ticket(
             )
         if not ok:
             return False, result, None
-        add_binding(channel_id, user_id, result, "PW", "wms_issue")
+        await _register_ticket_binding(channel_id, user_id, result, "PW", "wms_issue")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             link = f'{jira_url}/browse/{result}'
@@ -319,7 +353,7 @@ async def create_ticket(
         from core.jira_form_engine import create_issue_from_form
         from core.jira_lupa import create_lupa_issue
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         # В Лупе комментарий может быть пропущен (описание опционально).
         description = (form_data.get("description") or "").strip() or "Описание не предоставлено"
         employee_id = (profile.get("employee_id") or "").strip()
@@ -359,7 +393,7 @@ async def create_ticket(
             )
         if not ok:
             return False, result, None
-        add_binding(channel_id, user_id, result, "WHD", "lupa_search")
+        await _register_ticket_binding(channel_id, user_id, result, "WHD", "lupa_search")
         try:
             from core.lupa_report import log_lupa_ticket
             log_lupa_ticket(
@@ -386,7 +420,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_form_engine import create_issue_from_form
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         ok, result, project_key = await create_issue_from_form(
             "pc_problem",
             form_data=form_data,
@@ -396,7 +430,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
         proj = (project_key or "HD").strip().upper()
-        add_binding(channel_id, user_id, result, proj, "pc_problem")
+        await _register_ticket_binding(channel_id, user_id, result, proj, "pc_problem")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             from core.forms_catalog import get_form_definition
@@ -411,7 +445,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_form_engine import create_issue_from_form
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         ok, result, project_key = await create_issue_from_form(
             "orgtech_problem",
             form_data=form_data,
@@ -421,7 +455,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
         proj = (project_key or "HD").strip().upper()
-        add_binding(channel_id, user_id, result, proj, "orgtech_problem")
+        await _register_ticket_binding(channel_id, user_id, result, proj, "orgtech_problem")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             from core.forms_catalog import get_form_definition
@@ -436,7 +470,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_form_engine import create_issue_from_form
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         ok, result, project_key = await create_issue_from_form(
             "peripheral_equipment",
             form_data=form_data,
@@ -446,7 +480,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
         proj = (project_key or "HD").strip().upper()
-        add_binding(channel_id, user_id, result, proj, "peripheral_equipment")
+        await _register_ticket_binding(channel_id, user_id, result, proj, "peripheral_equipment")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             from core.forms_catalog import get_form_definition
@@ -461,7 +495,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_form_engine import create_issue_from_form
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         ok, result, project_key = await create_issue_from_form(
             "network_problem",
             form_data=form_data,
@@ -471,7 +505,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
         proj = (project_key or "HD").strip().upper()
-        add_binding(channel_id, user_id, result, proj, "network_problem")
+        await _register_ticket_binding(channel_id, user_id, result, proj, "network_problem")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             from core.forms_catalog import get_form_definition
@@ -486,7 +520,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_form_engine import create_issue_from_form
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         ok, result, project_key = await create_issue_from_form(
             "electronic_queue",
             form_data=form_data,
@@ -496,7 +530,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
         proj = (project_key or "HD").strip().upper()
-        add_binding(channel_id, user_id, result, proj, "electronic_queue")
+        await _register_ticket_binding(channel_id, user_id, result, proj, "electronic_queue")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             from core.forms_catalog import get_form_definition
@@ -511,7 +545,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_form_engine import create_issue_from_form
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         ok, result, project_key = await create_issue_from_form(
             "email_owa_outlook",
             form_data=form_data,
@@ -521,7 +555,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
         proj = (project_key or "ISR").strip().upper()
-        add_binding(channel_id, user_id, result, proj, "email_owa_outlook")
+        await _register_ticket_binding(channel_id, user_id, result, proj, "email_owa_outlook")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             from core.forms_catalog import get_form_definition
@@ -536,7 +570,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_form_engine import create_issue_from_form
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         engine_form_data = {
             "summary": "Запрос созданный через Бот ТП",
             "service_name": (form_data.get("service_name") or "").strip(),
@@ -551,7 +585,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
         proj = (project_key or "ISR").strip().upper()
-        add_binding(channel_id, user_id, result, proj, "atlassian_support")
+        await _register_ticket_binding(channel_id, user_id, result, proj, "atlassian_support")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             from core.forms_catalog import get_form_definition
@@ -566,7 +600,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_form_engine import create_issue_from_form
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         ok, result, project_key = await create_issue_from_form(
             "email_forwarding",
             form_data=form_data,
@@ -576,7 +610,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
         proj = (project_key or "ISR").strip().upper()
-        add_binding(channel_id, user_id, result, proj, "email_forwarding")
+        await _register_ticket_binding(channel_id, user_id, result, proj, "email_forwarding")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             from core.forms_catalog import get_form_definition
@@ -591,7 +625,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_form_engine import create_issue_from_form
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         ok, result, project_key = await create_issue_from_form(
             "email_groups",
             form_data=form_data,
@@ -601,7 +635,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
         proj = (project_key or "ISR").strip().upper()
-        add_binding(channel_id, user_id, result, proj, "email_groups")
+        await _register_ticket_binding(channel_id, user_id, result, proj, "email_groups")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             from core.forms_catalog import get_form_definition
@@ -616,7 +650,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_wms import create_wms_settings
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         department = (form_data.get("department") or profile.get("department_wms") or profile.get("department") or "").strip()
         service_type = (form_data.get("service_type") or "").strip()
         description = (form_data.get("description") or "").strip() or "-"
@@ -641,7 +675,7 @@ async def create_ticket(
         )
         if not ok:
             return False, result, None
-        add_binding(channel_id, user_id, result, "PW", "wms_settings")
+        await _register_ticket_binding(channel_id, user_id, result, "PW", "wms_settings")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             link = f'{jira_url}/browse/{result}'
@@ -654,7 +688,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_wms import create_wms_psi_user
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         summary = (form_data.get("summary") or "").strip() or "Заявка на пользователя PSIwms"
         full_name = (form_data.get("full_name") or "").strip()
         department = (form_data.get("department") or profile.get("department_wms") or profile.get("department") or "").strip()
@@ -682,7 +716,7 @@ async def create_ticket(
         )
         if not ok:
             return False, result, None
-        add_binding(channel_id, user_id, result, "PW", "wms_psi_user")
+        await _register_ticket_binding(channel_id, user_id, result, "PW", "wms_psi_user")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             link = f'{jira_url}/browse/{result}'
@@ -695,7 +729,7 @@ async def create_ticket(
         from user_storage import get_user_profile
         from core.jira_wms import create_wms_wait_products
         from core.support.issue_binding_registry import add_binding
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         department = (form_data.get("department") or profile.get("department_wms") or profile.get("department") or "").strip()
         description = (form_data.get("description") or "").strip()
         if not department:
@@ -714,7 +748,7 @@ async def create_ticket(
         )
         if not ok:
             return False, result, None
-        add_binding(channel_id, user_id, result, "PW", "wms_wait_products")
+        await _register_ticket_binding(channel_id, user_id, result, "PW", "wms_wait_products")
         jira_url = (CONFIG.get("JIRA", {}).get("LOGIN_URL") or "").strip().rstrip("/")
         if jira_url:
             link = f'{jira_url}/browse/{result}'
@@ -728,7 +762,7 @@ async def create_ticket(
         from core.jira_aa import create_aa_knowledge_chatbot_issue
         from core.support.issue_binding_registry import add_binding
 
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         department = (profile.get("department") or "").strip()
         if not department:
             return False, NEED_PROFILE_DEPARTMENT, None
@@ -775,7 +809,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
 
-        add_binding(channel_id, user_id, result, "AA", "aa_kb_chatbot")
+        await _register_ticket_binding(channel_id, user_id, result, "AA", "aa_kb_chatbot")
         primary = resolve_channel_user_id(channel_id, user_id)
         old_prof = get_user_profile(user_id, channel_id) or {}
         new_prof = dict(old_prof)
@@ -796,7 +830,7 @@ async def create_ticket(
         from core.jira_aa import create_aa_mail_browser_issue
         from core.support.issue_binding_registry import add_binding
 
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         department = (profile.get("department") or "").strip()
         if not department:
             return False, NEED_PROFILE_DEPARTMENT, None
@@ -844,7 +878,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
 
-        add_binding(channel_id, user_id, result, "AA", "aa_mail_browser")
+        await _register_ticket_binding(channel_id, user_id, result, "AA", "aa_mail_browser")
         primary = resolve_channel_user_id(channel_id, user_id)
         old_prof = get_user_profile(user_id, channel_id) or {}
         new_prof = dict(old_prof)
@@ -865,7 +899,7 @@ async def create_ticket(
         from core.jira_aa import create_aa_pc_account_issue
         from core.support.issue_binding_registry import add_binding
 
-        profile = get_user_profile(user_id, channel_id) or {}
+        profile = await _profile_for_ticket(channel_id, user_id)
         department = (profile.get("department") or "").strip()
         if not department:
             return False, NEED_PROFILE_DEPARTMENT, None
@@ -927,7 +961,7 @@ async def create_ticket(
         if not ok:
             return False, result, None
 
-        add_binding(channel_id, user_id, result, "AA", "aa_pc_account")
+        await _register_ticket_binding(channel_id, user_id, result, "AA", "aa_pc_account")
         primary = resolve_channel_user_id(channel_id, user_id)
         old_prof = get_user_profile(user_id, channel_id) or {}
         new_prof = dict(old_prof)
